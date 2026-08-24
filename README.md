@@ -1,7 +1,17 @@
-# Composer local switcher
+# Composer Local Switcher
+
+[![Packagist](https://img.shields.io/packagist/v/mistralys/composer-local-switcher)](https://packagist.org/packages/mistralys/composer-local-switcher)
+[![PHP](https://img.shields.io/packagist/php-v/mistralys/composer-local-switcher)](https://packagist.org/packages/mistralys/composer-local-switcher)
+[![License](https://img.shields.io/github/license/Mistralys/composer-local-switcher)](LICENSE)
 
 PHP library that handles switching between live and local Composer dependencies using 
 Composer scripts.
+
+## Installation
+
+```bash
+composer require mistralys/composer-local-switcher
+```
 
 ## How it works
 
@@ -272,7 +282,7 @@ therefore not installable.
 To work around this, you can optionally specify a version to use for packages in the
 local repositories configuration file:
 
-```json```
+```json
 {
   "local-repositories": [
     {
@@ -282,6 +292,7 @@ local repositories configuration file:
     }
   ]
 }
+```
 
 The repository will still be loaded as a path repository, but the specified version will 
 be used whenever Composer needs to resolve the package version.
