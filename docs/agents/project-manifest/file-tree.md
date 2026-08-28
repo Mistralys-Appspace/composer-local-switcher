@@ -25,6 +25,9 @@ composer-local-switcher/
 │   └── assets/
 │       ├── test-project/        — Fixture project with composer.json, lock, and dev-config
 │       └── work-projects/       — Ephemeral per-test working copies (created/cleaned by tests)
+├── resources/
+│   └── git-hooks/
+│       └── pre-commit       — Bundled pre-commit hook (DEV-mode and path-repo guards)
 ├── docs/                        — Documentation (this manifest)
 └── vendor/                      — Composer dependencies (gitignored)
 ```

@@ -17,11 +17,23 @@
 - **Lock file path** is derived from any `ConfigFile` path by replacing `.json` with `.lock`.
 - **Flag file path** is derived from the main file path by appending `.DEV` or `.PROD`.
 - These path derivations use simple `str_replace()` — filenames must end in `.json`.
+- Paths stored in the status file are canonicalized via `realpath()` (fallback to raw path when the file does not exist yet).
+
+## Three-Path Convention
+
+The `fromProjectRoot()` factory and all built-in Composer entry points assume the standard file layout:
+
+- `<root>/composer.json` — mutable working copy
+- `<root>/composer/composer-prod.json` — production baseline
+- `<root>/composer/local-repositories.json` — local repository definitions
+
+Projects that follow this convention can wire the built-in entry points directly in `composer.json` with zero PHP glue code.
 
 ## Configuration Format
 
 - The dev config file must contain a `local-repositories` key with an array of objects, each having `package-name` (string) and `path` (string). An optional `version` (string) overrides the default `*` version constraint.
 - Package names with underscores are also matched with hyphens when looking up existing repository entries (handles GitHub URL normalization).
+- When a `local-repositories` package exists in `require-dev` (not `require`) in the PROD config, the DEV switch writes the version constraint to `require-dev` — it does not move the package to `require`.
 
 ## Testing
 
@@ -29,6 +41,11 @@
 - Test suite directory: `tests/TestSuites/` (suffix `.php`).
 - Each test copies the fixture from `tests/assets/test-project/` into an ephemeral directory under `tests/assets/work-projects/`. The directory is cleaned up on tearDown unless `setKeepWorkFiles()` is called or the test failed.
 - The `work-projects/` directory contains only transient test data and should not be committed.
+
+## Bundled Resources
+
+- Non-PHP assets (e.g. shell scripts) live under `resources/` in the library root and are shipped with the Composer package.
+- `resources/git-hooks/pre-commit` is the canonical shared pre-commit hook. Consumer projects install it via `ConfigSwitcher::installGitHooks()`.
 
 ## Workflow Rules
 

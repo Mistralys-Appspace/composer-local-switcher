@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.1.0 - Sync hardening and Composer script entry points
+- Added static Composer script entry points (`composerSwitchDev`, `composerSwitchProd`, `composerSwitchUpdate`, `composerVerifyConfig`, `composerInstallHooks`) so consumers can wire directly to the library without PHP wrapper boilerplate.
+- Added a `fromProjectRoot()` static factory encoding the three-path convention shared by consumer projects.
+- Added a `verify()` method that compares `composer.json` with `composer-prod.json` and reports differing top-level keys.
+- Added a shared git-hook installer (`installGitHooks()`) with a bundled `pre-commit` hook resource.
+- DEV switch now prunes duplicate VCS repository entries matching a switched package within the same loop pass.
+- DEV switch now respects `require-dev` placement — packages in `require-dev` in the production config stay in `require-dev` during DEV mode.
+- Status file paths are now normalized via `realpath()` to eliminate `/../` segments.
+- HCP Editor and Mailforge rewired to use library entry points directly; per-consumer wrapper boilerplate removed.
+- Removed stale `composer/composer-dev.lock` and `composer/composer-dev.status` entries from Mailforge's `.gitignore`.
+
 ## v1.0.4 - Versioned packages
 - Added an optional `version` setting to handle more version constraint setups.
 

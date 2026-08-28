@@ -63,6 +63,73 @@ class ConfigSwitcher
     private $flagFileEnabled = true;
 
     /**
+     * Creates a ConfigSwitcher using the three-path convention
+     * shared by both consumer projects.
+     *
+     * @param string $rootPath Absolute path to the project root.
+     * @return self
+     */
+    public static function fromProjectRoot(string $rootPath) : self
+    {
+        $rootPath = rtrim($rootPath, '/');
+
+        return new self(
+            new ConfigFile($rootPath . '/composer.json'),
+            new ConfigFile($rootPath . '/composer/composer-prod.json'),
+            new ConfigFile($rootPath . '/composer/local-repositories.json')
+        );
+    }
+
+    public static function composerSwitchDev() : void
+    {
+        self::fromProjectRoot(getcwd())->switchToDevelopment();
+    }
+
+    public static function composerSwitchProd() : void
+    {
+        self::fromProjectRoot(getcwd())->switchToProduction();
+    }
+
+    public static function composerSwitchUpdate() : void
+    {
+        self::fromProjectRoot(getcwd())->switchUpdate();
+    }
+
+    public static function composerVerifyConfig() : void
+    {
+        $switcher = self::fromProjectRoot(getcwd());
+        $result = $switcher->verify();
+
+        if(!empty($result['devMode'])) {
+            echo 'DEV mode is active — config comparison skipped.' . PHP_EOL;
+            return;
+        }
+
+        if($result['inSync']) {
+            echo 'composer.json and composer-prod.json are in sync.' . PHP_EOL;
+            return;
+        }
+
+        echo 'composer.json and composer-prod.json differ in the following keys:' . PHP_EOL;
+        foreach($result['differences'] as $key) {
+            echo '  - ' . $key . PHP_EOL;
+        }
+    }
+
+    public static function composerInstallHooks() : void
+    {
+        $root = getcwd();
+        $switcher = self::fromProjectRoot($root);
+        $installed = $switcher->installGitHooks($root);
+
+        if($installed) {
+            echo 'Git hooks installed successfully.' . PHP_EOL;
+        } else {
+            echo 'WARNING: .git/hooks/ directory not found — hooks were not installed.' . PHP_EOL;
+        }
+    }
+
+    /**
      * @param ConfigFile $mainFile The main `composer.json` file.
      * @param ConfigFile $prodFile The production `composer-prod.json` file.
      * @param ConfigFile $devConfig The development configuration file, containing the list of local repositories.
@@ -114,6 +181,91 @@ class ConfigSwitcher
     public function getStatus(): StatusFile
     {
         return $this->statusFile;
+    }
+
+    /**
+     * Read-only comparison of `composer.json` and `composer-prod.json`.
+     *
+     * Returns an array with keys:
+     * - `inSync` (bool) — whether the files have identical normalized content.
+     * - `differences` (string[]) — top-level keys that differ.
+     * - `devMode` (bool) — present and true when called in DEV mode (comparison skipped).
+     *
+     * @return array{inSync: bool, differences: string[], devMode?: bool}
+     */
+    public function verify() : array
+    {
+        if($this->statusFile->isDEV()) {
+            return array(
+                'inSync' => false,
+                'differences' => array(),
+                'devMode' => true
+            );
+        }
+
+        $mainData = $this->mainFile->getData();
+        $prodData = $this->prodFile->exists() ? $this->prodFile->getData() : array();
+
+        $this->recursiveKsort($mainData);
+        $this->recursiveKsort($prodData);
+
+        $allKeys = array_unique(array_merge(array_keys($mainData), array_keys($prodData)));
+        sort($allKeys);
+
+        $differences = array();
+        foreach($allKeys as $key)
+        {
+            $mainValue = $mainData[$key] ?? null;
+            $prodValue = $prodData[$key] ?? null;
+
+            if($mainValue !== $prodValue) {
+                $differences[] = $key;
+            }
+        }
+
+        return array(
+            'inSync' => empty($differences),
+            'differences' => $differences
+        );
+    }
+
+    /**
+     * @param array<int|string,mixed> $array
+     * @return void
+     */
+    private function recursiveKsort(array &$array) : void
+    {
+        ksort($array);
+
+        foreach($array as &$value) {
+            if(is_array($value)) {
+                $this->recursiveKsort($value);
+            }
+        }
+    }
+
+    /**
+     * Copies the bundled pre-commit hook into the project's
+     * `.git/hooks/` directory with executable permissions.
+     *
+     * @param string $projectRoot Absolute path to the project root (containing `.git/`).
+     * @return bool True on success, false when `.git/hooks/` does not exist.
+     */
+    public function installGitHooks(string $projectRoot) : bool
+    {
+        $hooksDir = rtrim($projectRoot, '/') . '/.git/hooks';
+
+        if(!is_dir($hooksDir)) {
+            return false;
+        }
+
+        $source = __DIR__ . '/../resources/git-hooks/pre-commit';
+        $target = $hooksDir . '/pre-commit';
+
+        copy($source, $target);
+        chmod($target, 0755);
+
+        return true;
     }
 
     /**
@@ -441,7 +593,9 @@ class ConfigSwitcher
             $path = $repo['path'];
             $version = $repo['version'] ?? '*';
 
-            $config['require'][$packageName] = $version;
+            // Write to require-dev if the package lives there in the PROD baseline.
+            $requireKey = isset($config['require-dev'][$packageName]) ? 'require-dev' : 'require';
+            $config[$requireKey][$packageName] = $version;
 
             // Default wildcard version in the path repository.
             // This means that no version constraint is applied,
@@ -480,7 +634,9 @@ class ConfigSwitcher
                 $config[self::KEY_REPOSITORIES] = array();
             }
 
-            // Attempt to find an existing repository entry
+            // Attempt to find existing repository entries and replace
+            // the first match with the path entry. Any additional
+            // matches (stale VCS duplicates) are removed.
             $found = false;
             foreach ($config[self::KEY_REPOSITORIES] as $i => $repository)
             {
@@ -498,16 +654,19 @@ class ConfigSwitcher
                     continue;
                 }
 
-                $found = true;
-
-                $this->console->line1('- UPDATE | [%s] | Overwriting existing repository entry.', $packageName);
-                $config[self::KEY_REPOSITORIES][$i] = $repoEntry;
-
-                break;
+                if(!$found) {
+                    $found = true;
+                    $this->console->line1('- UPDATE | [%s] | Overwriting existing repository entry.', $packageName);
+                    $config[self::KEY_REPOSITORIES][$i] = $repoEntry;
+                } else {
+                    $this->console->line1('- PRUNE  | [%s] | Removing duplicate repository entry.', $packageName);
+                    unset($config[self::KEY_REPOSITORIES][$i]);
+                }
             }
 
-            // The package was not found, add it.
-            if(!$found) {
+            if($found) {
+                $config[self::KEY_REPOSITORIES] = array_values($config[self::KEY_REPOSITORIES]);
+            } else {
                 $config[self::KEY_REPOSITORIES][] = $repoEntry;
                 $this->console->line1('- ADD | [%s] | Adding new repository entry.', $packageName);
             }
@@ -519,4 +678,5 @@ class ConfigSwitcher
 
         $this->addMessage('Rebuilt a fresh DEV `composer.json`.');
     }
+
 }

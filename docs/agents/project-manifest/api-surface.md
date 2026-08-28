@@ -17,6 +17,26 @@ public const KEY_LOCAL_REPOSITORIES = 'local-repositories';
 public const KEY_REPOSITORIES = 'repositories';
 ```
 
+#### Static Factory
+
+```php
+public static function fromProjectRoot(string $rootPath): self
+```
+
+Creates a `ConfigSwitcher` using the three-path convention shared by both consumer projects: `$rootPath/composer.json`, `$rootPath/composer/composer-prod.json`, `$rootPath/composer/local-repositories.json`.
+
+#### Composer Script Entry Points
+
+```php
+public static function composerSwitchDev(): void
+public static function composerSwitchProd(): void
+public static function composerSwitchUpdate(): void
+public static function composerVerifyConfig(): void
+public static function composerInstallHooks(): void
+```
+
+Static entry points for use in `composer.json` scripts. Each calls `fromProjectRoot(getcwd())` internally.
+
 #### Constructor
 
 ```php
@@ -36,6 +56,8 @@ public function getMainFile(): ConfigFile
 public function getDevFile(): ConfigFile
 public function getProdFile(): ConfigFile
 public function getStatus(): StatusFile
+public function verify(): array
+public function installGitHooks(string $projectRoot): bool
 public function switchUpdate(): void
 public function switchToDevelopment(): void
 public function switchToProduction(): void

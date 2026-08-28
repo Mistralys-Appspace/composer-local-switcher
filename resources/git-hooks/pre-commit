@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# pre-commit:
+# Guard 1 — Blocks committing composer.json or composer.lock while Composer
+#            is in DEV mode (composer.json.DEV marker present).
+# Guard 2 — Blocks committing composer.json if it contains a "type": "path"
+#            entry in the repositories key (local symlink active), regardless
+#            of DEV mode state.
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+DEV_MARKER="$REPO_ROOT/composer.json.DEV"
+STAGED=$(git diff --cached --name-only)
+
+# ---------------------------------------------------------------------------
+# Guard 1: Block composer.json and composer.lock when in DEV mode.
+# ---------------------------------------------------------------------------
+if [ -f "$DEV_MARKER" ]; then
+    BLOCKED=()
+
+    for FILE in "composer.json" "composer.lock"; do
+        if echo "$STAGED" | grep -qx "$FILE"; then
+            BLOCKED+=("$FILE")
+        fi
+    done
+
+    if [ ${#BLOCKED[@]} -gt 0 ]; then
+        echo ""
+        echo "ERROR: Commit blocked — Composer is in DEV mode (composer.json.DEV is present)."
+        echo ""
+        echo "The following file(s) must not be committed in DEV mode:"
+        for FILE in "${BLOCKED[@]}"; do
+            echo "  - $FILE"
+        done
+        echo ""
+        echo "Switch to PROD config first:  composer switch-prod"
+        echo "Then run composer install:    composer install"
+        echo ""
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Guard 2: Block composer.json if it contains a local path repository.
+# A "type": "path" entry in the repositories key means a local symlink is
+# active. This must never be committed, regardless of DEV mode state.
+# ---------------------------------------------------------------------------
+if echo "$STAGED" | grep -qx "composer.json"; then
+    if git show :composer.json | grep -qE '"type"\s*:\s*"path"'; then
+        echo ""
+        echo "ERROR: Commit blocked — composer.json contains a local path repository."
+        echo ""
+        echo "A \"type\": \"path\" entry was found in the repositories key, which means"
+        echo "a local symlink is active. This must not be committed."
+        echo ""
+        echo "Switch to PROD config first:  composer switch-prod"
+        echo "Then run composer install:    composer install"
+        echo ""
+        exit 1
+    fi
+fi

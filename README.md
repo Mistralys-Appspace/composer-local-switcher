@@ -40,9 +40,11 @@ at the same time. Refactoring classes in a library can then be done in the libra
 and the changes will be immediately available in the project that uses the library.
 
 - If an entry exists in `repositories`, it is overwritten with a path repository. 
+  Any additional duplicate entries matching the same package are removed automatically.
   Otherwise, a new entry is added to ensure that the package is loaded from the specified path.
-- The `require` section is updated so the package version constraint is set to `*`, 
-  which is required for path repositories.
+- The `require` (or `require-dev`) section is updated so the package version constraint 
+  is set to `*`, which is required for path repositories. Packages that are listed in 
+  `require-dev` in the production config stay in `require-dev` — they are not moved to `require`.
 
 ## Setup
 
@@ -79,18 +81,47 @@ For packages that do not already have an entry in the `repositories` section of 
 
 ### 2. Production configuration
 
-Copy your existing `composer.json` file to a new file, for example `composer-production.json`.
+Copy your existing `composer.json` file to `composer/composer-prod.json`.
 This file will be used as the base configuration when switching back to production mode.
 
-**WARNING**: From now on, only edit the `composer-production.json` file. The `composer.json`
+**WARNING**: From now on, only edit `composer/composer-prod.json`. The `composer.json`
 file will be modified automatically when switching between configurations.
 
-### 3. Composer script handler class
+### 3. Set up switching scripts
 
-Composer scripts are typically static methods in a class, which are called by
-Composer when the script is executed.
+The library provides built-in Composer script entry points. If your project follows the
+standard file layout — `composer.json` in the project root, and `composer-prod.json` plus
+`local-repositories.json` in a `composer/` subdirectory — you can wire them directly 
+without writing any PHP glue code:
 
-You can use the following class as a starting point for your project:
+```json
+{
+  "scripts": {
+    "switch-dev": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchDev",
+    "switch-prod": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchProd",
+    "switch-update": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchUpdate",
+    "verify-config": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerVerifyConfig",
+    "install-hooks": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerInstallHooks"
+  }
+}
+```
+
+These entry points use `ConfigSwitcher::fromProjectRoot(getcwd())` internally, which
+resolves to:
+
+- `<project-root>/composer.json`
+- `<project-root>/composer/composer-prod.json`
+- `<project-root>/composer/local-repositories.json`
+
+> NOTE: It's good practice to also have a `build` script that ensures the
+> configuration is set to production mode before deploying the project.
+> This will minimize the risk of accidentally deploying with development
+> dependencies.
+
+### Custom file layout
+
+If your project uses a different file layout, you can use the three-argument constructor
+directly in a custom script handler class:
 
 ```php
 declare(strict_types=1);
@@ -100,6 +131,15 @@ use Mistralys\ComposerSwitcher\Utils\ConfigFile;
 
 class ComposerScripts
 {
+    private static function createSwitcher() : ConfigSwitcher
+    {
+        return new ConfigSwitcher(
+            new ConfigFile('/path/to/composer.json'),
+            new ConfigFile('/path/to/composer-production.json'),
+            new ConfigFile('/path/to/local-repositories.json')
+        );
+    }
+
     public static function switchToDEV() : void
     {
         self::createSwitcher()->switchToDevelopment();
@@ -114,67 +154,10 @@ class ComposerScripts
     {
         self::createSwitcher()->switchUpdate();
     }
-
-    private static $initialized = false;
-
-    /**
-     * Initializes the Composer autoloader. Scripts do not
-     * automatically load it, so we need to do it manually.
-     * Additionally, we ensure that this is only done once
-     * across multiple script calls.
-     */
-    private static function initAutoloader() : void
-    {
-        if(self::$initialized) {
-            return;
-        }
-        
-        self::$initialized = true;
-        
-        require_once __DIR__ . '/vendor/autoload.php';
-    }
-    
-    /**
-     * @var ConfigSwitcher|null 
-     */
-    private static $switcher;
-    
-    /**
-     * Create/get the configuration switcher instance.
-     * This automatically initializes the Composer
-     * autoloader as well.
-     * 
-     * @return ConfigSwitcher
-     */
-    private static function createSwitcher() : ConfigSwitcher
-    {
-        if(self::$switcher !== null) {
-            return self::$switcher;
-        }
-    
-        self::initAutoloader();
-        
-        $switcher = new ConfigSwitcher(
-            new ConfigFile('/path/to/composer.json'),
-            new ConfigFile('/path/to/composer-production.json'),
-            new ConfigFile('/path/to/composer-local-repositories.json'),
-        );
-        
-        self::$switcher = $switcher;
-        
-        return $switcher;
-    }
 }
 ```
 
-> NOTE: Adjust the paths in the `createSwitcher()` method to point to your
-> local configuration files, as well as the autoloader path if needed.
-
-### 4. Set up switching scripts
-
-We will be adding scripts to the `composer.json` file to switch
-between development and production configurations, as well as 
-update the current configuration.
+Then wire the scripts in `composer.json`:
 
 ```json
 {
@@ -185,11 +168,6 @@ update the current configuration.
   }
 }
 ```
-
-> NOTE: It's good practice to also have a `build` script that ensures the
-> configuration is set to production mode before deploying the project. 
-> This will minimize the risk of accidentally deploying with development 
-> dependencies.
 
 ### Vendor dependencies in attached projects
 
@@ -234,6 +212,21 @@ Use this if you modified either the `composer-production.json` or the
 composer switch-update
 composer update
 ```
+
+## Verifying configuration sync
+
+After editing `composer-prod.json`, you can verify that the production configuration is still in
+sync with the active `composer.json`:
+
+```bash
+composer verify-config
+```
+
+This prints an in-sync confirmation, a list of differing keys, or a DEV-mode message.
+
+For programmatic use, the `verify()` method returns an associative array with `inSync` (bool) 
+and `differences` (top-level key names that differ). When called in DEV mode, it returns early 
+with `devMode => true` since the comparison is only meaningful in PROD mode.
 
 ## Options
 
@@ -299,6 +292,29 @@ be used whenever Composer needs to resolve the package version.
 
 > NOTE: The only drawback of this approach is that you will need to maintain the version
 > number manually in the configuration file.
+
+## Git hooks
+
+The library ships with a pre-commit hook that prevents accidentally committing development
+configuration to version control. It blocks the commit when:
+
+1. `composer.json` or `composer.lock` is staged while in DEV mode (the `composer.json.DEV` marker file exists).
+2. `composer.json` is staged and contains a `"type": "path"` repository entry (a local symlink is active).
+
+To install the hook in your project:
+
+```bash
+composer install-hooks
+```
+
+Or programmatically:
+
+```php
+$switcher->installGitHooks('/path/to/project-root');
+```
+
+This copies the bundled hook to `.git/hooks/pre-commit` with executable permissions. If 
+`.git/hooks/` does not exist, the method returns `false` and prints a console warning.
 
 ## Version control
 

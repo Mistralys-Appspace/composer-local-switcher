@@ -17,6 +17,7 @@ User calls ConfigSwitcher::switchToDevelopment()
         → Reads dev config (local-repositories list)
         → For each local repo entry:
           → Sets require version to '*' (or explicit version if specified)
+          → Preserves require-dev placement (does not move packages to require)
           → Builds path repository entry (type: path, symlink: true)
           → Updates or inserts repository entry in config
         → Writes modified config → composer.json via ConfigFile::putData()
@@ -62,6 +63,46 @@ switchToProduction() when already in PROD mode
     → If prod is newer: restores prod → main (user edited composer-prod.json)
     → If equal: no file operations
 ```
+
+## 5. Verify Configuration
+
+```
+User calls ConfigSwitcher::verify()
+  → If StatusFile::isDEV(): returns early with devMode=true, inSync=false, differences=[]
+  → Reads mainFile->getData() and prodFile->getData()
+  → Recursively ksort() both arrays (key-order normalization)
+  → Collects union of all top-level keys
+  → For each key: compares normalized values (strict equality)
+  → differences[] = keys whose values differ
+  → Returns array('inSync' => empty($differences), 'differences' => $differences)
+  → No files are modified (read-only)
+```
+
+## 6. Install Git Hooks
+
+```
+User calls ConfigSwitcher::installGitHooks($projectRoot)
+  → Checks if $projectRoot/.git/hooks/ directory exists
+  → If missing: returns false (no directory creation, no exception)
+  → Copies resources/git-hooks/pre-commit → $projectRoot/.git/hooks/pre-commit
+  → Sets permissions to 0755
+  → Returns true
+```
+
+## 7. Composer Script Entry Points
+
+```
+Consumer wires a built-in entry point in composer.json scripts
+  → Composer invokes e.g. ConfigSwitcher::composerSwitchDev()
+    → Calls fromProjectRoot(getcwd())
+      → Constructs ConfigSwitcher with:
+        - getcwd()/composer.json
+        - getcwd()/composer/composer-prod.json
+        - getcwd()/composer/local-repositories.json
+    → Delegates to the corresponding method (switchToDevelopment, verify, etc.)
+```
+
+Available entry points: `composerSwitchDev`, `composerSwitchProd`, `composerSwitchUpdate`, `composerVerifyConfig`, `composerInstallHooks`.
 
 ## File Relationships
 

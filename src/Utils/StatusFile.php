@@ -19,9 +19,9 @@ class StatusFile extends ConfigFile
         $this->putData(array(
             self::KEY_MODE => $mode,
             self::KEY_DATE => date('Y-m-d H:i:s'),
-            self::KEY_MAIN_FILE => $switcher->getMainFile()->getPath(),
-            self::KEY_PROD_FILE => $switcher->getProdFile()->getPath(),
-            self::KEY_DEV_FILE => $switcher->getDevFile()->getPath(),
+            self::KEY_MAIN_FILE => self::canonicalizePath($switcher->getMainFile()->getPath()),
+            self::KEY_PROD_FILE => self::canonicalizePath($switcher->getProdFile()->getPath()),
+            self::KEY_DEV_FILE => self::canonicalizePath($switcher->getDevFile()->getPath()),
         ));
 
         // Reset the state to reload it the next time it's requested.
@@ -77,5 +77,11 @@ class StatusFile extends ConfigFile
         }
 
         return parent::getData();
+    }
+
+    private static function canonicalizePath(string $path) : string
+    {
+        $resolved = realpath($path);
+        return $resolved !== false ? $resolved : $path;
     }
 }
