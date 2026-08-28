@@ -174,7 +174,7 @@ final class TestSwitching extends ComposerSwitcherTestCase
         $config = $mainFile->getData();
         $config['repositories'][] = array(
             'type' => 'vcs',
-            'url' => 'git@github.com:Mistralys/application-framework-mirror.git'
+            'url' => 'git@github.com:Mistralys/application-framework.git'
         );
         $mainFile->putData($config);
 
@@ -339,6 +339,29 @@ final class TestSwitching extends ComposerSwitcherTestCase
         $this->assertArrayNotHasKey($devPackage, $result['require']);
     }
 
+    public function test_devSwitchPreservesNonSwitchedVCSRepository() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $config = $switcher->getMainFile()->getData();
+        $repos = $config['repositories'];
+
+        $found = false;
+        foreach($repos as $repository)
+        {
+            if(
+                isset($repository['type'], $repository['url'])
+                && stripos($repository['url'], 'some-unrelated-library') !== false
+            ) {
+                $found = true;
+                $this->assertSame('vcs', $repository['type'], 'Non-switched VCS entry must retain its type.');
+                break;
+            }
+        }
+
+        $this->assertTrue($found, 'Expected the non-switched VCS entry for some-unrelated-library to survive the DEV switch.');
+    }
 
     // endregion
 

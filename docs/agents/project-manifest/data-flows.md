@@ -19,7 +19,12 @@ User calls ConfigSwitcher::switchToDevelopment()
           → Sets require version to '*' (or explicit version if specified)
           → Preserves require-dev placement (does not move packages to require)
           → Builds path repository entry (type: path, symlink: true)
-          → Updates or inserts repository entry in config
+          → Scans all existing repository entries for URL matches via urlMatchesPackageName()
+            (stripos + boundary check: next char must be `.`, `/`, or end-of-string):
+            → First match: replaced in place with path entry (UPDATE)
+            → Subsequent matches: removed as stale duplicates (PRUNE)
+            → No match: path entry appended (ADD)
+          → Re-indexes repositories array after pruning
         → Writes modified config → composer.json via ConfigFile::putData()
     → StatusFile::saveState('dev', ...) — persists mode + timestamp + file paths as JSON
     → Writes flag files: creates composer.json.DEV, deletes composer.json.PROD

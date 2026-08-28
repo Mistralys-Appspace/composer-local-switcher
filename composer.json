@@ -39,10 +39,10 @@
     "analyze-save": "php vendor/bin/phpstan analyse --configuration phpstan.neon --memory-limit=900M > phpstan-result.txt || true",
     "analyze-clear": "php vendor/bin/phpstan clear-result-cache",
     "test": "php vendor/bin/phpunit",
-    "test-file": "php vendor/bin/phpunit --no-progress",
-    "test-suite": "php vendor/bin/phpunit --no-progress --testsuite",
-    "test-filter": "php vendor/bin/phpunit --no-progress --filter",
-    "test-group": "php vendor/bin/phpunit --no-progress --group"
+    "test-file": "php vendor/bin/phpunit",
+    "test-suite": "php vendor/bin/phpunit --testsuite",
+    "test-filter": "php vendor/bin/phpunit --filter",
+    "test-group": "php vendor/bin/phpunit --group"
   },
   "minimum-stability": "dev",
   "prefer-stable": true,

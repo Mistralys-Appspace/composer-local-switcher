@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.1 - Switching gaps and sync hardening
+- Fixed PHPStan errors: simplified redundant `else if(!condition)` to `else`, added `@param` docblock on `addMessage()`.
+- Fixed `@subackage` typo in PHPDoc headers (now `@subpackage`).
+- Tightened VCS URL matching with a boundary check via `urlMatchesPackageName()` to prevent substring collisions (e.g., `application-utils` no longer matches `application-utils-core`).
+- Removed invalid `--no-progress` flag from Composer test scripts (`test-file`, `test-suite`, `test-filter`, `test-group`) — the flag does not exist in PHPUnit 9.6.
+
 ## v1.1.0 - Sync hardening and Composer script entry points
 - Added static Composer script entry points (`composerSwitchDev`, `composerSwitchProd`, `composerSwitchUpdate`, `composerVerifyConfig`, `composerInstallHooks`) so consumers can wire directly to the library without PHP wrapper boilerplate.
 - Added a `fromProjectRoot()` static factory encoding the three-path convention shared by consumer projects.

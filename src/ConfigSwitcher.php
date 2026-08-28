@@ -1,7 +1,7 @@
 <?php
 /**
  * @package Composer Switcher
- * @subackage Core
+ * @subpackage Core
  */
 
 declare(strict_types=1);
@@ -15,7 +15,7 @@ use Mistralys\ComposerSwitcher\Utils\StatusFile;
 
 /**
  * @package Composer Switcher
- * @subackage Core
+ * @subpackage Core
  */
 class ConfigSwitcher
 {
@@ -476,7 +476,7 @@ class ConfigSwitcher
 
             $this->addMessage('Run `composer install` to use the development dependencies.');
         }
-        else if(!$this->devFile->getLockFile()->exists())
+        else
         {
             // Force re-creation of the lock file
             $this->mainFile->getLockFile()->delete();
@@ -542,6 +542,9 @@ class ConfigSwitcher
      */
     private $messages = array();
 
+    /**
+     * @param string|int|float ...$args
+     */
     private function addMessage(string $message, ...$args) : void
     {
         $this->messages[] = sprintf($message, ...$args);
@@ -645,11 +648,11 @@ class ConfigSwitcher
                 }
 
                 if(
-                    stripos($repository['url'], $packageName) === false
+                    !$this->urlMatchesPackageName($repository['url'], $packageName)
                     &&
                     // GitHub repository URLs use hyphens instead of underscores.
                     // The package name may use either.
-                    stripos($repository['url'], str_replace('_', '-', $packageName)) === false)
+                    !$this->urlMatchesPackageName($repository['url'], str_replace('_', '-', $packageName)))
                 {
                     continue;
                 }
@@ -679,4 +682,28 @@ class ConfigSwitcher
         $this->addMessage('Rebuilt a fresh DEV `composer.json`.');
     }
 
+    /**
+     * Checks whether a repository URL contains the package name
+     * followed by a valid boundary character (`.`, `/`, or end-of-string).
+     * Prevents substring collisions like `application-utils` matching
+     * `application-utils-core`.
+     */
+    private function urlMatchesPackageName(string $url, string $name) : bool
+    {
+        $pos = stripos($url, $name);
+
+        if($pos === false) {
+            return false;
+        }
+
+        $afterPos = $pos + strlen($name);
+
+        if($afterPos >= strlen($url)) {
+            return true;
+        }
+
+        $nextChar = $url[$afterPos];
+
+        return $nextChar === '.' || $nextChar === '/';
+    }
 }
