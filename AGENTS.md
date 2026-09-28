@@ -66,7 +66,6 @@ When you change code, update the corresponding manifest documents **in the same 
 | Missing documentation | Flag gap, do not invent facts | MUST |
 | Untested code path | Proceed with caution, add test recommendation | SHOULD |
 | New error code needed | Follow `1821xx` numbering; exceptions use `182101`–`1821xx`, switcher uses `1822xx` | MUST |
-| Unsure about PHP 7.3 compatibility | No union types, no typed properties, no named arguments, no match expressions | MUST |
 | `composer.json` edit requested | Edit `composer-prod.json` instead — the switcher overwrites `composer.json` | MUST |
 | Flag/lock/status file path logic unclear | Paths are derived by string replacement on `.json` — see `constraints.md` | SHOULD |
 
@@ -76,7 +75,7 @@ When you change code, update the corresponding manifest documents **in the same 
 
 | Key | Value |
 |---|---|
-| **Language** | PHP >=7.3 (`declare(strict_types=1)`) |
+| **Language** | PHP >=8.4 (`declare(strict_types=1)`) |
 | **Architecture** | Single orchestrator + utility classes, no framework |
 | **Package Manager** | Composer |
 | **Autoloading** | Classmap (`src/`, `tests/TestClasses/`) |

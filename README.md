@@ -100,8 +100,8 @@ without writing any PHP glue code:
     "switch-dev": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchDev",
     "switch-prod": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchProd",
     "switch-update": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchUpdate",
-    "verify-config": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerVerifyConfig",
-    "install-hooks": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerInstallHooks"
+    "switch-verify-config": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerVerifyConfig",
+    "switch-install-hooks": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerInstallHooks"
   }
 }
 ```
@@ -219,7 +219,7 @@ After editing `composer-prod.json`, you can verify that the production configura
 sync with the active `composer.json`:
 
 ```bash
-composer verify-config
+composer switch-verify-config
 ```
 
 This prints an in-sync confirmation, a list of differing keys, or a DEV-mode message.
@@ -304,7 +304,7 @@ configuration to version control. It blocks the commit when:
 To install the hook in your project:
 
 ```bash
-composer install-hooks
+composer switch-install-hooks
 ```
 
 Or programmatically:
@@ -331,9 +331,3 @@ Here is what you should and should not commit to version control:
 > NOTE: It is good practice to add a template for the `dev-config.json` file
 > to version control, so other developers can use this to create their own local
 > configuration file. This is typically named something like `dev-config.dist.json`.
-
-## Why PHP v7.3?
-
-The library is currently used in a legacy Composer environment that is still running 
-PHP v7.3. It is planned to be modernized, but until then this package will remain 
-compatible with PHP v7.3.
