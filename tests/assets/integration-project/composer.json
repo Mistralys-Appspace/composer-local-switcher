@@ -1,0 +1,22 @@
+{
+  "name": "mistralys/switcher-integration-fixture",
+  "type": "project",
+  "require": {
+    "php": ">=8.4",
+    "mistralys/simple_html_dom": "^2.0"
+  },
+  "autoload": {
+    "classmap": [
+      "__LIBRARY_SRC_PATH__"
+    ]
+  },
+  "scripts": {
+    "switch-dev": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchDev",
+    "switch-prod": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchProd",
+    "switch-update": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchUpdate",
+    "switch-verify-config": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerVerifyConfig",
+    "switch-install-hooks": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerInstallHooks"
+  },
+  "minimum-stability": "dev",
+  "prefer-stable": true
+}

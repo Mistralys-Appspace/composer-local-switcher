@@ -1,7 +1,8 @@
 composer.phar
 /vendor/
 /tests/assets/work-projects/
-.phpunit.result.cache
+/tests/assets/local-clones/
+/.phpunit.cache/
 .idea/copilot.data.migration.agent.xml
 .idea/copilot.data.migration.edit.xml
 

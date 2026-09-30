@@ -131,6 +131,65 @@ final class TestSwitching extends ComposerSwitcherTestCase
     }
 
     /**
+     * The hyphen alias in `options.versions` (added alongside the
+     * package name for underscore package names, so Composer can
+     * resolve either spelling of the repository URL) must never be
+     * added for a package name that already uses hyphens throughout —
+     * there is no alternate spelling to alias.
+     */
+    public function test_hyphenAliasOmittedForNonUnderscorePackage() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $config = $switcher->getMainFile()->getData();
+
+        $versions = $this->findVersionsForPackage($config, 'mistralys/application-utils-core');
+
+        $this->assertSame(
+            array('mistralys/application-utils-core' => '2.3.14'),
+            $versions
+        );
+    }
+
+    /**
+     * `ConfigSwitcher` writes the `version` field from a local
+     * repository entry into `composer.json` verbatim — it is a
+     * deliberate boundary that no validation of the version string
+     * happens here. A malformed value is the caller's responsibility;
+     * this characterises that the switcher itself never rejects or
+     * silently corrects one.
+     */
+    public function test_malformedVersionIsWrittenVerbatim() : void
+    {
+        $malformedVersion = 'not-a-version';
+
+        $devFile = new ConfigFile($this->testTarget . '/composer/local-repositories.json');
+        $devConfig = $devFile->getData();
+
+        foreach($devConfig['local-repositories'] as &$repo)
+        {
+            if($repo['package-name'] === 'mistralys/application-utils') {
+                $repo['version'] = $malformedVersion;
+            }
+        }
+        unset($repo);
+
+        $devFile->putData($devConfig);
+
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $config = $switcher->getMainFile()->getData();
+
+        $this->assertSame($malformedVersion, $config['require']['mistralys/application-utils'] ?? null);
+
+        $versions = $this->findVersionsForPackage($config, 'mistralys/application-utils');
+
+        $this->assertSame($malformedVersion, $versions['mistralys/application-utils'] ?? null);
+    }
+
+    /**
      * After a DEV switch, the VCS repository entry matching a
      * switched package must be replaced by a single path entry.
      */
@@ -321,7 +380,7 @@ final class TestSwitching extends ComposerSwitcherTestCase
         $mainFile->putData($config);
 
         // Add a matching entry to the dev config.
-        $devFile = new ConfigFile($this->testTarget . '/composer/dev-config.json');
+        $devFile = new ConfigFile($this->testTarget . '/composer/local-repositories.json');
         $devConfig = $devFile->getData();
         $devConfig['local-repositories'][] = array(
             'package-name' => $devPackage,
@@ -453,6 +512,29 @@ final class TestSwitching extends ComposerSwitcherTestCase
         }
 
         $this->fail('No version definition found for package name: ' . $packageName);
+    }
+
+    /**
+     * @param array<string, mixed> $config
+     * @return array<string, string>
+     */
+    private function findVersionsForPackage(array $config, string $packageName) : array
+    {
+        $this->assertArrayHasKey('repositories', $config);
+        $this->assertIsArray($config['repositories']);
+
+        foreach($config['repositories'] as $repository)
+        {
+            if(
+                isset($repository['type'], $repository['options']['versions'])
+                && $repository['type'] === 'path'
+                && isset($repository['options']['versions'][$packageName])
+            ) {
+                return $repository['options']['versions'];
+            }
+        }
+
+        $this->fail('No versions definition found for package name: ' . $packageName);
     }
 
     // endregion
