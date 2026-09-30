@@ -22,6 +22,24 @@ use SplFileInfo;
 final class FixtureFileSystem
 {
     /**
+     * Whether `$path` currently exists on disk, as a directory, a
+     * regular file, or a symlink — including a dangling symlink
+     * whose target no longer exists.
+     *
+     * Unlike a plain `file_exists()` check (which follows symlinks
+     * and reports `false` for a dangling one), this is what the
+     * harness's collision guards need: a dangling symlink still
+     * occupies the path and must still be treated as a collision.
+     *
+     * @param string $path
+     * @return bool
+     */
+    public static function pathExists(string $path) : bool
+    {
+        return is_dir($path) || is_file($path) || is_link($path);
+    }
+
+    /**
      * Recursively removes a directory, including symlinked entries.
      *
      * Symlinks are unlinked directly rather than followed, so a symlink
@@ -75,7 +93,7 @@ final class FixtureFileSystem
      */
     public static function copyDirectory(string $src, string $dst): void
     {
-        if (is_dir($dst) || is_file($dst) || is_link($dst)) {
+        if (self::pathExists($dst)) {
             throw new RuntimeException(sprintf(
                 'Cannot copy directory: destination already exists at [%s].',
                 $dst

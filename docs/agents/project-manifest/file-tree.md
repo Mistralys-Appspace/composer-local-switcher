@@ -11,10 +11,17 @@ composer-local-switcher/
 ├── src/
 │   ├── ConfigSwitcher.php       — Main orchestrator: switches between DEV/PROD configs
 │   ├── ComposerSwitcherException.php — Exception class with error code constants
+│   ├── State/
+│   │   ├── SwitchMessage.php     — Immutable value object pairing a switch message's text with a `MESSAGE_*` code
+│   │   ├── FileOperation.php     — Immutable value object describing a single file operation (copy/write/delete), performed or dry-run-planned
+│   │   ├── SwitchOutcome.php     — Immutable value object summarizing a switch/reconcile/preview result: target mode, dry-run flag, messages, file operations
+│   │   ├── SwitchDescription.php — Immutable snapshot of the switcher's current state, assembled by `ConfigSwitcher::describe()`
+│   │   └── VerificationResult.php — Immutable value object holding the outcome of comparing `composer.json` against `composer-prod.json`
 │   └── Utils/
-│       ├── BaseFile.php         — Abstract base: path, exists, delete, copy, modified date
+│       ├── BaseFile.php         — Abstract base: path, exists, delete, copyTo()/tryCopyTo(), modified date; every I/O call delegates to the shared FileSystem
 │       ├── ConfigFile.php       — JSON config file: read/write with getData()/putData()
 │       ├── ConsoleWriter.php    — Console output helper with header/line/separator methods
+│       ├── FileSystem.php       — Single write choke-point for every file mutation (write/copy/delete); real I/O in normal mode, in-memory overlay + FileOperation log in dry-run mode
 │       ├── FlagFile.php         — Creates mode indicator files (composer.json.DEV / .PROD)
 │       ├── LockFile.php         — composer.lock file abstraction (derived from ConfigFile path)
 │       └── StatusFile.php       — Persists switching state (mode, date, file paths) as JSON
@@ -27,17 +34,22 @@ composer-local-switcher/
 │   │   ├── GitRunner.php        — Harness: single choke-point for every `git` invocation, returning a `ProcessResult`; array-form `Process` construction, `isAvailable()` catching `Throwable`, always resolves `git` through PATH
 │   │   ├── ProcessResult.php    — Value object: exit code, stdout, and stderr of a `ComposerRunner` or `GitRunner` invocation
 │   │   ├── IntegrationTestCase.php — Tier 2 base test case: extends `ComposerSwitcherTestCase` to copy the `integration-project` fixture, resolve the local package clone, substitute both fixture placeholders, and expose `bootstrapProd()` / `runComposer()` / `setLocalRepositoryVersion()`
-│   │   ├── FixtureFileSystem.php — Harness: symlink-safe static removeDirectory()/copyDirectory() helpers, the latter throwing RuntimeException on an existing destination
+│   │   ├── FixtureFileSystem.php — Harness: symlink-safe static removeDirectory()/copyDirectory() helpers, the latter throwing RuntimeException on an existing destination; `pathExists()` is the single dangling-symlink-aware path-existence predicate (`is_dir || is_file || is_link`) shared by `copyDirectory()` and `WorkCopy`
 │   │   └── WorkCopy.php         — Harness: collision-free work-copy allocation (allocate()), fixture-backed creation, removal, and age-based purgeStale() (STALE_AFTER_SECONDS = 86400)
 │   ├── TestSuites/
 │   │   ├── TestSwitching.php    — Tests for all switching scenarios
+│   │   ├── TestMessages.php     — Tests for message codes: `getMessages()`/`getMessageTexts()` typing, legacy text/output parity, `setDisplayMessages()`
+│   │   ├── TestExceptionContext.php — Tests for `ComposerSwitcherException`'s structured context payload: invalid switch mode, missing DEV file, invalid DEV JSON structure, and a copy-to-unwritable-target failure each carry the expected context keys, plus `ConfigFile::getData()`'s read failure carrying a real error code instead of `0`
+│   │   ├── TestDescribe.php     — Tests for `describe()`/`SwitchDescription`: per-state assembly (INITIAL/DEV/PROD), tolerance of a missing/malformed dev file, and `toJSON()`/`toArray()` round-tripping
+│   │   ├── TestDryRun.php       — Tests for `previewSwitch()`/`switchTo($mode, $dryRun)`: disk untouched, preview/real operation parity (including from INITIAL), applied real-switch operations, dry-run flag restoration after a forced mid-preview failure, and the static `src/` filesystem choke-point guard scan
 │   │   ├── TestLocalPackageClone.php — Tier 1 tests for LocalPackageClone, each injecting a throwaway cache directory under a fresh WorkCopy::allocate() path so no test reaches a code path invoking git or touches the shared clone cache
 │   │   ├── TestHarnessExtensibility.php — Tier 1 tests for the ComposerSwitcherTestCase fixture-source seam and symlinked-directory teardown fix
-│   │   ├── TestWorkCopy.php     — Tier 1 tests for WorkCopy: allocation distinctness/PID embedding, collision-throw, the STALE_AFTER_SECONDS threshold, selective purge, symlink-safe purge, no-op on a missing root
+│   │   ├── TestWorkCopy.php     — Tier 1 tests for WorkCopy: allocation distinctness/PID embedding, collision-throw (`test_allocate_throwsOnCollision`), the STALE_AFTER_SECONDS threshold, selective purge, symlink-safe purge, no-op on a missing root
+│   │   ├── TestFixtureFileSystem.php — Tier 1 tests for FixtureFileSystem: `pathExists()` against a directory/file/dangling symlink, `copyDirectory()`'s collision throw onto an existing directory/file/symlink (destination left untouched), and a nested-tree copy to a fresh destination
 │   │   └── TestBootstrap.php    — Tier 1 test spawning `tests/bootstrap.php` as a real PHP subprocess, proving the bootstrap-driven purge runs and respects the 24h age threshold (a 1-hour-old work copy survives)
 │   ├── IntegrationSuites/
 │   │   ├── TestComposerRunner.php — Tier 2 tests for ComposerRunner against a real Composer binary
-│   │   ├── TestGitRunner.php    — Tier 2 tests for GitRunner (no network access required): isAvailable() against the real binary, a successful command's stdout, and a failing command's non-zero exit code with populated stderr
+│   │   ├── TestGitRunner.php    — Tier 2 tests for GitRunner (no network access required): isAvailable() against the real binary, a successful command's stdout, a failing command's non-zero exit code with populated stderr, a zero-argument call (non-zero exit, usage output), a missing working directory (throws Symfony's RuntimeException), and a read-only working directory (non-zero ProcessResult, via a recursive chmodRecursive() helper, gracefully skipped where chmod has no effect)
 │   │   ├── TestLocalPackageClone.php — Tier 2 tests for LocalPackageClone's real acquisition paths (no network access required): a failed clone against a nonexistent local repository leaves neither the cache directory nor any `.partial-*` sibling behind, and a successful clone against a real local git repository is atomic (cache path complete with `composer.json`, no `.partial-*` sibling remaining)
 │   │   ├── TestIntegrationTestCase.php — Tier 2 acceptance tests for IntegrationTestCase (fixture-source override, placeholder substitution, skip paths, bootstrapProd(), setLocalRepositoryVersion())
 │   │   ├── TestProdBootstrap.php — Tier 2 tests validating the integration fixture is a valid three-path project and that bootstrapProd()'s real `composer update` establishes the PROD baseline (composer.lock, non-symlinked vendor/, no switcher state artefacts)
@@ -54,6 +66,8 @@ composer-local-switcher/
 ├── resources/
 │   └── git-hooks/
 │       └── pre-commit       — Bundled pre-commit hook (DEV-mode and path-repo guards)
-├── docs/                        — Documentation (this manifest)
+├── docs/
+│   └── agents/
+│       └── project-manifest/    — This manifest, including switching-decision-table.md (state × action → command → PHP call → file effects → message codes)
 └── vendor/                      — Composer dependencies (gitignored)
 ```

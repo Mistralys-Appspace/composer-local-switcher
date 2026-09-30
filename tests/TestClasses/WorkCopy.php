@@ -57,7 +57,7 @@ final class WorkCopy
 
         $path = $workRoot . '/' . date('YmdHis') . '-' . getmypid() . '-' . self::$counter;
 
-        if (is_dir($path) || is_file($path) || is_link($path)) {
+        if (FixtureFileSystem::pathExists($path)) {
             throw new RuntimeException(sprintf(
                 'Cannot allocate work copy: path already exists at [%s].',
                 $path
@@ -77,7 +77,7 @@ final class WorkCopy
      */
     public function createFromFixture(string $fixtureDir): void
     {
-        if (is_dir($this->path) || is_file($this->path) || is_link($this->path)) {
+        if (FixtureFileSystem::pathExists($this->path)) {
             throw new RuntimeException(sprintf(
                 'Cannot create work copy: path already exists at [%s].',
                 $this->path

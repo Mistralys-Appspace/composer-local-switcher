@@ -23,28 +23,28 @@ class StatusFile extends ConfigFile
             self::KEY_PROD_FILE => self::canonicalizePath($switcher->getProdFile()->getPath()),
             self::KEY_DEV_FILE => self::canonicalizePath($switcher->getDevFile()->getPath()),
         ));
-
-        // Reset the state to reload it the next time it's requested.
-        $this->state = null;
     }
 
     /**
-     * @var array<int|string,mixed>|null
-     */
-    private $state = null;
-
-    /**
+     * Reads the current state fresh from {@see self::getData()} on
+     * every call, rather than caching it on this instance.
+     *
+     * A per-instance cache previously lived here, but became a
+     * correctness hazard once {@see \Mistralys\ComposerSwitcher\Utils\FileSystem}'s
+     * dry-run overlay was introduced: a dry-run write served this
+     * method a pending, never-applied mode via the overlay, and that
+     * value stayed cached on this object after the overlay was
+     * discarded (dry-run mode disabled), so a *later, real* read could
+     * still observe the stale dry-run value instead of the file's
+     * actual on-disk content. Re-reading every time keeps this file's
+     * state consistent with whatever `FileSystem` reports as "current"
+     * (real or overlaid) at the moment of the call.
+     *
      * @return array<int|string,mixed>
      */
     private function loadState() : array
     {
-        if($this->state !== null) {
-            return $this->state;
-        }
-
-        $this->state = $this->getData();
-
-        return $this->state;
+        return $this->getData();
     }
 
     public function getMode() : ?string

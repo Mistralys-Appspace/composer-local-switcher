@@ -30,6 +30,8 @@ class GitRunner
      *
      * @param string ...$arguments `git` sub-command and its own arguments,
      *        e.g. `run('add', 'composer.json')`.
+     * @throws \Symfony\Component\Process\Exception\RuntimeException When the
+     *         configured working directory does not exist.
      */
     public function run(string ...$arguments): ProcessResult
     {

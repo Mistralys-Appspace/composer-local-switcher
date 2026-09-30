@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Mistralys\ComposerSwitcher\TestSuites;
 
 use Mistralys\ComposerSwitcher\ConfigSwitcher;
+use Mistralys\ComposerSwitcher\State\SwitchMessage;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\ComposerSwitcherTestCase;
 use Mistralys\ComposerSwitcher\Utils\ConfigFile;
 use Mistralys\ComposerSwitcher\Utils\LockFile;
@@ -120,6 +121,112 @@ final class TestSwitching extends ComposerSwitcherTestCase
         $this->assertLockFileIsPROD($switcher->getMainFile());
         $this->assertLockFileIsDEV($switcher->getDevFile());
         $this->assertFlagIsPROD($switcher);
+    }
+
+    /**
+     * A missing `composer.lock` no longer aborts the switch: the config
+     * rewrite, status file, and flag file are all still produced, and
+     * {@see ConfigSwitcher::MESSAGE_NO_LOCK_FILE_FOUND} is recorded as
+     * a warning rather than the sole side effect of an early return.
+     */
+    public function test_switchWithoutLockFileCompletes() : void
+    {
+        $switcher = $this->createSwitcher();
+        unlink($switcher->getMainFile()->getLockFile()->getPath());
+
+        $switcher->switchToDevelopment();
+
+        $status = $switcher->getStatus();
+        $this->assertTrue($status->exists());
+        $this->assertTrue($status->isDEV());
+
+        $this->assertFlagIsDEV($switcher);
+        $this->assertConfigHasExpectedPaths($switcher);
+
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_NO_LOCK_FILE_FOUND,
+            $this->getMessageCodes($switcher)
+        );
+    }
+
+    /**
+     * A DEV->PROD switch with no `composer-prod.lock` backup to restore
+     * from used to throw `ERROR_CANNOT_COPY_FILE` from the unconditional
+     * `copyTo()` call in `switch_case_DEV_PROD()`. It now removes the
+     * stale DEV `composer.lock` instead (mirroring the equivalent
+     * missing-lock handling in `switch_case_PROD_DEV()`) and records
+     * {@see ConfigSwitcher::MESSAGE_PROD_LOCK_MISSING}.
+     */
+    public function test_prodSwitchWithoutProdLockDeletesMainLock() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        // Simulate the user creating the DEV lock file.
+        $this->assertNotFalse(file_put_contents(
+            $switcher->getMainFile()->getLockFile()->getPath(),
+            'DEV'
+        ));
+
+        // Simulate a missing production lock backup.
+        $prodLockFile = $switcher->getProdFile()->getLockFile();
+        $this->assertTrue($prodLockFile->exists());
+        unlink($prodLockFile->getPath());
+
+        $switcher->switchToProduction();
+
+        $this->assertFalse($switcher->getMainFile()->getLockFile()->exists());
+        $this->assertFlagIsPROD($switcher);
+
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_PROD_LOCK_MISSING,
+            $this->getMessageCodes($switcher)
+        );
+    }
+
+    /**
+     * `BaseFile::tryCopyTo()` used to require both the source AND the
+     * target to already exist, so the lock backup in
+     * `switch_case_PROD_PROD()` silently did nothing whenever
+     * `composer-prod.lock` had not been created yet. It now only
+     * requires the source to exist, so a missing target is created.
+     *
+     * Since `switch_case_PROD_PROD()` now delegates to the content-first
+     * `reconcile()` core, the two files must actually differ in content
+     * (not just modification time) for the backup branch to trigger —
+     * see {@see \Mistralys\ComposerSwitcher\ConfigSwitcher::reconcile()}.
+     */
+    public function test_tryCopyToCreatesMissingTarget() : void
+    {
+        //$this->setKeepWorkFiles();
+
+        $switcher = $this->createSwitcher();
+        $switcher->switchToProduction();
+
+        $prodLockFile = $switcher->getProdFile()->getLockFile();
+        $this->assertTrue($prodLockFile->exists());
+
+        // Simulate a missing production lock backup, with the main
+        // composer.json modified more recently than composer-prod.json
+        // and actually different in content, so that
+        // switch_case_PROD_PROD()'s backup branch triggers.
+        unlink($prodLockFile->getPath());
+        $this->assertFalse($prodLockFile->exists());
+
+        $config = $switcher->getMainFile()->getData();
+        $config['require']['php'] = '>=8.0';
+        $switcher->getMainFile()->putData($config);
+
+        touch($switcher->getProdFile()->getPath(), time() - 60);
+        touch($switcher->getMainFile()->getPath());
+
+        $switcher->switchToProduction();
+
+        $this->assertTrue($prodLockFile->exists());
+        $this->assertSame(
+            file_get_contents($switcher->getMainFile()->getLockFile()->getPath()),
+            file_get_contents($prodLockFile->getPath())
+        );
     }
 
     public function test_specificPackageVersion() : void
@@ -277,9 +384,10 @@ final class TestSwitching extends ComposerSwitcherTestCase
 
         $result = $switcher->verify();
 
-        $this->assertTrue($result['inSync']);
-        $this->assertEmpty($result['differences']);
-        $this->assertArrayNotHasKey('devMode', $result);
+        $this->assertTrue($result->isInSync());
+        $this->assertEmpty($result->getDifferences());
+        $this->assertFalse($result->isDevMode());
+        $this->assertTrue($result->isComparable());
     }
 
     public function test_verifyReturnsOutOfSyncWhenDifferent() : void
@@ -294,8 +402,8 @@ final class TestSwitching extends ComposerSwitcherTestCase
 
         $result = $switcher->verify();
 
-        $this->assertFalse($result['inSync']);
-        $this->assertContains('require', $result['differences']);
+        $this->assertFalse($result->isInSync());
+        $this->assertContains('require', $result->getDifferences());
     }
 
     public function test_verifyWarnsInDevMode() : void
@@ -305,9 +413,10 @@ final class TestSwitching extends ComposerSwitcherTestCase
 
         $result = $switcher->verify();
 
-        $this->assertFalse($result['inSync']);
-        $this->assertEmpty($result['differences']);
-        $this->assertTrue($result['devMode']);
+        $this->assertFalse($result->isInSync());
+        $this->assertEmpty($result->getDifferences());
+        $this->assertTrue($result->isDevMode());
+        $this->assertFalse($result->isComparable());
     }
 
     public function test_statusFileStoresCanonicalPaths() : void
@@ -425,6 +534,17 @@ final class TestSwitching extends ComposerSwitcherTestCase
     // endregion
 
     // region: Support methods
+
+    /**
+     * @return int[]
+     */
+    private function getMessageCodes(ConfigSwitcher $switcher) : array
+    {
+        return array_map(
+            static fn(SwitchMessage $message) : int => $message->getCode(),
+            $switcher->getMessages()
+        );
+    }
 
     private function assertFlagIsDEV(ConfigSwitcher $switcher) : void
     {

@@ -3,10 +3,10 @@
 ## 1. Switch to Development Mode
 
 ```
-User calls ConfigSwitcher::switchToDevelopment()
-  → switchTo(MODE_DEV)
+User calls ConfigSwitcher::switchToDevelopment(): SwitchOutcome
+  → switchTo(MODE_DEV): SwitchOutcome
     → Validates mode string
-    → Checks main lock file exists (warns if not)
+    → Checks main lock file exists (warns if not — does not abort)
     → switch_copyLockFiles('dev')
       → If initial state (no prior switch):
         → switch_initProductionFiles(): copies composer.json → composer-prod.json (and lock)
@@ -29,57 +29,136 @@ User calls ConfigSwitcher::switchToDevelopment()
     → StatusFile::saveState('dev', ...) — persists mode + timestamp + file paths as JSON
     → Writes flag files: creates composer.json.DEV, deletes composer.json.PROD
     → Displays collected messages
+    → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations)
 ```
 
 ## 2. Switch to Production Mode
 
 ```
-User calls ConfigSwitcher::switchToProduction()
-  → switchTo(MODE_PROD)
+User calls ConfigSwitcher::switchToProduction(): SwitchOutcome
+  → switchTo(MODE_PROD): SwitchOutcome
     → Validates mode string
-    → Checks main lock file exists
+    → Checks main lock file exists (warns if not — does not abort)
     → switch_copyLockFiles('prod')
       → If initial state: switch_initProductionFiles()
-      → Backs up DEV lock file → dev lock location
-      → Restores PROD config → composer.json (via ConfigFile::copyTo())
-      → Restores PROD lock file → composer.lock
+      → If coming from DEV: switch_case_DEV_PROD()
+        → Backs up DEV lock file → dev lock location, if it exists
+        → Restores PROD config → composer.json (via ConfigFile::copyTo())
+        → If a composer-prod.lock backup exists: restores it → composer.lock
+        → Otherwise: deletes composer.lock and adds MESSAGE_PROD_LOCK_MISSING,
+          instead of the unconditional copy throwing ERROR_CANNOT_COPY_FILE
     → StatusFile::saveState('prod', ...)
     → Writes flag files: creates composer.json.PROD, deletes composer.json.DEV
     → Displays collected messages
+    → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations)
 ```
 
 ## 3. Update Current Configuration
 
 ```
-User calls ConfigSwitcher::switchUpdate()
+User calls ConfigSwitcher::switchUpdate(): SwitchOutcome
   → Reads StatusFile to determine current mode
   → If DEV: calls switchToDevelopment() (refreshes DEV config from current local-repositories.json)
-  → If PROD: calls switchToProduction() (reconciles using modified dates)
-  → If INITIAL (no prior switch): no-op
+  → If PROD: calls switchToProduction() (reconciles content-first, using
+    modified dates only to pick a direction — see §4)
+  → If INITIAL (no prior switch): no file-system effect, but still returns
+    an explicit SwitchOutcome (mode: MODE_INITIAL, no operations) rather
+    than a silent no-op with no return value
 ```
 
-## 4. PROD-to-PROD Reconciliation (via switchUpdate or re-switch)
+## 4. PROD-to-PROD Reconciliation (via switchUpdate, re-switch, or a direct reconcile() call)
 
 ```
 switchToProduction() when already in PROD mode
   → switch_case_PROD_PROD()
-    → Compares modified dates of composer.json vs composer-prod.json
-    → If main is newer: backs up main → prod (user edited composer.json directly)
-    → If prod is newer: restores prod → main (user edited composer-prod.json)
-    → If equal: no file operations
+    → Adds MESSAGE_USING_PROD_CONFIG
+    → Delegates into the shared reconciliation core (reconcileCore()),
+      the same core the public reconcile() method calls — guaranteeing
+      identical file effects between a PROD→PROD switch and a direct
+      reconcile() call from the same starting state
+
+ConfigSwitcher::reconcile(?string $direction = null, bool $dryRun = false): SwitchOutcome
+  → Sets the dry-run flag and clears the file-operation log
+    → If $dryRun: adds MESSAGE_DRY_RUN_ACTIVE
+  → If DEV mode: adds MESSAGE_DEV_MODE_NOT_RECONCILABLE, returns (no-op) —
+    composer.json has been rewritten for local repositories and is not
+    meaningful to reconcile
+  → Calls verify() (content-first: decides *whether* to act)
+    → If in sync: adds MESSAGE_ALREADY_IN_SYNC, returns (no-op), even
+      when composer.json and composer-prod.json have different
+      modification times
+  → Resolves a direction (decides *which way* to copy):
+    → $direction explicit argument, if given (RECONCILE_TO_MAIN or
+      RECONCILE_TO_PROD) — also used to resolve the ambiguous case below
+    → Otherwise, compares modification times of composer.json vs
+      composer-prod.json:
+      → If main is newer: direction = RECONCILE_TO_PROD (user edited
+        composer.json directly)
+      → If prod is newer: direction = RECONCILE_TO_MAIN (user edited
+        composer-prod.json)
+      → If equal (and content differs, since verify() already ruled
+        out the in-sync case): adds MESSAGE_RECONCILE_AMBIGUOUS,
+        returns (no-op) — the two files disagree but there is no
+        modification-time signal to pick a direction automatically
+  → Applies the resolved direction, if any:
+    → RECONCILE_TO_PROD: adds MESSAGE_BACKED_UP_MAIN_TO_PROD, copies
+      composer.json → composer-prod.json plus its lock file
+    → RECONCILE_TO_MAIN: adds MESSAGE_RESTORED_PROD_TO_MAIN, copies
+      composer-prod.json → composer.json plus its lock file
+  → Restores the facade's previous dry-run flag
+  → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations)
 ```
 
-## 5. Verify Configuration
+## 5a. Describe Current State
+
+```
+User calls ConfigSwitcher::describe(): SwitchDescription
+  → Reads StatusFile: mode, last switch date
+  → Builds a per-file record (label, path, exists, modifiedDate) for:
+    main/prod/dev configs, the status file, and all three lock files
+  → Determines the active flag file (dev/prod/none)
+  → Calls verify() → VerificationResult
+  → Reads the dev config's local-repositories list
+    → If the dev file is missing or malformed: returns an empty list
+      and attaches a warning instead of throwing
+  → Returns a new SwitchDescription(mode, lastSwitchDate, files,
+    activeFlag, verification, localRepositories, warnings)
+  → No files are modified (read-only), never throws
+
+SwitchDescription::toJSON(): string
+  → Encodes toArray() with JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
+```
+
+## 5b. Preview a Switch (Dry Run)
+
+```
+User calls ConfigSwitcher::previewSwitch(string $mode): SwitchOutcome
+  → Validates $mode
+  → Suppresses message display for the duration of the call
+  → Calls switchTo($mode, dryRun: true)
+    → Sets the facade's dry-run flag and adds MESSAGE_DRY_RUN_ACTIVE
+    → Runs the exact same switch code path as a real switchTo() call,
+      routed through the FileSystem dry-run overlay so no file is
+      actually copied/written/deleted
+    → Restores the previous dry-run flag in a finally block, even if
+      an exception is thrown mid-switch
+  → Returns a SwitchOutcome whose getOperations() lists every planned
+    FileOperation (isApplied(): false), matching exactly what a real
+    switch from the same starting state would perform — including
+    from the INITIAL state, where composer-prod.json does not yet exist
+```
+
+## 5c. Verify Configuration
 
 ```
 User calls ConfigSwitcher::verify()
-  → If StatusFile::isDEV(): returns early with devMode=true, inSync=false, differences=[]
+  → If StatusFile::isDEV(): returns early with new VerificationResult(devMode: true, inSync: false, differences: [])
   → Reads mainFile->getData() and prodFile->getData()
   → Recursively ksort() both arrays (key-order normalization)
   → Collects union of all top-level keys
   → For each key: compares normalized values (strict equality)
   → differences[] = keys whose values differ
-  → Returns array('inSync' => empty($differences), 'differences' => $differences)
+  → Returns new VerificationResult(devMode: false, inSync: empty($differences), differences: $differences)
   → No files are modified (read-only)
 ```
 
@@ -107,7 +186,7 @@ Consumer wires a built-in entry point in composer.json scripts
     → Delegates to the corresponding method (switchToDevelopment, verify, etc.)
 ```
 
-Available entry points: `composerSwitchDev`, `composerSwitchProd`, `composerSwitchUpdate`, `composerVerifyConfig`, `composerInstallHooks`.
+Available entry points: `composerSwitchDev`, `composerSwitchProd`, `composerSwitchUpdate`, `composerVerifyConfig`, `composerInstallHooks`, `composerSwitchDescribe`, `composerSwitchDescribeJson`, `composerSwitchReconcile`, `composerSwitchPreviewDev`, `composerSwitchPreviewProd`. The last four delegate to `describe()`, `reconcile()`, and `previewSwitch()` respectively (see §5a/§4/§5b) instead of `switchToDevelopment()`/`switchToProduction()`/`verify()`.
 
 ## File Relationships
 

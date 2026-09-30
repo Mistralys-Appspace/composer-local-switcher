@@ -21,10 +21,7 @@ use RuntimeException;
  */
 final class TestWorkCopy extends TestCase
 {
-    /**
-     * @var string
-     */
-    private $workRoot;
+    private string $workRoot;
 
     protected function setUp(): void
     {
@@ -50,6 +47,28 @@ final class TestWorkCopy extends TestCase
         $second = WorkCopy::allocate($this->workRoot);
 
         $this->assertNotSame($first->getPath(), $second->getPath());
+    }
+
+    /**
+     * Forces a collision by pre-creating the exact path the next
+     * `allocate()` call would compute (same timestamp second, same
+     * PID, the immediately following counter value).
+     */
+    public function test_allocate_throwsOnCollision() : void
+    {
+        $first = WorkCopy::allocate($this->workRoot);
+
+        $segments = explode('-', basename($first->getPath()));
+        $nextCounter = ((int)array_pop($segments)) + 1;
+        $pid = array_pop($segments);
+        $datePart = implode('-', $segments);
+
+        $collisionPath = $this->workRoot . '/' . $datePart . '-' . $pid . '-' . $nextCounter;
+        mkdir($collisionPath, 0777, true);
+
+        $this->expectException(RuntimeException::class);
+
+        WorkCopy::allocate($this->workRoot);
     }
 
     public function test_allocate_pathContainsProcessId() : void

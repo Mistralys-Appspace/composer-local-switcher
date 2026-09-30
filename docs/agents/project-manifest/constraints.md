@@ -4,12 +4,21 @@
 
 - **Strict types:** Every PHP file declares `declare(strict_types=1)`.
 - **PHP 8.4 baseline:** PHP 8 constructs are fully available — typed properties, union types, constructor promotion, `readonly`, named arguments, match expressions, enums, nullsafe operators. There is no PHP 7 compatibility requirement of any kind. All new code uses PHP 8 constructs; the `@var`-docblock property style in existing `src/` files is legacy, not a convention to copy. Existing code may be modernised opportunistically, in the same pass as any work that already touches it — no separate approval, plan, or cleanup task is required to bring a touched file up to PHP 8 standards. A wholesale sweep of untouched files remains out of scope for any given plan.
-- **Namespace:** `Mistralys\ComposerSwitcher` for core classes, `Mistralys\ComposerSwitcher\Utils` for utility classes.
+- **Namespace:** `Mistralys\ComposerSwitcher` for core classes, `Mistralys\ComposerSwitcher\Utils` for utility classes, `Mistralys\ComposerSwitcher\State` for the immutable value objects returned by the switcher's public methods (`SwitchOutcome`, `SwitchMessage`, `SwitchDescription`, `VerificationResult`, `FileOperation`).
 
 ## Error Handling
 
-- All error codes use a `1821xx` numbering scheme — the exception class owns `182101`–`182110`, and the switcher class owns `182201`–`182202`.
+- All error codes use a `1821xx` numbering scheme — the exception class owns `182101`–`182111` (`182111` is `ERROR_INVALID_RECONCILE_DIRECTION`, thrown by `reconcile()`), and the switcher class owns `182201`–`182214` (message codes; `182210`–`182213` are emitted by `reconcile()`'s reconciliation workflow; `182214`/`MESSAGE_PROD_LOCK_MISSING` is emitted by `switch_case_DEV_PROD()` when a DEV→PROD switch finds no `composer-prod.lock` backup to restore).
+- A missing lock file no longer aborts a switch: `switchTo()` (and its `switchToDevelopment()`/`switchToProduction()` wrappers) records `MESSAGE_NO_LOCK_FILE_FOUND`/`MESSAGE_PROD_LOCK_MISSING` as a warning and completes the config rewrite, status file, and flag file regardless. There is no remaining early-return path that leaves a switch half-done.
+- `ComposerSwitcherException` also carries an optional, fluent `setContext(array $context): self` / `getContext(): array` / `getContextValue(string $key): mixed` payload for structured data beyond the free-form message. Every throw site in the library attaches context: `KEY_FILE_PATH`/`KEY_TARGET_PATH` for file-path-carrying failures (a copy's source under `KEY_FILE_PATH`, its destination under `KEY_TARGET_PATH`), `KEY_MODE` for `ERROR_INVALID_SWITCH_MODE`, `KEY_DIRECTION` for `ERROR_INVALID_RECONCILE_DIRECTION`, `KEY_EXPECTED`/`KEY_ACTUAL` for the offending-value-plus-expected-set cases, and `KEY_PACKAGE_NAME` where a local-repository entry is being processed. A programmatic consumer never needs to parse the free-form message to recover this data.
 - Errors are thrown as `ComposerSwitcherException` with an integer error code constant. No other exception types are used.
+
+## File-System Write Choke-Point
+
+- Every mutating file operation performed by the library (`write()`, `copy()`, `delete()`) — and every read/existence/mtime check that must observe those writes consistently — passes through a single `Mistralys\ComposerSwitcher\Utils\FileSystem` facade. `ConfigSwitcher` constructs one `FileSystem` and propagates it to every `BaseFile` it owns (`$mainFile`, `$prodFile`, `$devFile`, `$statusFile`, every `FlagFile`) via `setFileSystem()` — never construct or call a mutating PHP filesystem function (`file_put_contents()`, `unlink()`, `copy()`) directly from `ConfigSwitcher` or a `BaseFile` subclass; go through the shared `FileSystem` instead. The sole exception is `ConfigSwitcher::installGitHooks()`, which calls `copy()`/`chmod()` directly against `.git/hooks/pre-commit` — a one-time, non-switching operation outside the dry-run-observable switch/reconcile/preview code paths, so it is intentionally not routed through `FileSystem`.
+- `FileSystem::setDryRun(true)` swaps `write()`/`copy()`/`delete()` to an in-memory overlay instead of touching disk, while `exists()`/`read()`/`modifiedTime()` consult that overlay first — this is what makes `ConfigSwitcher::previewSwitch()` run the exact same code path as a real switch with zero special-cased preview logic to drift out of sync.
+- `FileSystem::getOperations()` is the source of truth for `SwitchOutcome::getOperations()`; `clearOperations()` is called at the start of every `switchTo()`/`reconcileCore()` call so each returned outcome only reflects that single call.
+- `BaseFile::tryCopyTo(BaseFile $target)` copies only when the source file exists — unlike checking the target's existence, it tolerates a missing *target* (the copy still runs to create it) and simply no-ops when the *source* is absent instead of throwing `ERROR_CANNOT_COPY_FILE`. `reconcile()`'s lock-file backup calls use `tryCopyTo()` for exactly this reason: a config file's lock file is not guaranteed to exist.
 
 ## File Conventions
 
@@ -55,6 +64,8 @@ Projects that follow this convention can wire the built-in entry points directly
 - Mtime ordering between files is forced with `touch()`, never `sleep()`.
 - Tests never mutate the shared clone cache (`tests/assets/local-clones/`) directly — inject a throwaway cache directory (e.g. via `WorkCopy::allocate()`) instead.
 - Adding a new class under `tests/TestClasses/` requires running `composer dump-autoload` (classmap autoloading).
+- `FixtureFileSystem::pathExists()` is the harness's single dangling-symlink-aware path-existence predicate (`is_dir || is_file || is_link`) — shared by `FixtureFileSystem::copyDirectory()` and `WorkCopy`. Any new harness code that needs to check whether a path exists (including a possibly-dangling symlink) should call this rather than a bare `file_exists()`, which returns `false` for a dangling symlink and would misreport it as absent.
+- New Tier 1 coverage added alongside the value-object/`FileSystem`/structured-message rework: `TestMessages.php` (message-code typing and legacy text parity), `TestExceptionContext.php` (`ComposerSwitcherException` context payload), `TestDescribe.php` (`describe()`/`SwitchDescription`), `TestDryRun.php` (`previewSwitch()`/dry-run parity, including a static `src/` filesystem choke-point guard scan), `TestFixtureFileSystem.php`, and `TestBootstrap.php`. See [file-tree.md](file-tree.md) for the full per-file description of every suite.
 
 ### Test Tiers
 

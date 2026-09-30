@@ -4,15 +4,11 @@ declare(strict_types=1);
 
 namespace Mistralys\ComposerSwitcher\Utils;
 
-use Mistralys\ComposerSwitcher\ComposerSwitcherException;
 use Mistralys\ComposerSwitcher\ConfigSwitcher;
 
 class FlagFile extends BaseFile
 {
-    /**
-     * @var string
-     */
-    private $mode;
+    private readonly string $mode;
 
     public function __construct(ConfigSwitcher $switcher, string $mode)
     {
@@ -23,16 +19,12 @@ class FlagFile extends BaseFile
 
     public function create() : self
     {
-        if(file_put_contents($this->getPath(), $this->mode) !== false) {
-            return $this;
-        }
-
-        throw new ComposerSwitcherException(
-            sprintf(
-                'Failed to write data to flag file %s.',
-                $this->getBaseName()
-            ),
-            ComposerSwitcherException::ERROR_CANNOT_WRITE_FILE
+        $this->getFileSystem()->write(
+            $this->getPath(),
+            $this->mode,
+            'Creating ' . $this->mode . ' flag file.'
         );
+
+        return $this;
     }
 }

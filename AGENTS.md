@@ -17,6 +17,7 @@
 | [api-surface.md](docs/agents/project-manifest/api-surface.md) | Public classes, constants, constructors, and method signatures. |
 | [data-flows.md](docs/agents/project-manifest/data-flows.md) | Switching workflows and file relationships. |
 | [constraints.md](docs/agents/project-manifest/constraints.md) | Code style rules, error handling, testing, and workflow conventions. |
+| [switching-decision-table.md](docs/agents/project-manifest/switching-decision-table.md) | Current state × intended action → exact command → PHP call → file effects → message codes. |
 
 ### Quick Start Workflow
 
@@ -53,6 +54,7 @@ When you change code, update the corresponding manifest documents **in the same 
 - **Implementation patterns or autoloading?** Check `tech-stack.md` FIRST.
 - **Switching workflows or file relationships?** Check `data-flows.md` FIRST.
 - **Coding rules or error code scheme?** Check `constraints.md` FIRST.
+- **"What happens if I do X from state Y?"** Check `switching-decision-table.md` FIRST.
 - **Only then** read source files.
 
 ---
@@ -68,6 +70,7 @@ When you change code, update the corresponding manifest documents **in the same 
 | New error code needed | Follow `1821xx` numbering; exceptions use `182101`–`1821xx`, switcher uses `1822xx` | MUST |
 | `composer.json` edit requested | Edit `composer-prod.json` instead — the switcher overwrites `composer.json` | MUST |
 | Flag/lock/status file path logic unclear | Paths are derived by string replacement on `.json` — see `constraints.md` | SHOULD |
+| Unsure what a switch/reconcile/preview call will do from the current state | Check `switching-decision-table.md` before reading `ConfigSwitcher.php` | SHOULD |
 
 ---
 
@@ -89,5 +92,5 @@ When you change code, update the corresponding manifest documents **in the same 
 | **Analyse Command** | `composer analyze` |
 | **Analyse (save)** | `composer analyze-save` (writes `phpstan-result.txt`) |
 | **Analyse (clear cache)** | `composer analyze-clear` |
-| **Namespace** | `Mistralys\ComposerSwitcher`, `Mistralys\ComposerSwitcher\Utils` |
+| **Namespace** | `Mistralys\ComposerSwitcher`, `Mistralys\ComposerSwitcher\Utils`, `Mistralys\ComposerSwitcher\State` |
 | **License** | MIT |

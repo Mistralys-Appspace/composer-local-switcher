@@ -106,10 +106,11 @@ final class TestVersionOverride extends IntegrationTestCase
      * (the switcher writes the override into the generated repository
      * entry without validating it), but the following `composer update`
      * fails with a non-zero exit and names the malformed value in its
-     * output. What `switch-prod` does after such a failure is being
-     * redesigned by `docs/agents/plans/2026-09-25-switcher-ergonomics/plan.md`
-     * (AC-13), so this test deliberately stops at the failed update
-     * rather than asserting further — AC-08.
+     * output. Recovery from this failure — switching back to PROD
+     * afterwards — is covered by
+     * {@see self::test_switchProdRecoversAfterRejectedVersion()}, so this
+     * test deliberately stops at the failed update rather than asserting
+     * further — AC-08.
      */
     public function test_malformedVersionFailsComposerUpdate() : void
     {
@@ -126,6 +127,61 @@ final class TestVersionOverride extends IntegrationTestCase
                 $updateResult->getOutput(),
                 $updateResult->getErrorOutput()
             )
+        );
+    }
+
+    /**
+     * A malformed `version` override makes `composer update` fail in DEV
+     * (see {@see self::test_malformedVersionFailsComposerUpdate()}),
+     * leaving no DEV `composer.lock` behind. `switch-prod` used to bail
+     * out entirely in this situation — the missing-lock early return in
+     * `ConfigSwitcher::switchTo()` aborted before restoring anything,
+     * leaving the project stuck in a broken DEV state. It now completes
+     * the switch and restores both the PROD `composer.json` and the PROD
+     * `composer.lock` backup created when `switch-dev` first ran — AC-13.
+     *
+     * The recovery step is driven through {@see ConfigSwitcher} directly
+     * rather than a real `composer switch-prod` invocation: the malformed
+     * `version` override was written verbatim into `composer.json`'s
+     * `require` section by the preceding DEV switch (by design — see
+     * {@see self::test_malformedVersionIsWrittenVerbatim()} in
+     * `TestSwitching.php`), and Composer's own root-package loader
+     * eagerly parses every `require` entry as a version constraint
+     * before running *any* command or script — including a custom one
+     * like `switch-prod` — so the Composer binary itself refuses to run
+     * at all while that value is in place. That eager validation is a
+     * property of the Composer CLI, not of this library, so it would
+     * make every command fail identically; exercising the switcher's own
+     * recovery logic directly is what actually isolates the behavior
+     * under test.
+     */
+    public function test_switchProdRecoversAfterRejectedVersion() : void
+    {
+        $this->setLocalRepositoryVersion('not-a-version');
+        $this->switchToDev();
+
+        $updateResult = $this->runComposer('update');
+        $this->assertNotSame(0, $updateResult->getExitCode(), 'Expected composer update to fail with a malformed version override.');
+
+        $this->assertFileDoesNotExist(
+            $this->testTarget . '/composer.lock',
+            'Expected the failed composer update to leave no DEV lock file behind.'
+        );
+
+        $prodData = $this->decodeJsonFile($this->testTarget . '/composer/composer-prod.json');
+        $prodLockContent = $this->readFile($this->testTarget . '/composer/composer-prod.lock');
+
+        $switcher = $this->createSwitcher();
+        $switcher->switchToProduction();
+
+        $mainData = $this->decodeJsonFile($this->testTarget . '/composer.json');
+        $this->assertSame($prodData, $mainData, 'Expected composer.json to be restored to the PROD baseline.');
+
+        $this->assertFileExists($this->testTarget . '/composer.lock', 'Expected switch-prod to restore the PROD composer.lock backup.');
+        $this->assertSame(
+            $prodLockContent,
+            $this->readFile($this->testTarget . '/composer.lock'),
+            'Expected the restored composer.lock to match the PROD lock backup.'
         );
     }
 
