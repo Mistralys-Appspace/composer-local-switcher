@@ -53,7 +53,7 @@ User calls ConfigSwitcher::switchToProduction()
 ```
 User calls ConfigSwitcher::switchUpdate()
   → Reads StatusFile to determine current mode
-  → If DEV: calls switchToDevelopment() (refreshes DEV config from current dev-config)
+  → If DEV: calls switchToDevelopment() (refreshes DEV config from current local-repositories.json)
   → If PROD: calls switchToProduction() (reconciles using modified dates)
   → If INITIAL (no prior switch): no-op
 ```
@@ -116,9 +116,9 @@ composer.json            ← mutable working copy (switched between DEV/PROD con
 composer.lock            ← follows the active configuration
 composer-prod.json       ← immutable production baseline
 composer-prod.lock       ← production lock file backup
-dev-config.json          ← local-repositories list (input only, never modified)
-dev-config.lock          ← development lock file backup
-dev-config.status        ← JSON status file (mode, date, file paths)
+local-repositories.json  ← local-repositories list (input only, never modified)
+local-repositories.lock  ← development lock file backup
+local-repositories.status ← JSON status file (mode, date, file paths)
 composer.json.DEV        ← flag file (exists only in DEV mode)
 composer.json.PROD       ← flag file (exists only in PROD mode)
 ```

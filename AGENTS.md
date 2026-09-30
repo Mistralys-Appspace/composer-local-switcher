@@ -79,8 +79,8 @@ When you change code, update the corresponding manifest documents **in the same 
 | **Architecture** | Single orchestrator + utility classes, no framework |
 | **Package Manager** | Composer |
 | **Autoloading** | Classmap (`src/`, `tests/TestClasses/`) |
-| **Test Framework** | PHPUnit >=9.6 |
-| **Static Analysis** | PHPStan >=1.10 |
+| **Test Framework** | PHPUnit >=13.0 |
+| **Static Analysis** | PHPStan >=1.10 (analyses `src/` and the `tests/` directories) |
 | **Test Command** | `composer test` |
 | **Test Single File** | `composer test-file -- path/to/Test.php` |
 | **Test by Suite** | `composer test-suite -- <name>` |

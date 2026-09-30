@@ -1,9 +1,9 @@
 # Project Manifest — Composer Local Switcher
 
 > **Package:** `mistralys/composer-local-switcher`
-> **Version:** 1.0.4
+> **Version:** 2.0.0
 > **License:** MIT
-> **PHP:** >=7.3
+> **PHP:** >=8.4
 
 PHP library that switches a project's `composer.json` between production and local development configurations, replacing packages with symlinked path repositories for local package development.
 

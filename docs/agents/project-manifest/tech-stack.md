@@ -2,23 +2,24 @@
 
 ## Runtime
 
-- **Language:** PHP >=7.3
-- **Platform pin:** `config.platform.php` is set to `7.3` in `composer.json`, ensuring dependency resolution targets that version regardless of the host PHP.
+- **Language:** PHP >=8.4
+- **No platform pin:** `composer.json` no longer sets `config.platform.php`; dependency resolution targets the host PHP version directly.
 
 ## Dependencies
 
 ### Production
 
-None. The library has zero runtime dependencies — only `php >=7.3`.
+None. The library has zero runtime dependencies — only `php >=8.4`.
 
 ### Development
 
 | Package | Constraint | Purpose |
 |---|---|---|
-| `phpunit/phpunit` | >=9.6 | Unit testing |
+| `phpunit/phpunit` | >=13.0 | Unit testing. Installing the dev toolchain needs PHP `>=8.4.1` (PHPUnit 13's own floor); the runtime `php` constraint stays `>=8.4`. |
 | `phpstan/phpstan` | >=1.10 | Static analysis |
 | `phpstan/phpstan-phpunit` | >=1.3 | PHPStan rules for PHPUnit |
 | `roave/security-advisories` | dev-latest | Blocks packages with known vulnerabilities |
+| `symfony/process` | ^7.0 \|\| ^8.0 | Runs the real `composer` and `git` binaries from Tier 2 integration tests (`ComposerRunner`, `GitRunner`) via array-form `Process` construction; `ExecutableFinder` resolves binaries on `PATH` |
 
 ## Package Manager
 
@@ -33,8 +34,8 @@ None. The library has zero runtime dependencies — only `php >=7.3`.
 
 | Tool | Config File | Command |
 |---|---|---|
-| PHPUnit | `phpunit.xml` | `vendor/bin/phpunit` |
-| PHPStan | *(no config file in repo)* | `vendor/bin/phpstan` |
+| PHPUnit | `phpunit.xml` (bootstrap: `tests/bootstrap.php`) | `vendor/bin/phpunit` |
+| PHPStan | `phpstan.neon` (covers `src/` and `tests/TestClasses/`, `tests/TestSuites/`, `tests/IntegrationSuites/`) | `vendor/bin/phpstan` |
 
 ## Architectural Patterns
 

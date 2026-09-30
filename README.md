@@ -313,8 +313,9 @@ Or programmatically:
 $switcher->installGitHooks('/path/to/project-root');
 ```
 
-This copies the bundled hook to `.git/hooks/pre-commit` with executable permissions. If 
-`.git/hooks/` does not exist, the method returns `false` and prints a console warning.
+This copies the bundled hook to `.git/hooks/pre-commit` with executable permissions,
+**overwriting any existing `pre-commit` hook** at that path without prompting or backing it up.
+If `.git/hooks/` does not exist, the method returns `false` and prints a console warning.
 
 ## Version control
 
@@ -323,11 +324,11 @@ Here is what you should and should not commit to version control:
 - `composer.json` - YES
 - `composer.lock` - YES
 - `composer.json.PROD` / `composer.json.DEV` - NO (helper files)
-- `composer-production.json` - YES
-- `composer-production.lock` - YES
-- `dev-config.json` - NO (local-specific paths)
-- `dev-config.status` - NO
+- `composer-prod.json` - YES
+- `composer-prod.lock` - YES
+- `local-repositories.json` - NO (local-specific paths)
+- `local-repositories.status` - NO
 
-> NOTE: It is good practice to add a template for the `dev-config.json` file
+> NOTE: It is good practice to add a template for the `local-repositories.json` file
 > to version control, so other developers can use this to create their own local
-> configuration file. This is typically named something like `dev-config.dist.json`.
+> configuration file. This is typically named something like `local-repositories.dist.json`.
