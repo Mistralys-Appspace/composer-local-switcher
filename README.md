@@ -40,9 +40,11 @@ at the same time. Refactoring classes in a library can then be done in the libra
 and the changes will be immediately available in the project that uses the library.
 
 - If an entry exists in `repositories`, it is overwritten with a path repository. 
+  Any additional duplicate entries matching the same package are removed automatically.
   Otherwise, a new entry is added to ensure that the package is loaded from the specified path.
-- The `require` section is updated so the package version constraint is set to `*`, 
-  which is required for path repositories.
+- The `require` (or `require-dev`) section is updated so the package version constraint 
+  is set to `*`, which is required for path repositories. Packages that are listed in 
+  `require-dev` in the production config stay in `require-dev` — they are not moved to `require`.
 
 ## Setup
 
@@ -79,18 +81,86 @@ For packages that do not already have an entry in the `repositories` section of 
 
 ### 2. Production configuration
 
-Copy your existing `composer.json` file to a new file, for example `composer-production.json`.
+Copy your existing `composer.json` file to `composer/composer-prod.json`.
 This file will be used as the base configuration when switching back to production mode.
 
-**WARNING**: From now on, only edit the `composer-production.json` file. The `composer.json`
+**WARNING**: From now on, only edit `composer/composer-prod.json`. The `composer.json`
 file will be modified automatically when switching between configurations.
 
-### 3. Composer script handler class
+> NOTE: `composer switch-update`/`reconcile()` can reconcile drift between `composer.json`
+> and `composer-prod.json` on your behalf, but this is **best-effort**, not a substitute
+> for the rule above. It resolves drift by comparing file content and picks a direction
+> using file modification time — two cases it cannot resolve automatically, plus two
+> states it reports as a no-op rather than acting on:
+> - **Ambiguous case**: both files were edited and happen to share the same modification
+>   time. No direction can be chosen; see
+>   [Reconciling PROD configuration drift](#reconciling-prod-configuration-drift) for the
+>   programmatic API to resolve this explicitly.
+> - **DEV case**: while in development mode, `composer.json` has already been rewritten
+>   with local path repositories and is no longer meaningful to compare against
+>   `composer-prod.json` at all — reconciliation is skipped entirely, and only
+>   `composer/composer-prod.json` reflects your real production configuration.
+> - **INITIAL case**: before any switch has ever been run, there is nothing yet to
+>   compare — reconciliation is a no-op regardless of direction.
+> - **Missing `composer-prod.json`**: with no production baseline on disk, reconciliation
+>   is a no-op for every direction except an explicit request to recreate it from
+>   `composer.json`; see
+>   [Reconciling PROD configuration drift](#reconciling-prod-configuration-drift) for both
+>   ways to recover from this.
 
-Composer scripts are typically static methods in a class, which are called by
-Composer when the script is executed.
+### 3. Set up switching scripts
 
-You can use the following class as a starting point for your project:
+The library provides built-in Composer script entry points. If your project follows the
+standard file layout — `composer.json` in the project root, and `composer-prod.json` plus
+`local-repositories.json` in a `composer/` subdirectory — you can wire them directly 
+without writing any PHP glue code:
+
+```json
+{
+  "scripts": {
+    "switch-dev": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchDev",
+    "switch-prod": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchProd",
+    "switch-update": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchUpdate",
+    "switch-verify-config": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerVerifyConfig",
+    "switch-install-hooks": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerInstallHooks"
+  }
+}
+```
+
+These entry points use `ConfigSwitcher::fromProjectRoot(getcwd())` internally, which
+resolves to:
+
+- `<project-root>/composer.json`
+- `<project-root>/composer/composer-prod.json`
+- `<project-root>/composer/local-repositories.json`
+
+The library also ships these optional entry points, which use the same path
+convention:
+
+```json
+{
+  "scripts": {
+    "switch-describe": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchDescribe",
+    "switch-describe-json": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchDescribeJson",
+    "switch-reconcile": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchReconcile",
+    "switch-preview-dev": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchPreviewDev",
+    "switch-preview-prod": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchPreviewProd"
+  }
+}
+```
+
+See [Inspecting switcher state](#inspecting-switcher-state) and
+[Previewing a switch](#previewing-a-switch) for what these print.
+
+> NOTE: It's good practice to also have a `build` script that ensures the
+> configuration is set to production mode before deploying the project.
+> This will minimize the risk of accidentally deploying with development
+> dependencies.
+
+### Custom file layout
+
+If your project uses a different file layout, you can use the three-argument constructor
+directly in a custom script handler class:
 
 ```php
 declare(strict_types=1);
@@ -100,6 +170,15 @@ use Mistralys\ComposerSwitcher\Utils\ConfigFile;
 
 class ComposerScripts
 {
+    private static function createSwitcher() : ConfigSwitcher
+    {
+        return new ConfigSwitcher(
+            new ConfigFile('/path/to/composer.json'),
+            new ConfigFile('/path/to/composer-production.json'),
+            new ConfigFile('/path/to/local-repositories.json')
+        );
+    }
+
     public static function switchToDEV() : void
     {
         self::createSwitcher()->switchToDevelopment();
@@ -114,67 +193,10 @@ class ComposerScripts
     {
         self::createSwitcher()->switchUpdate();
     }
-
-    private static $initialized = false;
-
-    /**
-     * Initializes the Composer autoloader. Scripts do not
-     * automatically load it, so we need to do it manually.
-     * Additionally, we ensure that this is only done once
-     * across multiple script calls.
-     */
-    private static function initAutoloader() : void
-    {
-        if(self::$initialized) {
-            return;
-        }
-        
-        self::$initialized = true;
-        
-        require_once __DIR__ . '/vendor/autoload.php';
-    }
-    
-    /**
-     * @var ConfigSwitcher|null 
-     */
-    private static $switcher;
-    
-    /**
-     * Create/get the configuration switcher instance.
-     * This automatically initializes the Composer
-     * autoloader as well.
-     * 
-     * @return ConfigSwitcher
-     */
-    private static function createSwitcher() : ConfigSwitcher
-    {
-        if(self::$switcher !== null) {
-            return self::$switcher;
-        }
-    
-        self::initAutoloader();
-        
-        $switcher = new ConfigSwitcher(
-            new ConfigFile('/path/to/composer.json'),
-            new ConfigFile('/path/to/composer-production.json'),
-            new ConfigFile('/path/to/composer-local-repositories.json'),
-        );
-        
-        self::$switcher = $switcher;
-        
-        return $switcher;
-    }
 }
 ```
 
-> NOTE: Adjust the paths in the `createSwitcher()` method to point to your
-> local configuration files, as well as the autoloader path if needed.
-
-### 4. Set up switching scripts
-
-We will be adding scripts to the `composer.json` file to switch
-between development and production configurations, as well as 
-update the current configuration.
+Then wire the scripts in `composer.json`:
 
 ```json
 {
@@ -185,11 +207,6 @@ update the current configuration.
   }
 }
 ```
-
-> NOTE: It's good practice to also have a `build` script that ensures the
-> configuration is set to production mode before deploying the project. 
-> This will minimize the risk of accidentally deploying with development 
-> dependencies.
 
 ### Vendor dependencies in attached projects
 
@@ -225,15 +242,221 @@ composer update
 
 ### Update current configuration
 
-This command will re-apply the current configuration (DEV or PROD) to 
-update the configurations based on which files have been modified.
-Use this if you modified either the `composer-production.json` or the
-`composer.json` file directly.
+This command will re-apply the current configuration (DEV or PROD).
+In PROD mode, `composer.json` and `composer-prod.json` are reconciled:
+if their content already matches, nothing happens; otherwise the file
+with the more recent modification time is copied over the other one
+(along with its lock file). Use this if you modified either the
+`composer-prod.json` or the `composer.json` file directly.
 
 ```bash
 composer switch-update
 composer update
 ```
+
+> NOTE: If `composer.json`'s lock file is missing (for example right after cloning
+> the project), the switch still completes in full — config rewrite, status file,
+> flag file — with a console warning instead of aborting. A DEV→PROD switch with
+> no `composer-prod.lock` backup to restore from behaves the same way: the stale
+> DEV lock file is removed and a warning is printed, rather than the switch failing.
+
+If `composer.json` and `composer-prod.json` were both edited and
+happen to share the same modification time, reconciliation cannot pick
+a direction automatically and performs no write — see
+[Reconciling PROD configuration drift](#reconciling-prod-configuration-drift)
+for the programmatic API that lets you resolve this explicitly.
+
+### Inspecting a switch outcome
+
+`switchTo()`, `switchToDevelopment()`, `switchToProduction()` and `switchUpdate()` all
+return a `SwitchOutcome` object describing what the switch did, using the same shape
+as `reconcile()`:
+
+```php
+$outcome = $switcher->switchToProduction();
+
+$outcome->getMode();          // string — the mode that was switched to
+$outcome->getMessages();      // SwitchMessage[]
+$outcome->getMessageTexts();  // string[]
+$outcome->getOperations();    // FileOperation[] — files copied or removed, in order
+$outcome->hasOperations();    // bool — true if at least one file was touched
+```
+
+`switchUpdate()` returns the outcome of whichever of `switchToDevelopment()`/
+`switchToProduction()` it dispatches to. If no switch has ever been run yet, it
+performs no file operations and returns a `SwitchOutcome` with mode `initial`
+(`ConfigSwitcher::MODE_INITIAL`) and no operations, rather than silently doing nothing.
+
+## Verifying configuration sync
+
+After editing `composer-prod.json`, you can verify that the production configuration is still in
+sync with the active `composer.json`:
+
+```bash
+composer switch-verify-config
+```
+
+This prints an in-sync confirmation, a list of differing keys, or a DEV-mode message.
+
+For programmatic use, the `verify()` method returns a `VerificationResult` object:
+
+```php
+$result = $switcher->verify();
+
+$result->isDevMode();     // bool — whether the switcher was in DEV mode
+$result->isComparable();  // bool — false in DEV mode, since the comparison isn't meaningful
+$result->isInSync();      // bool — always false when not comparable
+$result->getDifferences(); // string[] — top-level key names that differ
+```
+
+`toArray()` returns the equivalent `array{inSync:bool,differences:string[],devMode:bool}` shape.
+
+## Reconciling PROD configuration drift
+
+`composer switch-update` calls `reconcile()` internally when in PROD mode, but it is also available directly for programmatic use — for example to preview a reconciliation, force a direction, or inspect exactly which files were touched:
+
+```php
+$outcome = $switcher->reconcile();
+
+$outcome->getMode();          // string — the mode reconciliation ran in
+$outcome->isDryRun();         // bool
+$outcome->getMessages();      // SwitchMessage[]
+$outcome->getMessageTexts();  // string[]
+$outcome->getOperations();    // FileOperation[] — files copied, in order
+$outcome->hasOperations();    // bool — true if at least one file was (or would be) touched
+```
+
+Content decides *whether* a reconciliation is needed — if `composer.json` and `composer-prod.json` already match, `reconcile()` is a no-op regardless of their modification times. When they differ, the more recently modified file wins by default. To resolve an ambiguous case (equal modification times) or to force a specific outcome, pass an explicit direction:
+
+```php
+use Mistralys\ComposerSwitcher\ConfigSwitcher;
+
+$switcher->reconcile(ConfigSwitcher::RECONCILE_TO_PROD); // composer.json → composer-prod.json
+$switcher->reconcile(ConfigSwitcher::RECONCILE_TO_MAIN); // composer-prod.json → composer.json
+```
+
+Pass `true` as the second argument to preview the outcome without writing any files:
+
+```php
+$preview = $switcher->reconcile(null, true);
+```
+
+`reconcile()` is a no-op in DEV mode, since `composer.json` has already been rewritten for local repositories and is not meaningful to compare against `composer-prod.json`.
+
+`reconcile()` never throws for two additional states that have nothing to reconcile yet —
+it reports them as a no-op outcome instead, for every direction, including an explicit one:
+
+- **`INITIAL` state** (no switch has ever been run): mode `ConfigSwitcher::MODE_INITIAL`,
+  message `MESSAGE_INITIAL_NOT_RECONCILABLE`.
+- **`composer-prod.json` missing** in PROD mode: message `MESSAGE_PROD_CONFIG_MISSING` —
+  *except* for an explicit `RECONCILE_TO_PROD`, which recovers instead of being blocked,
+  recreating `composer-prod.json` (and its lock file, when present) from `composer.json`
+  and reporting `MESSAGE_BACKED_UP_MAIN_TO_PROD`. There are two ways to trigger this
+  recovery: programmatically, `$switcher->reconcile(ConfigSwitcher::RECONCILE_TO_PROD)`;
+  from the command line, delete the status file and run `composer switch-prod` — a fresh
+  switch to PROD always (re)creates `composer-prod.json` from the current `composer.json`
+  if it is missing, since `composer switch-reconcile` itself always resolves the direction
+  automatically and cannot be made to pass `RECONCILE_TO_PROD` explicitly.
+
+An invalid direction (anything other than `RECONCILE_TO_MAIN`/`RECONCILE_TO_PROD`) still
+throws `ComposerSwitcherException::ERROR_INVALID_RECONCILE_DIRECTION` in every state above,
+`INITIAL` included.
+
+A preview (`reconcile(null, true)`, or `previewSwitch()` in PROD mode with drifted configs)
+never writes to disk — if `reconcile()` throws partway through a real (non-preview) call,
+the switcher's dry-run flag is always restored to its prior value before the call returns.
+
+```bash
+composer switch-reconcile
+```
+
+## Inspecting switcher state
+
+`describe()` assembles a full snapshot of the switcher's current state — mode, last
+switch date, per-file existence and modification date for every config and lock file
+it manages, which flag file (if any) is active, the `verify()` result, and the parsed
+`local-repositories` list — without throwing, even when the dev configuration file is
+missing or malformed (in which case the repository list comes back empty and a warning
+is attached instead):
+
+```php
+$description = $switcher->describe();
+
+$description->getMode();              // string|null — 'dev'/'prod'/'initial', or null if unknown
+$description->getLastSwitchDate();    // string|null
+$description->getFiles();             // array<int,array{label,path,exists,modifiedDate}>
+$description->getActiveFlag();        // string|null — mode whose flag file currently exists
+$description->getVerification();      // VerificationResult, same object verify() returns
+$description->getLocalRepositories(); // array<int,array{packageName,path,version}>
+$description->getWarnings();          // string[] — e.g. an unreadable dev config
+$description->hasWarnings();          // bool
+```
+
+`toArray()` returns the equivalent nested array shape, and `toJSON()` encodes it as
+pretty-printed JSON (`JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES`) for programmatic
+consumption. A full example payload, for a project in PROD mode with one local
+repository configured and no warnings:
+
+```json
+{
+  "mode": "prod",
+  "lastSwitchDate": "2026-09-30 08:12:45",
+  "files": [
+    { "label": "main", "path": "/project/composer.json", "exists": true, "modifiedDate": "2026-09-30 08:12:45" },
+    { "label": "prod", "path": "/project/composer/composer-prod.json", "exists": true, "modifiedDate": "2026-09-29 17:03:11" },
+    { "label": "dev", "path": "/project/composer/local-repositories.json", "exists": true, "modifiedDate": "2026-09-28 11:40:02" },
+    { "label": "status", "path": "/project/composer/local-repositories.status", "exists": true, "modifiedDate": "2026-09-30 08:12:45" },
+    { "label": "mainLock", "path": "/project/composer.lock", "exists": true, "modifiedDate": "2026-09-30 08:12:46" },
+    { "label": "prodLock", "path": "/project/composer/composer-prod.lock", "exists": true, "modifiedDate": "2026-09-29 17:03:20" },
+    { "label": "devLock", "path": "/project/composer/local-repositories.lock", "exists": false, "modifiedDate": null }
+  ],
+  "activeFlag": "prod",
+  "verification": {
+    "inSync": true,
+    "differences": [],
+    "devMode": false
+  },
+  "localRepositories": [
+    { "packageName": "vendor/package-name", "path": "/path/to/package", "version": "*" }
+  ],
+  "warnings": []
+}
+```
+
+```bash
+composer switch-describe       # human-readable report
+composer switch-describe-json  # pretty-printed JSON
+```
+
+## Previewing a switch
+
+`previewSwitch(string $mode)` runs the same code path as a real switch, under a
+dry-run overlay that never touches disk — every file on disk stays byte-identical and
+every modification time stays unchanged, and its returned `SwitchOutcome::getOperations()`
+matches exactly what a real switch from the same starting state would perform (even from
+the `INITIAL` state, where `composer-prod.json` does not yet exist):
+
+```php
+$outcome = $switcher->previewSwitch(ConfigSwitcher::MODE_PROD);
+
+$outcome->isDryRun();       // bool — always true for previewSwitch()
+$outcome->getOperations();  // FileOperation[] — what would be copied/written/removed
+$outcome->getMessages();    // SwitchMessage[]
+```
+
+`switchTo(string $mode, bool $dryRun = false)` exposes the same dry-run overlay
+directly; `previewSwitch()` calls `switchTo($mode, true)` with message display
+suppressed. The dry-run flag is always restored to its previous value afterward —
+even if an exception is thrown mid-preview — so a subsequent real switch still writes
+to disk normally.
+
+```bash
+composer switch-preview-dev
+composer switch-preview-prod
+```
+
+Each planned file operation is printed as `would <type>: <source> -> <target> (<reason>)`,
+followed by the same messages a real switch would display.
 
 ## Options
 
@@ -264,6 +487,26 @@ $switcher = new ConfigSwitcher();
 
 $switcher->setWriteToConsole(true);
 ```
+
+After a switch completes, a summary of what happened is printed to the console
+automatically. This can be disabled:
+
+```php
+$switcher->setDisplayMessages(false);
+```
+
+For programmatic use, `getMessages()` returns the switch messages as an array of
+`SwitchMessage` objects, each pairing a human-readable text with a numeric
+`ConfigSwitcher::MESSAGE_*` code:
+
+```php
+foreach($switcher->getMessages() as $message) {
+    echo $message->getCode() . ': ' . $message->getText();
+}
+```
+
+`getMessageTexts()` returns the same messages as a plain `string[]`, and is what
+`displayMessages()` uses internally to render console output.
 
 ## Using specific package versions
 
@@ -300,6 +543,179 @@ be used whenever Composer needs to resolve the package version.
 > NOTE: The only drawback of this approach is that you will need to maintain the version
 > number manually in the configuration file.
 
+## Handling exceptions
+
+All errors raised by the library are instances of `ComposerSwitcherException`, each
+carrying a numeric `ERROR_*` code and, in addition to its message, a structured context
+array describing the failure programmatically instead of requiring you to parse the
+message text:
+
+```php
+use Mistralys\ComposerSwitcher\ComposerSwitcherException;
+
+try {
+    $switcher->switchToProduction();
+} catch (ComposerSwitcherException $e) {
+    $e->getCode();               // int — one of the ERROR_* constants
+    $e->getContext();            // array — the full context payload
+    $e->getContextValue('filePath'); // mixed — null if the key isn't present
+}
+```
+
+Common context keys include `filePath`/`targetPath` (the file involved, or a copy's
+source/destination pair), `mode`/`direction` (an offending `switchTo()` mode or
+`reconcile()` direction string), and `expected`/`actual` (an offending value paired
+with what was expected). See `ComposerSwitcherException`'s `KEY_*` constants for the
+full list.
+
+A filesystem failure (a failed read, write, copy, or delete) never leaks a bare PHP
+warning — even when a stricter host, such as Composer's own error handler, would
+otherwise turn an unsuppressed warning into an `\ErrorException`. It always surfaces
+as a `ComposerSwitcherException` instead, with the native error's message attached
+under `KEY_NATIVE_ERROR` and the same native error chained as `getPrevious()`:
+
+```php
+} catch (ComposerSwitcherException $e) {
+    $e->getContextValue(ComposerSwitcherException::KEY_NATIVE_ERROR); // string|null — native PHP error message
+    $e->getPrevious();                                                // ?Throwable — the captured \ErrorException
+}
+```
+
+## Programmatic and agent usage
+
+The sections above introduce each value object where it's returned, but for a caller
+building automation or an AI agent around this library, here is the whole
+programmatic surface in one place — everything you need to drive a switch, inspect
+its outcome, and handle failure, entirely without parsing console text.
+
+| You want to... | Call | Returns |
+|---|---|---|
+| Perform a switch or update | `switchTo()`, `switchToDevelopment()`, `switchToProduction()`, `switchUpdate()` | `SwitchOutcome` |
+| Fix drift without switching | `reconcile()` | `SwitchOutcome` |
+| Preview a switch with no disk writes | `previewSwitch()` | `SwitchOutcome` (`isDryRun()` always `true`) |
+| Compare `composer.json` vs `composer-prod.json` | `verify()` | `VerificationResult` |
+| Get a full state snapshot | `describe()` | `SwitchDescription` |
+
+Every one of these value objects is immutable and exposes a `toArray()` (`SwitchDescription`
+also exposes `toJSON()`), so a caller never needs to scrape console output or parse a
+free-form message string to know what happened:
+
+```php
+use Mistralys\ComposerSwitcher\ConfigSwitcher;
+use Mistralys\ComposerSwitcher\ComposerSwitcherException;
+
+$switcher = ConfigSwitcher::fromProjectRoot($projectRoot);
+$switcher->setWriteToConsole(false);   // suppress verbose step-by-step logging
+$switcher->setDisplayMessages(false);  // suppress the automatic post-switch summary
+
+try {
+    $outcome = $switcher->switchToProduction();
+
+    // SwitchOutcome: what happened
+    $outcome->getMode();                          // 'prod'
+    $outcome->isDryRun();                          // false
+    $outcome->hasOperations();                     // bool
+
+    foreach($outcome->getMessages() as $message) { // SwitchMessage[]
+        $message->getCode();                       // int — ConfigSwitcher::MESSAGE_* constant, or 0
+        $message->hasCode();                        // bool — false when code is 0
+        $message->getText();                        // string
+    }
+
+    foreach($outcome->getOperations() as $operation) { // FileOperation[]
+        $operation->getType();                          // FileOperation::TYPE_COPY|TYPE_WRITE|TYPE_DELETE
+        $operation->getSourcePath();                     // string|null — null for write/delete
+        $operation->getTargetPath();                     // string
+        $operation->getReason();                         // string — human-readable
+        $operation->isApplied();                         // bool — false in a dry run
+    }
+
+    // Every value object round-trips to a plain array for JSON APIs, logs, etc.
+    json_encode($outcome->toArray());
+} catch (ComposerSwitcherException $e) {
+    // Structured failure: no message-string parsing required
+    $e->getCode();                                  // int — a ComposerSwitcherException::ERROR_* constant
+    $e->getContext();                                // array — full structured payload
+    $e->getContextValue(ComposerSwitcherException::KEY_FILE_PATH); // mixed — null if absent
+}
+```
+
+For a read-only, agent-friendly snapshot of everything the switcher knows (without
+performing a switch), use `describe()->toJSON()` — see
+[Inspecting switcher state](#inspecting-switcher-state) for the full example payload — or
+drive it directly from the console with `composer switch-describe-json`.
+
+## Git hooks
+
+The library ships with a pre-commit hook that prevents accidentally committing development
+configuration to version control. It blocks the commit when:
+
+1. `composer.json` or `composer.lock` is staged while in DEV mode (the `composer.json.DEV` marker file exists).
+2. `composer.json` is staged and contains a `"type": "path"` entry in its `repositories` key (a local symlink is active) — in either list or keyed-object form. The check falls back to a file-wide match (never failing open) if the staged file is not valid JSON or `php` is unavailable.
+
+To install the hook in your project:
+
+```bash
+composer switch-install-hooks
+```
+
+Or programmatically:
+
+```php
+$switcher->installGitHooks('/path/to/project-root');
+```
+
+This copies the bundled hook to `.git/hooks/pre-commit` with executable permissions,
+**overwriting any existing `pre-commit` hook** at that path without prompting or backing it up.
+If `.git/hooks/` does not exist, the method returns `false` and prints a console warning.
+
+## Migrating from 2.x
+
+Version 3.0.0 introduces typed return values in place of the previous `void`/array
+returns and one behavior fix. Existing `composer switch-*` Composer scripts and the
+`composer.json`/`composer-prod.json`/`local-repositories.json` file layout are
+**unchanged** — this migration only affects code that calls the library's PHP API
+directly.
+
+1. **`verify()` no longer returns an array.** It returns a `VerificationResult` object.
+
+   ```php
+   // Before (2.x)
+   $result = $switcher->verify();
+   $inSync = $result['inSync'];
+   $differences = $result['differences'];
+
+   // After (3.0.0)
+   $result = $switcher->verify();
+   $inSync = $result->isInSync();
+   $differences = $result->getDifferences();
+   ```
+
+2. **`switchTo()`, `switchToDevelopment()`, `switchToProduction()`, and `switchUpdate()`
+   no longer return `void`.** They return a `SwitchOutcome` object. If you have a
+   subclass or wrapper that declares a `: void` return type on an override, or code
+   that asserted these calls returned nothing, update the type/assertion — see
+   [Inspecting a switch outcome](#inspecting-a-switch-outcome) and
+   [Programmatic and agent usage](#programmatic-and-agent-usage) for the new shape.
+   Console output and `getMessages()`/`getMessageTexts()` on `ConfigSwitcher` are
+   unaffected — only the return type changed, not the side effects.
+
+3. **`BaseFile::tryCopyTo()` no longer requires the target to already exist.** In 2.x,
+   `tryCopyTo()` copied only when *both* the source and the target existed — a target
+   that didn't exist yet was silently skipped. In 3.0.0, it copies whenever the
+   *source* exists, regardless of whether the target exists yet. This is a bug fix
+   (the documented behavior was always "copy if the source exists"), but if any
+   custom code relied on `tryCopyTo()` refusing to create a new file, add an explicit
+   `$target->exists()` guard before calling it.
+
+4. **New capabilities are entirely additive** — `describe()`, `previewSwitch()`,
+   `reconcile()`, structured message codes (`SwitchMessage`), and exception context
+   (`ComposerSwitcherException::getContext()`) are new methods/features you can adopt
+   incrementally; nothing about them requires touching existing call sites.
+
+No changes are required to `composer.json` script wiring, the three-path file
+convention, or the `local-repositories.json` format.
+
 ## Version control
 
 Here is what you should and should not commit to version control:
@@ -307,17 +723,11 @@ Here is what you should and should not commit to version control:
 - `composer.json` - YES
 - `composer.lock` - YES
 - `composer.json.PROD` / `composer.json.DEV` - NO (helper files)
-- `composer-production.json` - YES
-- `composer-production.lock` - YES
-- `dev-config.json` - NO (local-specific paths)
-- `dev-config.status` - NO
+- `composer-prod.json` - YES
+- `composer-prod.lock` - YES
+- `local-repositories.json` - NO (local-specific paths)
+- `local-repositories.status` - NO
 
-> NOTE: It is good practice to add a template for the `dev-config.json` file
+> NOTE: It is good practice to add a template for the `local-repositories.json` file
 > to version control, so other developers can use this to create their own local
-> configuration file. This is typically named something like `dev-config.dist.json`.
-
-## Why PHP v7.3?
-
-The library is currently used in a legacy Composer environment that is still running 
-PHP v7.3. It is planned to be modernized, but until then this package will remain 
-compatible with PHP v7.3.
+> configuration file. This is typically named something like `local-repositories.dist.json`.

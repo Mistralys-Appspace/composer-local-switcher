@@ -4,14 +4,9 @@ declare(strict_types=1);
 
 namespace Mistralys\ComposerSwitcher\Utils;
 
-use Mistralys\ComposerSwitcher\ComposerSwitcherException;
-
 class LockFile extends BaseFile
 {
-    /**
-     * @var ConfigFile
-     */
-    private $configFile;
+    private readonly ConfigFile $configFile;
 
     public function __construct(ConfigFile $configFile)
     {
@@ -22,16 +17,7 @@ class LockFile extends BaseFile
 
     public function getContent() : string
     {
-        $content = file_get_contents($this->getPath());
-
-        if($content !== false) {
-            return $content;
-        }
-
-        throw new ComposerSwitcherException(
-            'Failed to read file: ' . $this->getPath(),
-            ComposerSwitcherException::ERROR_CANNOT_READ_FILE
-        );
+        return $this->getFileSystem()->read($this->getPath());
     }
 
     public function getConfigFile(): ConfigFile
