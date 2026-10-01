@@ -90,7 +90,8 @@ file will be modified automatically when switching between configurations.
 > NOTE: `composer switch-update`/`reconcile()` can reconcile drift between `composer.json`
 > and `composer-prod.json` on your behalf, but this is **best-effort**, not a substitute
 > for the rule above. It resolves drift by comparing file content and picks a direction
-> using file modification time — two cases it cannot resolve automatically:
+> using file modification time — two cases it cannot resolve automatically, plus two
+> states it reports as a no-op rather than acting on:
 > - **Ambiguous case**: both files were edited and happen to share the same modification
 >   time. No direction can be chosen; see
 >   [Reconciling PROD configuration drift](#reconciling-prod-configuration-drift) for the
@@ -99,6 +100,13 @@ file will be modified automatically when switching between configurations.
 >   with local path repositories and is no longer meaningful to compare against
 >   `composer-prod.json` at all — reconciliation is skipped entirely, and only
 >   `composer/composer-prod.json` reflects your real production configuration.
+> - **INITIAL case**: before any switch has ever been run, there is nothing yet to
+>   compare — reconciliation is a no-op regardless of direction.
+> - **Missing `composer-prod.json`**: with no production baseline on disk, reconciliation
+>   is a no-op for every direction except an explicit request to recreate it from
+>   `composer.json`; see
+>   [Reconciling PROD configuration drift](#reconciling-prod-configuration-drift) for both
+>   ways to recover from this.
 
 ### 3. Set up switching scripts
 
@@ -335,6 +343,29 @@ $preview = $switcher->reconcile(null, true);
 
 `reconcile()` is a no-op in DEV mode, since `composer.json` has already been rewritten for local repositories and is not meaningful to compare against `composer-prod.json`.
 
+`reconcile()` never throws for two additional states that have nothing to reconcile yet —
+it reports them as a no-op outcome instead, for every direction, including an explicit one:
+
+- **`INITIAL` state** (no switch has ever been run): mode `ConfigSwitcher::MODE_INITIAL`,
+  message `MESSAGE_INITIAL_NOT_RECONCILABLE`.
+- **`composer-prod.json` missing** in PROD mode: message `MESSAGE_PROD_CONFIG_MISSING` —
+  *except* for an explicit `RECONCILE_TO_PROD`, which recovers instead of being blocked,
+  recreating `composer-prod.json` (and its lock file, when present) from `composer.json`
+  and reporting `MESSAGE_BACKED_UP_MAIN_TO_PROD`. There are two ways to trigger this
+  recovery: programmatically, `$switcher->reconcile(ConfigSwitcher::RECONCILE_TO_PROD)`;
+  from the command line, delete the status file and run `composer switch-prod` — a fresh
+  switch to PROD always (re)creates `composer-prod.json` from the current `composer.json`
+  if it is missing, since `composer switch-reconcile` itself always resolves the direction
+  automatically and cannot be made to pass `RECONCILE_TO_PROD` explicitly.
+
+An invalid direction (anything other than `RECONCILE_TO_MAIN`/`RECONCILE_TO_PROD`) still
+throws `ComposerSwitcherException::ERROR_INVALID_RECONCILE_DIRECTION` in every state above,
+`INITIAL` included.
+
+A preview (`reconcile(null, true)`, or `previewSwitch()` in PROD mode with drifted configs)
+never writes to disk — if `reconcile()` throws partway through a real (non-preview) call,
+the switcher's dry-run flag is always restored to its prior value before the call returns.
+
 ```bash
 composer switch-reconcile
 ```
@@ -537,6 +568,19 @@ source/destination pair), `mode`/`direction` (an offending `switchTo()` mode or
 with what was expected). See `ComposerSwitcherException`'s `KEY_*` constants for the
 full list.
 
+A filesystem failure (a failed read, write, copy, or delete) never leaks a bare PHP
+warning — even when a stricter host, such as Composer's own error handler, would
+otherwise turn an unsuppressed warning into an `\ErrorException`. It always surfaces
+as a `ComposerSwitcherException` instead, with the native error's message attached
+under `KEY_NATIVE_ERROR` and the same native error chained as `getPrevious()`:
+
+```php
+} catch (ComposerSwitcherException $e) {
+    $e->getContextValue(ComposerSwitcherException::KEY_NATIVE_ERROR); // string|null — native PHP error message
+    $e->getPrevious();                                                // ?Throwable — the captured \ErrorException
+}
+```
+
 ## Programmatic and agent usage
 
 The sections above introduce each value object where it's returned, but for a caller
@@ -607,7 +651,7 @@ The library ships with a pre-commit hook that prevents accidentally committing d
 configuration to version control. It blocks the commit when:
 
 1. `composer.json` or `composer.lock` is staged while in DEV mode (the `composer.json.DEV` marker file exists).
-2. `composer.json` is staged and contains a `"type": "path"` repository entry (a local symlink is active).
+2. `composer.json` is staged and contains a `"type": "path"` entry in its `repositories` key (a local symlink is active) — in either list or keyed-object form. The check falls back to a file-wide match (never failing open) if the staged file is not valid JSON or `php` is unavailable.
 
 To install the hook in your project:
 

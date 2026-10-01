@@ -72,24 +72,45 @@ User calls ConfigSwitcher::switchUpdate(): SwitchOutcome
 switchToProduction() when already in PROD mode
   → switch_case_PROD_PROD()
     → Adds MESSAGE_USING_PROD_CONFIG
-    → Delegates into the shared reconciliation core (reconcileCore()),
+    → Delegates into the shared reconciliation core (reconcileCore(null)),
       the same core the public reconcile() method calls — guaranteeing
       identical file effects between a PROD→PROD switch and a direct
-      reconcile() call from the same starting state
+      reconcile() call from the same starting state. No dry-run flag of
+      its own is passed: the nested call simply inherits whatever flag
+      the enclosing switchTo() already set, so a PROD-mode preview can
+      never let this nested reconcile perform a real write.
 
 ConfigSwitcher::reconcile(?string $direction = null, bool $dryRun = false): SwitchOutcome
+  → Validates $direction (throws ERROR_INVALID_RECONCILE_DIRECTION for a
+    non-null, non-constant value — in every state, INITIAL included)
   → Sets the dry-run flag and clears the file-operation log
     → If $dryRun: adds MESSAGE_DRY_RUN_ACTIVE
-  → If DEV mode: adds MESSAGE_DEV_MODE_NOT_RECONCILABLE, returns (no-op) —
-    composer.json has been rewritten for local repositories and is not
-    meaningful to reconcile
-  → Calls verify() (content-first: decides *whether* to act)
+  → Calls the private reconcileCore($direction) inside a try/finally that
+    always restores the facade's previous dry-run flag afterward, even
+    if reconcileCore() throws (e.g. a malformed composer.json)
+  → reconcileCore() first calls reconcile_detectBlocker($direction), in order:
+    → If DEV mode: blocked — composer.json has been rewritten for local
+      repositories and is not meaningful to reconcile
+    → If INITIAL state (no switch has ever been run): blocked,
+      regardless of $direction — there is no baseline yet to reconcile
+      against
+    → If composer-prod.json does not exist and $direction is not
+      RECONCILE_TO_PROD: blocked — reconciling against a file that does
+      not exist would otherwise reach requireModifiedDate() and throw;
+      naming RECONCILE_TO_PROD explicitly is the one direction that
+      recovers instead (see below)
+    → A blocker, if any, records its message (MESSAGE_DEV_MODE_NOT_RECONCILABLE
+      / MESSAGE_INITIAL_NOT_RECONCILABLE / MESSAGE_PROD_CONFIG_MISSING) and
+      returns (no-op) immediately — verify() is never called
+  → Otherwise calls verify() (content-first: decides *whether* to act)
     → If in sync: adds MESSAGE_ALREADY_IN_SYNC, returns (no-op), even
       when composer.json and composer-prod.json have different
       modification times
   → Resolves a direction (decides *which way* to copy):
     → $direction explicit argument, if given (RECONCILE_TO_MAIN or
-      RECONCILE_TO_PROD) — also used to resolve the ambiguous case below
+      RECONCILE_TO_PROD) — also used to resolve the ambiguous case
+      below, and to recover a missing composer-prod.json when it is
+      RECONCILE_TO_PROD
     → Otherwise, compares modification times of composer.json vs
       composer-prod.json:
       → If main is newer: direction = RECONCILE_TO_PROD (user edited
@@ -102,11 +123,13 @@ ConfigSwitcher::reconcile(?string $direction = null, bool $dryRun = false): Swit
         modification-time signal to pick a direction automatically
   → Applies the resolved direction, if any:
     → RECONCILE_TO_PROD: adds MESSAGE_BACKED_UP_MAIN_TO_PROD, copies
-      composer.json → composer-prod.json plus its lock file
+      composer.json → composer-prod.json plus its lock file (this is
+      also how a missing composer-prod.json is recreated)
     → RECONCILE_TO_MAIN: adds MESSAGE_RESTORED_PROD_TO_MAIN, copies
       composer-prod.json → composer.json plus its lock file
-  → Restores the facade's previous dry-run flag
   → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations)
+    — mode is MODE_INITIAL when the INITIAL blocker fired, otherwise the
+    current status mode
 ```
 
 ## 5a. Describe Current State
@@ -145,7 +168,10 @@ User calls ConfigSwitcher::previewSwitch(string $mode): SwitchOutcome
   → Returns a SwitchOutcome whose getOperations() lists every planned
     FileOperation (isApplied(): false), matching exactly what a real
     switch from the same starting state would perform — including
-    from the INITIAL state, where composer-prod.json does not yet exist
+    from the INITIAL state, where composer-prod.json does not yet exist,
+    and from a drifted PROD state, where switch_case_PROD_PROD()'s nested
+    reconcile inherits this call's dry-run flag rather than performing a
+    real reconcile copy (see §4)
 ```
 
 ## 5c. Verify Configuration
