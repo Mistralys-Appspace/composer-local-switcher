@@ -136,6 +136,44 @@ final class TestMessages extends ComposerSwitcherTestCase
         );
     }
 
+    /**
+     * `setDisplayMessages(false)` must suppress the automatic console
+     * output a switch would otherwise print, while `getMessages()`
+     * still reports every accumulated message — disabling display does
+     * not also discard the messages themselves.
+     */
+    public function test_setDisplayMessagesFalseSuppressesOutput() : void
+    {
+        $switcher = $this->createSwitcher()
+            ->setWriteToConsole(false)
+            ->setDisplayMessages(false);
+
+        ob_start();
+        $switcher->switchToDevelopment();
+        $output = ob_get_clean();
+
+        $this->assertSame('', $output);
+        $this->assertNotEmpty($switcher->getMessages());
+    }
+
+    /**
+     * `displayMessages()` called directly against an empty message log
+     * (no switch performed yet) must print nothing — not even the
+     * blank-line padding the non-empty case wraps its output in.
+     */
+    public function test_displayMessagesWithEmptyLogPrintsNothing() : void
+    {
+        $switcher = $this->createSwitcher();
+
+        $this->assertEmpty($switcher->getMessages());
+
+        ob_start();
+        $switcher->displayMessages();
+        $output = ob_get_clean();
+
+        $this->assertSame('', $output);
+    }
+
     // endregion
 
     // region: Support methods

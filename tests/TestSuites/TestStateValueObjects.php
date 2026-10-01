@@ -42,6 +42,21 @@ final class TestStateValueObjects extends TestCase
         $this->assertFalse($withoutCode->hasCode());
     }
 
+    /**
+     * {@see SwitchMessage::hasCode()} treats any non-positive code —
+     * not just the documented `0` default/unset value — as "no code".
+     * A negative code is not a value any throw site in the library
+     * ever constructs, but the getter's own `> 0` comparison should
+     * still be verified against it directly.
+     */
+    public function test_switchMessage_hasCodeWithNegativeCode() : void
+    {
+        $negative = new SwitchMessage(-1, 'Has a negative code');
+
+        $this->assertFalse($negative->hasCode());
+        $this->assertSame(-1, $negative->getCode());
+    }
+
     // endregion
 
     // region: _Tests - FileOperation
@@ -182,6 +197,23 @@ final class TestStateValueObjects extends TestCase
         $this->assertTrue($outcome->isDryRun());
     }
 
+    /**
+     * `toArray()` with no messages and no operations must still
+     * produce the full key set, with both collections as empty
+     * arrays rather than, say, being omitted or `null`.
+     */
+    public function test_switchOutcome_toArrayWithNoMessagesOrOperations() : void
+    {
+        $outcome = new SwitchOutcome('initial', false, array(), array());
+
+        $array = $outcome->toArray();
+
+        $this->assertSame('initial', $array['mode']);
+        $this->assertFalse($array['dryRun']);
+        $this->assertSame(array(), $array['messages']);
+        $this->assertSame(array(), $array['operations']);
+    }
+
     // endregion
 
     // region: _Tests - SwitchDescription
@@ -250,6 +282,41 @@ final class TestStateValueObjects extends TestCase
         $this->assertNull($description->getActiveFlag());
         $this->assertFalse($description->hasActiveFlag());
         $this->assertFalse($description->hasWarnings());
+    }
+
+    /**
+     * `toArray()`/`toJSON()` must round-trip cleanly with every
+     * collection empty (no files, no local repositories, no warnings)
+     * — the shape `describe()` produces for a freshly initialized
+     * project before any file records have been gathered.
+     */
+    public function test_switchDescription_toArrayAndJsonWithEmptyCollections() : void
+    {
+        $verification = new VerificationResult(false, true, array());
+
+        $description = new SwitchDescription(
+            null,
+            null,
+            array(),
+            null,
+            $verification,
+            array(),
+            array()
+        );
+
+        $array = $description->toArray();
+
+        $this->assertSame(array(), $array['files']);
+        $this->assertSame(array(), $array['localRepositories']);
+        $this->assertSame(array(), $array['warnings']);
+        $this->assertNull($array['mode']);
+        $this->assertNull($array['lastSwitchDate']);
+        $this->assertNull($array['activeFlag']);
+
+        $json = $description->toJSON();
+        $decoded = json_decode($json, true, 512, JSON_THROW_ON_ERROR);
+
+        $this->assertSame($array, $decoded);
     }
 
     // endregion

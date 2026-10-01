@@ -9,6 +9,7 @@ declare(strict_types=1);
 namespace Mistralys\ComposerSwitcher\Utils;
 
 use DateTime;
+use ErrorException;
 use Mistralys\ComposerSwitcher\ComposerSwitcherException;
 use Mistralys\ComposerSwitcher\State\FileOperation;
 
@@ -27,6 +28,14 @@ use Mistralys\ComposerSwitcher\State\FileOperation;
  * `copy()` resolves its source through `read()`, so copying a file
  * that was only just (pending-)written works without touching disk.
  *
+ * No native PHP warning ever escapes this facade: every real-mode
+ * native filesystem call runs through {@see self::runNative()}, which
+ * captures any warning as an {@see ErrorException} instead of letting
+ * it reach the ambient error handler — this is what keeps a filesystem
+ * failure surfacing only as a typed {@see ComposerSwitcherException},
+ * never as the bare `\ErrorException` that Composer's own
+ * `ErrorHandler::handle()` would raise for an unsuppressed warning.
+ *
  * @package Composer Switcher
  * @subpackage Utils
  */
@@ -37,12 +46,12 @@ final class FileSystem
     /**
      * @var array<string,string|null>
      */
-    private array $overlay = array();
+    private array $overlay = [];
 
     /**
      * @var FileOperation[]
      */
-    private array $operations = array();
+    private array $operations = [];
 
     /**
      * @param bool $dryRun When enabling dry-run mode, the overlay starts empty.
@@ -52,7 +61,7 @@ final class FileSystem
     public function setDryRun(bool $dryRun) : self
     {
         $this->dryRun = $dryRun;
-        $this->overlay = array();
+        $this->overlay = [];
 
         return $this;
     }
@@ -87,12 +96,12 @@ final class FileSystem
                 'Failed to read file: ' . $path . ' (pending delete in dry-run mode).',
                 ComposerSwitcherException::ERROR_CANNOT_READ_FILE
             ))
-                ->setContext(array(
+                ->setContext([
                     ComposerSwitcherException::KEY_FILE_PATH => $path
-                ));
+                ]);
         }
 
-        $content = file_get_contents($path);
+        $content = $this->runNative(static fn() => file_get_contents($path), $nativeError);
 
         if($content !== false) {
             return $content;
@@ -100,11 +109,13 @@ final class FileSystem
 
         throw (new ComposerSwitcherException(
             'Failed to read file: ' . $path,
-            ComposerSwitcherException::ERROR_CANNOT_READ_FILE
+            ComposerSwitcherException::ERROR_CANNOT_READ_FILE,
+            $nativeError
         ))
-            ->setContext(array(
-                ComposerSwitcherException::KEY_FILE_PATH => $path
-            ));
+            ->setContext([
+                ComposerSwitcherException::KEY_FILE_PATH => $path,
+                ComposerSwitcherException::KEY_NATIVE_ERROR => $nativeError?->getMessage() ?? ''
+            ]);
     }
 
     public function modifiedTime(string $path) : ?DateTime
@@ -123,7 +134,7 @@ final class FileSystem
             return null;
         }
 
-        $timestamp = filemtime($path);
+        $timestamp = $this->runNative(static fn() => filemtime($path), $nativeError);
 
         if($timestamp === false) {
             return null;
@@ -147,14 +158,18 @@ final class FileSystem
             return;
         }
 
-        if(file_put_contents($path, $content) === false) {
+        $result = $this->runNative(static fn() => file_put_contents($path, $content), $nativeError);
+
+        if($result === false) {
             throw (new ComposerSwitcherException(
                 'Failed to write data to file: ' . $path,
-                ComposerSwitcherException::ERROR_CANNOT_WRITE_FILE
+                ComposerSwitcherException::ERROR_CANNOT_WRITE_FILE,
+                $nativeError
             ))
-                ->setContext(array(
-                    ComposerSwitcherException::KEY_FILE_PATH => $path
-                ));
+                ->setContext([
+                    ComposerSwitcherException::KEY_FILE_PATH => $path,
+                    ComposerSwitcherException::KEY_NATIVE_ERROR => $nativeError?->getMessage() ?? ''
+                ]);
         }
 
         $this->recordOperation(FileOperation::TYPE_WRITE, $path, null, $reason, true);
@@ -181,15 +196,19 @@ final class FileSystem
             return;
         }
 
-        if(file_put_contents($target, $content) === false) {
+        $result = $this->runNative(static fn() => file_put_contents($target, $content), $nativeError);
+
+        if($result === false) {
             throw (new ComposerSwitcherException(
                 'Failed to copy file from ' . $source . ' to ' . $target,
-                ComposerSwitcherException::ERROR_CANNOT_COPY_FILE
+                ComposerSwitcherException::ERROR_CANNOT_COPY_FILE,
+                $nativeError
             ))
-                ->setContext(array(
+                ->setContext([
                     ComposerSwitcherException::KEY_FILE_PATH => $source,
-                    ComposerSwitcherException::KEY_TARGET_PATH => $target
-                ));
+                    ComposerSwitcherException::KEY_TARGET_PATH => $target,
+                    ComposerSwitcherException::KEY_NATIVE_ERROR => $nativeError?->getMessage() ?? ''
+                ]);
         }
 
         $this->recordOperation(FileOperation::TYPE_COPY, $target, $source, $reason, true);
@@ -216,14 +235,18 @@ final class FileSystem
             return;
         }
 
-        if(!unlink($path)) {
+        $result = $this->runNative(static fn() => unlink($path), $nativeError);
+
+        if(!$result) {
             throw (new ComposerSwitcherException(
                 'Failed to delete file: ' . $path,
-                ComposerSwitcherException::ERROR_CANNOT_DELETE_FILE
+                ComposerSwitcherException::ERROR_CANNOT_DELETE_FILE,
+                $nativeError
             ))
-                ->setContext(array(
-                    ComposerSwitcherException::KEY_FILE_PATH => $path
-                ));
+                ->setContext([
+                    ComposerSwitcherException::KEY_FILE_PATH => $path,
+                    ComposerSwitcherException::KEY_NATIVE_ERROR => $nativeError?->getMessage() ?? ''
+                ]);
         }
 
         $this->recordOperation(FileOperation::TYPE_DELETE, $path, null, $reason, true);
@@ -239,11 +262,47 @@ final class FileSystem
 
     public function clearOperations() : void
     {
-        $this->operations = array();
+        $this->operations = [];
     }
 
     private function recordOperation(string $type, string $targetPath, ?string $sourcePath, string $reason, bool $applied) : void
     {
         $this->operations[] = new FileOperation($type, $targetPath, $sourcePath, $reason, $applied);
+    }
+
+    /**
+     * Runs a native PHP call with any warning/notice it raises captured
+     * into `$capturedError` instead of being emitted to the ambient
+     * error handler — this is what guarantees no native warning ever
+     * escapes this facade, even under a Composer-style error handler
+     * that throws on any unsuppressed warning.
+     *
+     * The previous error handler (whatever it was, including none) is
+     * always restored via `restore_error_handler()`, regardless of
+     * whether `$call` throws.
+     *
+     * @template T
+     * @param callable():T $call
+     * @param ErrorException|null $capturedError Set by reference to the
+     *        captured native error, or left `null` when `$call` raised none.
+     * @return T
+     */
+    private function runNative(callable $call, ?ErrorException &$capturedError = null) : mixed
+    {
+        $capturedError = null;
+
+        set_error_handler(static function(int $severity, string $message, string $file = '', int $line = 0) use (&$capturedError) : bool {
+            $capturedError = new ErrorException($message, 0, $severity, $file, $line);
+
+            // Prevents PHP's default error handler (and thus the
+            // native warning) from ever running.
+            return true;
+        });
+
+        try {
+            return $call();
+        } finally {
+            restore_error_handler();
+        }
     }
 }

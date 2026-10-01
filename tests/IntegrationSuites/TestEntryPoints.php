@@ -4,17 +4,33 @@ declare(strict_types=1);
 
 namespace Mistralys\ComposerSwitcher\IntegrationSuites;
 
+use Mistralys\ComposerSwitcher\ConfigSwitcher;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\ProcessResult;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\IntegrationTestCase;
+use FilesystemIterator;
+use RecursiveDirectoryIterator;
+use RecursiveIteratorIterator;
 
 /**
- * Tier 2 suite driving all five namespaced `composer switch-*` commands
+ * Tier 2 suite driving all ten namespaced `composer switch-*` commands
  * ({@see \Mistralys\ComposerSwitcher\ConfigSwitcher::composerSwitchDev()}
- * and its siblings) as real Composer invocations, asserting the
+ * and its siblings — `switch-dev`, `switch-prod`, `switch-update`,
+ * `switch-verify-config`, `switch-install-hooks`, `switch-describe`,
+ * `switch-describe-json`, `switch-reconcile`, `switch-preview-dev` and
+ * `switch-preview-prod`) as real Composer invocations, asserting the
  * documented output each one produces rather than only the underlying
  * class method's return value — proving the script-key wiring in
  * `composer.json` actually dispatches to the switcher, not just that the
  * switcher's own logic is correct in isolation.
+ *
+ * `switch-describe` and `switch-preview-prod` are wired in the fixture's
+ * `composer.json` but deliberately not driven by a dedicated test here:
+ * they share their rendering code paths with `switch-describe-json`
+ * (both read {@see \Mistralys\ComposerSwitcher\ConfigSwitcher::describe()})
+ * and `switch-preview-dev` (both call
+ * {@see \Mistralys\ComposerSwitcher\ConfigSwitcher::previewSwitch()}) —
+ * commands this suite already exercises — so a dedicated Tier 2 test for
+ * either would duplicate coverage already proven at the dispatch layer.
  *
  * Every test here shells out to a real Composer binary and/or the cached
  * local package clone, so it belongs in the `Integration` testsuite
@@ -160,6 +176,71 @@ final class TestEntryPoints extends IntegrationTestCase
         $this->assertFileDoesNotExist($this->testTarget . '/composer.json.DEV');
     }
 
+    /**
+     * `composer switch-reconcile` in a fresh (INITIAL) work copy exits
+     * zero and prints {@see ConfigSwitcher::MESSAGE_INITIAL_NOT_RECONCILABLE}'s
+     * text — no switch has run yet, so there is nothing to reconcile.
+     * Once `switch-prod` establishes a baseline and the work copy is
+     * untouched since, the same command instead reports the
+     * already-in-sync outcome — proving the CLI entry point dispatches
+     * to {@see ConfigSwitcher::reconcile()} and prints whichever message
+     * it recorded, rather than a fixed string — AC-05, AC-13.
+     */
+    public function test_reconcileReportsInitialThenAlreadyInSync() : void
+    {
+        $initialResult = $this->runComposer('switch-reconcile');
+
+        $this->assertSuccessfulWithOutput($initialResult, 'No switch has been run yet: there is nothing to reconcile.');
+
+        $this->bootstrapProd();
+        $this->runComposerChecked('switch-prod');
+
+        $inSyncResult = $this->runComposer('switch-reconcile');
+
+        $this->assertSuccessfulWithOutput($inSyncResult, '`composer.json` and `composer-prod.json` are already in sync.');
+    }
+
+    /**
+     * `composer switch-describe-json` in a fresh (INITIAL) work copy
+     * exits zero and prints a single JSON document on stdout whose
+     * `mode` key is {@see ConfigSwitcher::MODE_INITIAL} — proving the
+     * CLI entry point emits {@see ConfigSwitcher::describe()}'s snapshot
+     * as machine-readable JSON rather than the human-readable report
+     * `switch-describe` renders — AC-13.
+     */
+    public function test_describeJsonReportsInitialMode() : void
+    {
+        $result = $this->runComposer('switch-describe-json');
+
+        $this->assertTrue($result->isSuccess());
+
+        $decoded = json_decode(trim($result->getOutput()), true);
+
+        $this->assertIsArray($decoded, 'Expected switch-describe-json stdout to decode as a JSON object.');
+        $this->assertSame(ConfigSwitcher::MODE_INITIAL, $decoded['mode'] ?? null);
+    }
+
+    /**
+     * `composer switch-preview-dev` only prints the planned operations
+     * and messages — it never touches disk. A byte-for-byte snapshot of
+     * every file in the work copy, taken immediately before and after
+     * the command runs, must therefore be identical — proving the dry
+     * run reaches the real filesystem facade's dry-run flag through the
+     * full CLI dispatch path, not only when called directly on
+     * {@see ConfigSwitcher} as Tier 1 already covers — AC-13.
+     */
+    public function test_previewDevLeavesFileSnapshotUnchanged() : void
+    {
+        $before = $this->snapshotDirectory($this->testTarget);
+
+        $result = $this->runComposer('switch-preview-dev');
+
+        $after = $this->snapshotDirectory($this->testTarget);
+
+        $this->assertTrue($result->isSuccess());
+        $this->assertSame($before, $after, 'switch-preview-dev must leave every file in the work copy untouched.');
+    }
+
     // endregion
 
     // region: Support methods
@@ -187,6 +268,41 @@ final class TestEntryPoints extends IntegrationTestCase
         $data['description'] = $description;
 
         $this->writeJsonFile($path, $data);
+    }
+
+    /**
+     * Recursively snapshots every regular file under `$root`, capturing
+     * both content and modification time, so two snapshots taken around
+     * a dry-run command can be compared for byte-for-byte equality.
+     *
+     * @param string $root
+     * @return array<string,array{content:string,mtime:int|false}>
+     */
+    private function snapshotDirectory(string $root) : array
+    {
+        $snapshot = array();
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS)
+        );
+
+        foreach($iterator as $fileInfo)
+        {
+            if(!$fileInfo->isFile()) {
+                continue;
+            }
+
+            $path = $fileInfo->getPathname();
+
+            $snapshot[$path] = array(
+                'content' => file_get_contents($path),
+                'mtime' => filemtime($path)
+            );
+        }
+
+        ksort($snapshot);
+
+        return $snapshot;
     }
 
     // endregion

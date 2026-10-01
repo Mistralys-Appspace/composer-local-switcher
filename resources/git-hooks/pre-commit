@@ -3,8 +3,13 @@
 # Guard 1 — Blocks committing composer.json or composer.lock while Composer
 #            is in DEV mode (composer.json.DEV marker present).
 # Guard 2 — Blocks committing composer.json if it contains a "type": "path"
-#            entry in the repositories key (local symlink active), regardless
-#            of DEV mode state.
+#            entry scoped to the repositories key (list or keyed-object
+#            form; local symlink active), regardless of DEV mode state. The
+#            scoped check is a fail-safe PHP JSON parse: any outcome other
+#            than a confident "no path repository found" (invalid JSON, a
+#            missing php binary, or php itself crashing) falls back to a
+#            blunt, file-wide grep match, which blocks rather than failing
+#            open.
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 DEV_MARKER="$REPO_ROOT/composer.json.DEV"
@@ -39,12 +44,78 @@ if [ -f "$DEV_MARKER" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Guard 2: Block composer.json if it contains a local path repository.
-# A "type": "path" entry in the repositories key means a local symlink is
-# active. This must never be committed, regardless of DEV mode state.
+# Guard 2: Block composer.json if it contains a local path repository,
+# scoped to the "repositories" key.
+#
+# The scoped check below runs the staged composer.json through `php -r`,
+# which decodes it as JSON and looks for a "type": "path" entry inside
+# "repositories" (list form: `[{"type":"path",...}]`, or keyed-object form:
+# `{"local":{"type":"path",...}}`) — a non-array entry in that key (e.g.
+# `"packagist.org": false`) is skipped rather than causing a PHP error.
+#
+# Dedicated exit codes (chosen to avoid 0, 1, 2, 127 and 255 — the last two
+# are what a missing `php` binary and an uncaught PHP fatal/parse error
+# produce, respectively) report the outcome:
 # ---------------------------------------------------------------------------
+GUARD2_STATUS_PATH_FOUND=3
+GUARD2_STATUS_NONE_FOUND=4
+GUARD2_STATUS_UNDECODABLE=5
+
 if echo "$STAGED" | grep -qx "composer.json"; then
-    if git show :composer.json | grep -qE '"type"\s*:\s*"path"'; then
+    GUARD2_PHP_EXIT=$(
+        git show :composer.json | GUARD2_STATUS_PATH_FOUND="$GUARD2_STATUS_PATH_FOUND" \
+            GUARD2_STATUS_NONE_FOUND="$GUARD2_STATUS_NONE_FOUND" \
+            GUARD2_STATUS_UNDECODABLE="$GUARD2_STATUS_UNDECODABLE" \
+            php -r '
+                $json = stream_get_contents(STDIN);
+                $data = json_decode($json, true);
+
+                if (!is_array($data)) {
+                    exit((int)getenv("GUARD2_STATUS_UNDECODABLE"));
+                }
+
+                $repositories = $data["repositories"] ?? null;
+
+                if (!is_array($repositories)) {
+                    exit((int)getenv("GUARD2_STATUS_NONE_FOUND"));
+                }
+
+                foreach ($repositories as $entry) {
+                    if (!is_array($entry)) {
+                        // Non-array entry (e.g. "packagist.org": false) —
+                        // not a path repository, skip without erroring.
+                        continue;
+                    }
+
+                    if (($entry["type"] ?? null) === "path") {
+                        exit((int)getenv("GUARD2_STATUS_PATH_FOUND"));
+                    }
+                }
+
+                exit((int)getenv("GUARD2_STATUS_NONE_FOUND"));
+            ' 2>/dev/null
+        echo $?
+    )
+
+    GUARD2_SHOULD_BLOCK=0
+
+    if [ "$GUARD2_PHP_EXIT" = "$GUARD2_STATUS_NONE_FOUND" ]; then
+        # The scoped check confidently found no path repository under
+        # "repositories" — Guard 2 passes without falling back to grep,
+        # even if a "type": "path" pair exists elsewhere in the file
+        # (e.g. under "extra", where it carries no special meaning).
+        GUARD2_SHOULD_BLOCK=0
+    else
+        # The scoped check found a path repository, could not decode the
+        # staged JSON, or php itself was unavailable (exit 127) or crashed
+        # (exit 255) — fall back to the file-wide grep, which never fails
+        # open.
+        if git show :composer.json | grep -qE '"type"\s*:\s*"path"'; then
+            GUARD2_SHOULD_BLOCK=1
+        fi
+    fi
+
+    if [ "$GUARD2_SHOULD_BLOCK" -eq 1 ]; then
         echo ""
         echo "ERROR: Commit blocked — composer.json contains a local path repository."
         echo ""

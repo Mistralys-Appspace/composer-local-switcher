@@ -85,6 +85,62 @@ final class TestLocalPackageClone extends TestCase
         $this->assertNoPartialSiblingsExist($cacheDir);
     }
 
+    /**
+     * When a concurrent process wins the race — its own cache directory
+     * already exists (non-empty, with a valid `composer.json`) by the time
+     * this clone's own `@rename()` runs — `ensureAvailable()` discards its
+     * own attempt and adopts the winner's cache instead, returning it with
+     * {@see LocalPackageClone::REASON_NONE} and leaving no `.partial-*`
+     * sibling behind.
+     *
+     * The concurrent winner is materialised via an anonymous subclass
+     * overriding the protected {@see LocalPackageClone::cloneInto()} test
+     * seam: it performs the real clone exactly as the parent would, then
+     * creates the winner's cache directory itself, so the subsequent
+     * `@rename()` inside `ensureAvailable()` is the real, unstubbed call —
+     * it genuinely loses the race against a real, non-empty directory
+     * already at the cache path.
+     */
+    public function test_concurrentWinnerValidDirectoryIsAdopted() : void
+    {
+        $this->skipUnlessRenameOntoNonEmptyDirectoryFails();
+
+        $sourceRepository = $this->createLocalGitRepository();
+        $cacheDir = $this->workRoot . '/cache/simple_html_dom';
+
+        $clone = $this->createCloneWithConcurrentWinner($cacheDir, $sourceRepository, withComposerJson: true);
+
+        $result = $clone->ensureAvailable();
+
+        $this->assertNotNull($result);
+        $this->assertSame(LocalPackageClone::REASON_NONE, $clone->getUnavailableReason());
+        $this->assertFileExists($result . '/composer.json');
+        $this->assertNoPartialSiblingsExist($cacheDir);
+    }
+
+    /**
+     * When a concurrent process's directory wins the rename race but is
+     * itself invalid (non-empty, but missing `composer.json` — e.g. a
+     * corrupted or hand-edited directory) — `ensureAvailable()` reports a
+     * genuine {@see LocalPackageClone::REASON_CLONE_FAILED} rather than
+     * adopting it, and still leaves no `.partial-*` sibling behind.
+     */
+    public function test_concurrentWinnerInvalidDirectoryFailsClone() : void
+    {
+        $this->skipUnlessRenameOntoNonEmptyDirectoryFails();
+
+        $sourceRepository = $this->createLocalGitRepository();
+        $cacheDir = $this->workRoot . '/cache/simple_html_dom';
+
+        $clone = $this->createCloneWithConcurrentWinner($cacheDir, $sourceRepository, withComposerJson: false);
+
+        $result = $clone->ensureAvailable();
+
+        $this->assertNull($result);
+        $this->assertSame(LocalPackageClone::REASON_CLONE_FAILED, $clone->getUnavailableReason());
+        $this->assertNoPartialSiblingsExist($cacheDir);
+    }
+
     // endregion
 
     // region: Support methods
@@ -139,6 +195,92 @@ final class TestLocalPackageClone extends TestCase
             $result->isSuccess(),
             sprintf("Expected '%s' to succeed.\nOutput:\n%s\nError output:\n%s", $label, $result->getOutput(), $result->getErrorOutput())
         );
+    }
+
+    /**
+     * Probes, against a pair of real, throwaway directories, that this
+     * host's `rename()` actually fails when the destination is an existing,
+     * non-empty directory — the behaviour the concurrent-winner branch
+     * depends on. Skips the calling test with a named reason instead of
+     * failing it when the probe does not reproduce that behaviour (e.g. an
+     * unusual filesystem where it succeeds).
+     */
+    private function skipUnlessRenameOntoNonEmptyDirectoryFails() : void
+    {
+        $probeRoot = $this->workRoot . '/rename-probe-' . uniqid('', true);
+        $source = $probeRoot . '/source';
+        $destination = $probeRoot . '/destination';
+
+        if(!mkdir($source, 0755, true) && !is_dir($source)) {
+            $this->fail(sprintf('Failed to create throwaway probe source: %s', $source));
+        }
+
+        if(!mkdir($destination, 0755, true) && !is_dir($destination)) {
+            $this->fail(sprintf('Failed to create throwaway probe destination: %s', $destination));
+        }
+
+        file_put_contents($destination . '/marker.txt', 'non-empty');
+
+        $renameSucceeded = @rename($source, $destination);
+
+        FixtureFileSystem::removeDirectory($probeRoot);
+
+        if($renameSucceeded) {
+            $this->markTestSkipped('Skipped: this host\'s rename() unexpectedly succeeds onto a non-empty directory, so the concurrent-winner branch cannot be reproduced with a real rename() here.');
+        }
+    }
+
+    /**
+     * Builds a {@see LocalPackageClone} whose protected `cloneInto()` test
+     * seam is overridden (via an anonymous subclass) to perform the real
+     * clone exactly as the parent would, then materialise a competing,
+     * non-empty directory at the cache path before returning — simulating
+     * a concurrent process that already won the race by the time
+     * `ensureAvailable()`'s own `@rename()` runs.
+     *
+     * @param string $cacheDir
+     * @param string $repositoryUrl
+     * @param bool $withComposerJson Whether the materialised winner
+     *        directory contains a valid `composer.json` (the "valid
+     *        winner, adopt it" case) or not (the "invalid winner, genuine
+     *        failure" case).
+     * @return LocalPackageClone
+     */
+    private function createCloneWithConcurrentWinner(string $cacheDir, string $repositoryUrl, bool $withComposerJson) : LocalPackageClone
+    {
+        return new class($cacheDir, $repositoryUrl, $withComposerJson) extends LocalPackageClone {
+            public function __construct(
+                string $cacheDirectory,
+                string $repositoryUrl,
+                private readonly bool $withComposerJson
+            )
+            {
+                parent::__construct($cacheDirectory, $repositoryUrl);
+            }
+
+            protected function cloneInto(string $targetDir) : bool
+            {
+                $result = parent::cloneInto($targetDir);
+
+                if(!$result) {
+                    return $result;
+                }
+
+                $winnerDir = $this->getCacheDirectory();
+
+                if(!is_dir($winnerDir) && !mkdir($winnerDir, 0755, true)) {
+                    return false;
+                }
+
+                file_put_contents($winnerDir . '/marker.txt', 'concurrent winner');
+
+                if($this->withComposerJson) {
+                    file_put_contents($winnerDir . '/composer.json', '{"name": "mistralys/simple_html_dom"}');
+                }
+
+                return $result;
+            }
+        };
     }
 
     // endregion

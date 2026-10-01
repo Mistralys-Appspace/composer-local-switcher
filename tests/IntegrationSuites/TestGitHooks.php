@@ -157,18 +157,13 @@ final class TestGitHooks extends IntegrationTestCase
     }
 
     /**
-     * Characterisation test: Guard 2 in `resources/git-hooks/pre-commit`
-     * greps the entire staged `composer.json` for `"type": "path"`
-     * rather than scoping the match to the `repositories` key, so a
-     * `"type": "path"` pair anywhere in the file — including under
-     * `extra`, where it carries no special meaning to Composer — still
-     * blocks the commit. This is a known limitation of the shipped
-     * guard, pinned here so the guard-registry reshape (insight
-     * 2cd87f16-2556-4523-af27-0b88a6adbf0b) expected to scope this match
-     * deliberately updates this test instead of silently changing its
-     * behaviour — AC-10.
+     * Guard 2 scopes its match to the `repositories` key: a
+     * `"type": "path"` pair anywhere else in the file — e.g. under
+     * `extra`, where it carries no special meaning to Composer — must
+     * not block the commit, even though a blunt, file-wide grep would
+     * match it — AC-10.
      */
-    public function test_guard2MatchesTypePathOutsideRepositories() : void
+    public function test_guard2IgnoresTypePathOutsideRepositories() : void
     {
         $this->installHooks();
 
@@ -180,11 +175,184 @@ final class TestGitHooks extends IntegrationTestCase
 
         $result = $this->runHookScript();
 
-        $this->assertNotSame(
+        $this->assertSame(
             0,
             $result->getExitCode(),
-            'Expected Guard 2 to block the commit even though the "type": "path" pair sits under `extra`, not `repositories` — characterising its file-wide match.'
+            'Expected Guard 2 to pass since the "type": "path" pair sits under `extra`, not `repositories`.'
         );
+    }
+
+    /**
+     * Guard 2's scoped check recognizes a path repository in the
+     * keyed-object form of `repositories` (`{"local": {"type": "path",
+     * ...}}`), not just the list form already covered by
+     * {@see self::test_guard2BlocksPathRepository()} — AC-10.
+     */
+    public function test_guard2BlocksPathRepositoryInKeyedObjectForm() : void
+    {
+        $this->installHooks();
+
+        $data = $this->decodeJsonFile($this->testTarget . '/composer.json');
+        $data['repositories'] = array(
+            'local' => array('type' => 'path', 'url' => '../local-clone'),
+        );
+        $this->writeJsonFile($this->testTarget . '/composer.json', $data);
+
+        $this->stageComposerJson();
+
+        $result = $this->runHookScript();
+
+        $this->assertNotSame(0, $result->getExitCode(), 'Expected Guard 2 to block a keyed-object-form path repository.');
+    }
+
+    /**
+     * A non-array entry in `repositories` (e.g. `"packagist.org": false`,
+     * a documented way to disable Packagist) must be skipped by Guard 2's
+     * scoped check without a PHP error — the commit still passes when no
+     * other entry is a path repository, and still blocks when one is — AC-10.
+     */
+    public function test_guard2SkipsNonArrayRepositoryEntryWhenNoPathRepositoryPresent() : void
+    {
+        $this->installHooks();
+
+        $data = $this->decodeJsonFile($this->testTarget . '/composer.json');
+        $data['repositories'] = array('packagist.org' => false);
+        $this->writeJsonFile($this->testTarget . '/composer.json', $data);
+
+        $this->stageComposerJson();
+
+        $result = $this->runHookScript();
+
+        $this->assertSame(0, $result->getExitCode(), 'Expected Guard 2 to pass: a non-array repositories entry is not a path repository.');
+    }
+
+    /**
+     * The same non-array entry alongside an actual path repository must
+     * still block — skipping the non-array entry must not short-circuit
+     * the scan before the path repository entry is reached — AC-10.
+     */
+    public function test_guard2SkipsNonArrayRepositoryEntryButStillBlocksWhenPathRepositoryAlsoPresent() : void
+    {
+        $this->installHooks();
+
+        $data = $this->decodeJsonFile($this->testTarget . '/composer.json');
+        $data['repositories'] = array(
+            'packagist.org' => false,
+            'local' => array('type' => 'path', 'url' => '../local-clone'),
+        );
+        $this->writeJsonFile($this->testTarget . '/composer.json', $data);
+
+        $this->stageComposerJson();
+
+        $result = $this->runHookScript();
+
+        $this->assertNotSame(0, $result->getExitCode(), 'Expected Guard 2 to still block when a path repository is present alongside a non-array entry.');
+    }
+
+    /**
+     * When the staged `composer.json` is not valid JSON, Guard 2's
+     * scoped check cannot evaluate it and falls back to the blunt,
+     * file-wide grep — which blocks here since the invalid content
+     * still contains the literal `"type": "path"` text. This proves
+     * the fallback never fails open on undecodable input — AC-10.
+     */
+    public function test_guard2FallsBackToGrepOnInvalidJson() : void
+    {
+        $this->installHooks();
+
+        $this->assertNotFalse(file_put_contents(
+            $this->testTarget . '/composer.json',
+            '{not valid json, but still mentions "type": "path" in here'
+        ));
+
+        $this->stageComposerJson();
+
+        $result = $this->runHookScript();
+
+        $this->assertNotSame(0, $result->getExitCode(), 'Expected Guard 2 to fall back to grep and block on undecodable JSON.');
+    }
+
+    /**
+     * When `php` cannot be resolved via `PATH`, Guard 2's scoped check
+     * cannot run at all and falls back to the blunt, file-wide grep —
+     * which still blocks a real path repository. `bash`/`git`/`grep`
+     * are restricted onto the throwaway `PATH` so the hook script and
+     * its fallback can still run; `php` is deliberately excluded — AC-10.
+     */
+    public function test_guard2FallsBackWhenPhpUnavailable() : void
+    {
+        $this->installHooks();
+
+        $data = $this->decodeJsonFile($this->testTarget . '/composer.json');
+        $data['repositories'] = array(
+            array('type' => 'path', 'url' => '../local-clone'),
+        );
+        $this->writeJsonFile($this->testTarget . '/composer.json', $data);
+
+        $this->stageComposerJson();
+
+        $restrictedPathDir = $this->createRestrictedPathDirectory('bash', 'git', 'grep');
+        $originalPath = getenv('PATH');
+
+        try {
+            putenv('PATH=' . $restrictedPathDir);
+
+            $result = $this->runHookScript();
+
+            $this->assertNotSame(0, $result->getExitCode(), 'Expected Guard 2 to fall back to grep and block when php is unavailable.');
+        } finally {
+            if($originalPath === false) {
+                putenv('PATH');
+            } else {
+                putenv('PATH=' . $originalPath);
+            }
+
+            FixtureFileSystem::removeDirectory($restrictedPathDir);
+        }
+    }
+
+    /**
+     * When `php` itself crashes while evaluating the staged content
+     * (surfacing here as a fake `php` binary that always exits `255`,
+     * the real exit code PHP uses for an uncaught fatal/parse error),
+     * Guard 2 falls back to the blunt, file-wide grep rather than
+     * treating the crash as a pass — AC-10.
+     */
+    public function test_guard2FallsBackWhenPhpCheckCrashes() : void
+    {
+        $this->installHooks();
+
+        $data = $this->decodeJsonFile($this->testTarget . '/composer.json');
+        $data['repositories'] = array(
+            array('type' => 'path', 'url' => '../local-clone'),
+        );
+        $this->writeJsonFile($this->testTarget . '/composer.json', $data);
+
+        $this->stageComposerJson();
+
+        $restrictedPathDir = $this->createRestrictedPathDirectory('bash', 'git', 'grep');
+        $fakePhpPath = $restrictedPathDir . '/php';
+
+        $this->assertNotFalse(file_put_contents($fakePhpPath, "#!/usr/bin/env bash\nexit 255\n"));
+        $this->assertTrue(chmod($fakePhpPath, 0755));
+
+        $originalPath = getenv('PATH');
+
+        try {
+            putenv('PATH=' . $restrictedPathDir);
+
+            $result = $this->runHookScript();
+
+            $this->assertNotSame(0, $result->getExitCode(), 'Expected Guard 2 to fall back to grep and block when php crashes.');
+        } finally {
+            if($originalPath === false) {
+                putenv('PATH');
+            } else {
+                putenv('PATH=' . $originalPath);
+            }
+
+            FixtureFileSystem::removeDirectory($restrictedPathDir);
+        }
     }
 
     /**
@@ -209,7 +377,7 @@ final class TestGitHooks extends IntegrationTestCase
         $originalComposerBinary = getenv('COMPOSER_BINARY');
         $originalPath = getenv('PATH');
 
-        $fakePathDir = $this->createPhpOnlyPathDirectory();
+        $fakePathDir = $this->createRestrictedPathDirectory('php');
 
         putenv('COMPOSER_BINARY=' . $this->resolveComposerBinaryPath());
         putenv('PATH=' . $fakePathDir);
@@ -277,26 +445,43 @@ final class TestGitHooks extends IntegrationTestCase
     }
 
     /**
-     * Creates a throwaway directory containing only a `php` symlink, so
-     * it can serve as a `PATH` that resolves Composer's own
-     * `#!/usr/bin/env php` shebang without resolving `git`.
+     * Creates a throwaway directory containing only symlinks to the
+     * named real binaries (resolved via the current, unrestricted
+     * `PATH`), so it can serve as a restricted `PATH` for a test that
+     * needs some binaries resolvable and others deliberately not —
+     * e.g. `php` alone (to satisfy Composer's own `#!/usr/bin/env php`
+     * shebang) without resolving `git`, or `bash`/`git`/`grep` (to let
+     * the installed hook itself run and fall back to its grep check)
+     * without resolving `php`.
+     *
+     * Skips (rather than fails) the calling test with a named reason
+     * when a requested binary cannot be resolved on this host, since a
+     * missing `bash`/`git`/`grep` here is an environment constraint,
+     * not a defect in the code under test.
      */
-    private function createPhpOnlyPathDirectory() : string
+    private function createRestrictedPathDirectory(string ...$binaries) : string
     {
-        $phpBinary = (new ExecutableFinder())->find('php');
-
-        if($phpBinary === null) {
-            $this->fail('Could not resolve an absolute path for the php binary.');
-        }
-
-        $dir = sys_get_temp_dir() . '/composer-switcher-git-unavailable-' . uniqid('', true);
+        $finder = new ExecutableFinder();
+        $dir = sys_get_temp_dir() . '/composer-switcher-restricted-path-' . uniqid('', true);
 
         if(!mkdir($dir, 0755, true) && !is_dir($dir)) {
             $this->fail(sprintf('Failed to create throwaway PATH directory: %s', $dir));
         }
 
-        if(!symlink($phpBinary, $dir . '/php')) {
-            $this->fail('Failed to symlink the php binary into the throwaway PATH directory.');
+        foreach($binaries as $binary) {
+            $resolved = $finder->find($binary);
+
+            if($resolved === null) {
+                FixtureFileSystem::removeDirectory($dir);
+                $this->markTestSkipped(sprintf(
+                    'Skipped: could not resolve an absolute path for the %s binary on this host.',
+                    $binary
+                ));
+            }
+
+            if(!symlink($resolved, $dir . '/' . $binary)) {
+                $this->fail(sprintf('Failed to symlink the %s binary into the throwaway PATH directory.', $binary));
+            }
         }
 
         return $dir;

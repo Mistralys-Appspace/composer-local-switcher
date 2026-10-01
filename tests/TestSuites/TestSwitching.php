@@ -36,6 +36,30 @@ final class TestSwitching extends ComposerSwitcherTestCase
     }
 
     /**
+     * `switchUpdate()` in the INITIAL state (no switch has ever been
+     * run) is a no-op on disk: it returns an explicit {@see ConfigSwitcher::MODE_INITIAL}
+     * outcome with no operations and no messages, rather than silently
+     * doing nothing or implicitly initializing the production files.
+     */
+    public function test_switchUpdateInInitialStateReturnsInitialOutcome() : void
+    {
+        $switcher = $this->createSwitcher();
+
+        $this->assertFalse($switcher->getStatus()->exists());
+        $this->assertFalse($switcher->getProdFile()->exists());
+
+        $outcome = $switcher->switchUpdate();
+
+        $this->assertSame(ConfigSwitcher::MODE_INITIAL, $outcome->getMode());
+        $this->assertFalse($outcome->hasOperations());
+        $this->assertEmpty($outcome->getMessages());
+        $this->assertFalse($outcome->isDryRun());
+
+        $this->assertFalse($switcher->getStatus()->exists());
+        $this->assertFalse($switcher->getProdFile()->exists());
+    }
+
+    /**
      * No switch has been made yet, so switching to DEV
      * has the following tasks:
      *

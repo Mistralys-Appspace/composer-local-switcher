@@ -181,7 +181,18 @@ class LocalPackageClone
         return $realPath !== false ? $realPath : $cacheDir;
     }
 
-    private function cloneInto(string $targetDir) : bool
+    /**
+     * Test seam: runs after {@see self::ensureAvailable()}'s stale-partial
+     * purge and its `is_dir($cacheDir)` short-circuit, and before the
+     * inlined `@rename()` that promotes `$targetDir` onto the cache path —
+     * `protected` (rather than `private`) solely so a test subclass can
+     * override it to materialise a competing, non-empty cache-path
+     * directory between the real clone and the real `rename()` call below,
+     * making the otherwise-unreachable concurrent-winner branch exercisable
+     * against a real, unstubbed `rename()`. The inlined `@rename()` call
+     * itself is not part of this seam and is not overridable.
+     */
+    protected function cloneInto(string $targetDir) : bool
     {
         $parentDir = dirname($targetDir);
 
@@ -224,7 +235,7 @@ class LocalPackageClone
         $pattern = $parentDir . '/' . self::PARTIAL_PREFIX . basename($cacheDir) . '-*';
         $threshold = time() - self::PARTIAL_STALE_AFTER_SECONDS;
 
-        foreach(glob($pattern) ?: array() as $partialPath)
+        foreach(glob($pattern) ?: [] as $partialPath)
         {
             if(!is_dir($partialPath)) {
                 continue;

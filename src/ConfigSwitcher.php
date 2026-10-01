@@ -33,6 +33,11 @@ class ConfigSwitcher
      * {@see self::switchUpdate()} mode reported when no switch has ever
      * been run yet (the status file does not exist), replacing the
      * previous silent no-op with an explicit, inspectable outcome.
+     *
+     * {@see self::reconcile()} also reports this mode: called before any
+     * switch has ever been run, it is a no-op (no operations, no file
+     * ever touched) that records {@see self::MESSAGE_INITIAL_NOT_RECONCILABLE},
+     * regardless of the `$direction` passed in.
      */
     public const MODE_INITIAL = 'initial';
 
@@ -50,6 +55,20 @@ class ConfigSwitcher
     public const MESSAGE_DEV_MODE_NOT_RECONCILABLE = 182212;
     public const MESSAGE_DRY_RUN_ACTIVE = 182213;
     public const MESSAGE_PROD_LOCK_MISSING = 182214;
+
+    /**
+     * {@see self::reconcile()} outcome when called before any switch has
+     * ever been run ({@see self::MODE_INITIAL}) — there is nothing to
+     * reconcile yet, so the call is a no-op regardless of `$direction`.
+     */
+    public const MESSAGE_INITIAL_NOT_RECONCILABLE = 182215;
+
+    /**
+     * {@see self::reconcile()} outcome in PROD mode when `composer-prod.json`
+     * does not exist — blocked for every direction except an explicit
+     * {@see self::RECONCILE_TO_PROD}, which recreates it from `composer.json`.
+     */
+    public const MESSAGE_PROD_CONFIG_MISSING = 182216;
     public const KEY_LOCAL_REPOSITORIES = 'local-repositories';
     public const KEY_REPOSITORIES = 'repositories';
 
@@ -246,8 +265,13 @@ class ConfigSwitcher
     /**
      * Reconciles `composer.json` and `composer-prod.json`, printing
      * whichever message {@see self::reconcile()} recorded for the
-     * outcome (already-in-sync, backed-up, restored, ambiguous, or
-     * not-reconcilable in DEV mode).
+     * outcome (already-in-sync, backed-up, restored, ambiguous,
+     * not-reconcilable in DEV mode, not-reconcilable in the INITIAL
+     * state, or blocked on a missing `composer-prod.json`). This CLI
+     * entry point always calls {@see self::reconcile()} with its
+     * `$direction` omitted — the direction is resolved automatically
+     * from modification times (or blocked/reported as ambiguous), never
+     * overridden from the command line.
      */
     public static function composerSwitchReconcile() : void
     {
@@ -845,7 +869,13 @@ class ConfigSwitcher
         // identical file effects. Messages accumulated so far (the
         // "Using Composer PROD configuration" message above) are
         // preserved, since the core does not clear them itself.
-        $this->reconcileCore(null, false);
+        //
+        // No `$dryRun` argument is passed: the dry-run flag and
+        // operation list are now owned exclusively by the outermost
+        // entry point (here, the enclosing switchTo() call already in
+        // progress), so this nested reconcile simply inherits whatever
+        // flag switchTo() already set — it neither sets nor restores it.
+        $this->reconcileCore(null);
     }
 
     /**
@@ -853,9 +883,22 @@ class ConfigSwitcher
      * content decides *whether* to act (via {@see self::verify()}),
      * modification time decides *which direction* to copy in.
      *
-     * In DEV mode, `composer.json` has been rewritten for local
-     * repositories and is not meaningful to reconcile — the call is a
-     * no-op that reports {@see self::MESSAGE_DEV_MODE_NOT_RECONCILABLE}.
+     * Blocked (no-op, no exception) in three situations, each reporting
+     * its own message via {@see self::reconcile_detectBlocker()}:
+     * DEV mode ({@see self::MESSAGE_DEV_MODE_NOT_RECONCILABLE} —
+     * `composer.json` has been rewritten for local repositories and is
+     * not meaningful to reconcile), the INITIAL state
+     * ({@see self::MESSAGE_INITIAL_NOT_RECONCILABLE} — no switch has
+     * ever been run, so there is nothing to reconcile), and a missing
+     * `composer-prod.json` in PROD mode ({@see self::MESSAGE_PROD_CONFIG_MISSING}) —
+     * unless `$direction` is explicitly {@see self::RECONCILE_TO_PROD},
+     * which recreates `composer-prod.json` from `composer.json` instead
+     * of being blocked.
+     *
+     * Owns the file system facade's dry-run flag and operation list for
+     * the duration of this call: both are reset before reconciling, and
+     * the flag is always restored to its prior value in `finally`, even
+     * if this call throws (e.g. a malformed `composer.json`).
      *
      * @param string|null $direction Explicit direction overriding the
      *        modification-time heuristic. One of {@see self::RECONCILE_TO_MAIN}
@@ -865,13 +908,26 @@ class ConfigSwitcher
      *        that would have been performed.
      * @return SwitchOutcome
      *
-     * @throws ComposerSwitcherException {@see ComposerSwitcherException::ERROR_INVALID_RECONCILE_DIRECTION} when `$direction` is non-null and not one of the two direction constants.
+     * @throws ComposerSwitcherException {@see ComposerSwitcherException::ERROR_INVALID_RECONCILE_DIRECTION} when `$direction` is non-null and not one of the two direction constants — thrown in every state, INITIAL included.
      */
     public function reconcile(?string $direction = null, bool $dryRun = false) : SwitchOutcome
     {
+        $this->requireValidReconcileDirection($direction);
         $this->clearMessages();
 
-        return $this->reconcileCore($direction, $dryRun);
+        $previousDryRun = $this->fileSystem->isDryRun();
+        $this->fileSystem->setDryRun($dryRun);
+        $this->fileSystem->clearOperations();
+
+        try {
+            if($dryRun) {
+                $this->addMessage(self::MESSAGE_DRY_RUN_ACTIVE, 'Dry run: no files will actually be changed.');
+            }
+
+            return $this->reconcileCore($direction);
+        } finally {
+            $this->fileSystem->setDryRun($previousDryRun);
+        }
     }
 
     /**
@@ -881,34 +937,25 @@ class ConfigSwitcher
      * mid-switch can add its own message beforehand and have it preserved
      * in the returned outcome.
      *
-     * @param string|null $direction
-     * @param bool $dryRun
-     * @return SwitchOutcome
+     * Direction validation, the dry-run flag, and the operation list are
+     * entirely the caller's responsibility — this method only reads the
+     * current flag/operations state to build the returned outcome, it
+     * never sets or clears either.
      *
-     * @throws ComposerSwitcherException {@see ComposerSwitcherException::ERROR_INVALID_RECONCILE_DIRECTION}
+     * @param string|null $direction Already validated by the caller.
+     * @return SwitchOutcome
      */
-    private function reconcileCore(?string $direction, bool $dryRun) : SwitchOutcome
+    private function reconcileCore(?string $direction) : SwitchOutcome
     {
-        $this->requireValidReconcileDirection($direction);
+        $mode = $this->getStatus()->getMode() ?? self::MODE_INITIAL;
 
-        $previousDryRun = $this->fileSystem->isDryRun();
-        $this->fileSystem->setDryRun($dryRun);
-        $this->fileSystem->clearOperations();
+        $blocker = $this->reconcile_detectBlocker($direction);
 
-        if($dryRun) {
-            $this->addMessage(self::MESSAGE_DRY_RUN_ACTIVE, 'Dry run: no files will actually be changed.');
-        }
-
-        $mode = $this->getStatus()->getMode() ?? self::MODE_PROD;
-
-        if($this->getStatus()->isDEV())
+        if($blocker !== null)
         {
-            $this->addMessage(
-                self::MESSAGE_DEV_MODE_NOT_RECONCILABLE,
-                'DEV mode is active: `composer.json` has been rewritten for local repositories and cannot be reconciled.'
-            );
+            $this->messages[] = $blocker;
 
-            return $this->finishReconcile($mode, $previousDryRun);
+            return $this->buildReconcileOutcome($mode);
         }
 
         $result = $this->verify();
@@ -917,13 +964,13 @@ class ConfigSwitcher
         {
             $this->addMessage(self::MESSAGE_ALREADY_IN_SYNC, '`composer.json` and `composer-prod.json` are already in sync.');
 
-            return $this->finishReconcile($mode, $previousDryRun);
+            return $this->buildReconcileOutcome($mode);
         }
 
         $resolvedDirection = $direction ?? $this->resolveReconcileDirection($result);
 
         if($resolvedDirection === null) {
-            return $this->finishReconcile($mode, $previousDryRun);
+            return $this->buildReconcileOutcome($mode);
         }
 
         if($resolvedDirection === self::RECONCILE_TO_PROD)
@@ -939,7 +986,60 @@ class ConfigSwitcher
             $this->prodFile->getLockFile()->tryCopyTo($this->mainFile->getLockFile());
         }
 
-        return $this->finishReconcile($mode, $previousDryRun);
+        return $this->buildReconcileOutcome($mode);
+    }
+
+    /**
+     * Detects whether {@see self::reconcileCore()} should be blocked
+     * from reconciling at all, checked in this order:
+     *
+     * 1. DEV mode — `composer.json` has been rewritten for local
+     *    repositories and is not meaningful to reconcile.
+     * 2. The INITIAL state (no switch has ever been run) — there is no
+     *    baseline yet to reconcile against, regardless of `$direction`.
+     * 3. A missing `composer-prod.json` in PROD mode — reconciling
+     *    against a file that does not exist would otherwise reach
+     *    {@see self::resolveReconcileDirection()}'s
+     *    `requireModifiedDate()` call and throw. The one exception is
+     *    an explicit {@see self::RECONCILE_TO_PROD}: naming the
+     *    direction is already treated as consent elsewhere in this API,
+     *    and it recreates `composer-prod.json` from `composer.json`
+     *    instead of reconciling against it.
+     *
+     * @param string|null $direction The already-validated direction passed to {@see self::reconcileCore()}.
+     * @return SwitchMessage|null The blocking message, or `null` when reconciliation may proceed.
+     */
+    private function reconcile_detectBlocker(?string $direction) : ?SwitchMessage
+    {
+        if($this->getStatus()->isDEV())
+        {
+            return new SwitchMessage(
+                self::MESSAGE_DEV_MODE_NOT_RECONCILABLE,
+                'DEV mode is active: `composer.json` has been rewritten for local repositories and cannot be reconciled.'
+            );
+        }
+
+        if($this->getStatus()->getMode() === null)
+        {
+            return new SwitchMessage(
+                self::MESSAGE_INITIAL_NOT_RECONCILABLE,
+                'No switch has been run yet: there is nothing to reconcile.'
+            );
+        }
+
+        if(!$this->prodFile->exists() && $direction !== self::RECONCILE_TO_PROD)
+        {
+            return new SwitchMessage(
+                self::MESSAGE_PROD_CONFIG_MISSING,
+                sprintf(
+                    'Production configuration file not found: `%s` is missing. Pass RECONCILE_TO_PROD to recreate it from `%s`.',
+                    $this->prodFile->getBaseName(),
+                    $this->mainFile->getBaseName()
+                )
+            );
+        }
+
+        return null;
     }
 
     /**
@@ -986,7 +1086,7 @@ class ConfigSwitcher
             return;
         }
 
-        $allowed = array(self::RECONCILE_TO_MAIN, self::RECONCILE_TO_PROD);
+        $allowed = [self::RECONCILE_TO_MAIN, self::RECONCILE_TO_PROD];
 
         if(in_array($direction, $allowed, true)) {
             return;
@@ -1000,33 +1100,30 @@ class ConfigSwitcher
             ),
             ComposerSwitcherException::ERROR_INVALID_RECONCILE_DIRECTION
         ))
-            ->setContext(array(
+            ->setContext([
                 ComposerSwitcherException::KEY_DIRECTION => $direction,
                 ComposerSwitcherException::KEY_EXPECTED => $allowed
-            ));
+            ]);
     }
 
     /**
-     * Builds the {@see SwitchOutcome} for the current call to
-     * {@see self::reconcileCore()}, then restores the file system
-     * facade's dry-run flag to whatever it was before this call.
+     * Pure {@see SwitchOutcome} builder for {@see self::reconcileCore()}:
+     * reads the file system facade's current dry-run flag and
+     * accumulated operations as-is, without touching either — flag and
+     * operation-list ownership belongs entirely to {@see self::reconcile()}
+     * (or, for a nested PROD→PROD call, to the enclosing {@see self::switchTo()}).
      *
      * @param string $mode
-     * @param bool $previousDryRun
      * @return SwitchOutcome
      */
-    private function finishReconcile(string $mode, bool $previousDryRun) : SwitchOutcome
+    private function buildReconcileOutcome(string $mode) : SwitchOutcome
     {
-        $outcome = new SwitchOutcome(
+        return new SwitchOutcome(
             $mode,
             $this->fileSystem->isDryRun(),
             $this->messages,
             $this->fileSystem->getOperations()
         );
-
-        $this->fileSystem->setDryRun($previousDryRun);
-
-        return $outcome;
     }
 
     private function switch_case_DEV_PROD() : void
@@ -1133,6 +1230,13 @@ class ConfigSwitcher
     }
 
     /**
+     * Prints every accumulated message text to the console, each on its own
+     * line, surrounded by a blank line before and after. Prints nothing if
+     * the message log is empty. Unlike {@see self::autoDisplayMessages()},
+     * a direct call to this method always prints and is **not** gated by
+     * {@see self::setDisplayMessages()} — that flag only suppresses the
+     * automatic call made internally after a switch completes.
+     *
      * @return $this
      */
     public function displayMessages() : self
@@ -1153,7 +1257,9 @@ class ConfigSwitcher
     /**
      * Enables or disables automatic display of the switch messages
      * on the console after a switch completes (see {@see self::autoDisplayMessages()}).
-     * Enabled by default.
+     * Enabled by default. Only gates that automatic internal call — a
+     * direct call to {@see self::displayMessages()} always prints,
+     * regardless of this setting.
      *
      * @param bool $display
      * @return $this

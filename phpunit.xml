@@ -6,6 +6,8 @@
          colors="true"
          processIsolation="false"
          stopOnFailure="false"
+         failOnWarning="true"
+         failOnNotice="true"
          cacheDirectory=".phpunit.cache"
          bootstrap="tests/bootstrap.php">
     <testsuites>

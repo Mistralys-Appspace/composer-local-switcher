@@ -10,6 +10,7 @@ use Mistralys\ComposerSwitcher\State\SwitchOutcome;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\ComposerSwitcherTestCase;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\WorkCopy;
 use Mistralys\ComposerSwitcher\Utils\ConfigFile;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 /**
  * Verifies {@see ConfigSwitcher::reconcile()}: content (via
@@ -167,6 +168,247 @@ final class TestReconcile extends ComposerSwitcherTestCase
             $this->getMessageCodes($outcome)
         );
         $this->assertSame($mainDataBefore, $switcher->getMainFile()->getData());
+    }
+
+    /**
+     * `reconcile()` called before any switch has ever been run (the
+     * status file does not exist) is a no-op for every direction,
+     * including an explicit one — it reports {@see MODE_INITIAL} and
+     * {@see MESSAGE_INITIAL_NOT_RECONCILABLE} rather than throwing or
+     * implicitly creating `composer-prod.json`.
+     *
+     */
+    #[DataProvider('provideInitialStateDirections')]
+    public function test_initialStateIsNotReconcilable(?string $direction) : void
+    {
+        $switcher = $this->createSwitcher();
+
+        $prodFile = $switcher->getProdFile();
+        $prodLockFile = $prodFile->getLockFile();
+        $statusFile = $switcher->getStatus();
+
+        $this->assertFalse($prodFile->exists());
+        $this->assertFalse($statusFile->exists());
+
+        $outcome = $switcher->reconcile($direction);
+
+        $this->assertSame(ConfigSwitcher::MODE_INITIAL, $outcome->getMode());
+        $this->assertFalse($outcome->hasOperations());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_INITIAL_NOT_RECONCILABLE,
+            $this->getMessageCodes($outcome)
+        );
+        $this->assertFalse($prodFile->exists());
+        $this->assertFalse($prodLockFile->exists());
+        $this->assertFalse($statusFile->exists());
+    }
+
+    /**
+     * @return array<string,array{0:string|null}>
+     */
+    public static function provideInitialStateDirections() : array
+    {
+        return [
+            'null (automatic)' => [null],
+            'RECONCILE_TO_MAIN' => [ConfigSwitcher::RECONCILE_TO_MAIN],
+            'RECONCILE_TO_PROD' => [ConfigSwitcher::RECONCILE_TO_PROD],
+        ];
+    }
+
+    /**
+     * An invalid direction still throws in the INITIAL state — the
+     * INITIAL no-op policy only applies to the two valid direction
+     * constants (and `null`), never to a bogus value.
+     */
+    public function test_invalidDirectionThrowsInInitialState() : void
+    {
+        $switcher = $this->createSwitcher();
+
+        $this->assertFalse($switcher->getStatus()->exists());
+
+        try {
+            $switcher->reconcile('sideways');
+            $this->fail('Expected a ComposerSwitcherException to be thrown.');
+        } catch(ComposerSwitcherException $e) {
+            $this->assertSame(ComposerSwitcherException::ERROR_INVALID_RECONCILE_DIRECTION, $e->getCode());
+            $this->assertSame('sideways', $e->getContextValue(ComposerSwitcherException::KEY_DIRECTION));
+        }
+    }
+
+    /**
+     * In PROD mode with `composer-prod.json` deleted, `reconcile()`
+     * (automatic direction) and the explicit `RECONCILE_TO_MAIN`
+     * direction are both blocked — `composer.json` stays untouched and
+     * `composer-prod.json` stays absent.
+     *
+     */
+    #[DataProvider('provideBlockedMissingProdDirections')]
+    public function test_missingProdConfigIsBlocked(?string $direction) : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToProduction();
+
+        $mainDataBefore = $switcher->getMainFile()->getData();
+        $switcher->getProdFile()->delete();
+
+        $outcome = $switcher->reconcile($direction);
+
+        $this->assertFalse($outcome->hasOperations());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_PROD_CONFIG_MISSING,
+            $this->getMessageCodes($outcome)
+        );
+        $this->assertSame($mainDataBefore, $switcher->getMainFile()->getData());
+        $this->assertFalse($switcher->getProdFile()->exists());
+    }
+
+    /**
+     * @return array<string,array{0:string|null}>
+     */
+    public static function provideBlockedMissingProdDirections() : array
+    {
+        return [
+            'null (automatic)' => [null],
+            'RECONCILE_TO_MAIN' => [ConfigSwitcher::RECONCILE_TO_MAIN],
+        ];
+    }
+
+    /**
+     * An explicit `RECONCILE_TO_PROD` is the one direction that
+     * recovers from a missing `composer-prod.json`: it recreates the
+     * file (and its lock, when present) from `composer.json` instead of
+     * being blocked.
+     */
+    public function test_missingProdConfigRecoversWithExplicitDirection() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToProduction();
+
+        $mainData = $switcher->getMainFile()->getData();
+        $mainLockContent = $switcher->getMainFile()->getLockFile()->getContent();
+        $switcher->getProdFile()->delete();
+
+        $outcome = $switcher->reconcile(ConfigSwitcher::RECONCILE_TO_PROD);
+
+        $this->assertTrue($outcome->hasOperations());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_BACKED_UP_MAIN_TO_PROD,
+            $this->getMessageCodes($outcome)
+        );
+        $this->assertNotContains(
+            ConfigSwitcher::MESSAGE_PROD_CONFIG_MISSING,
+            $this->getMessageCodes($outcome)
+        );
+        $this->assertTrue($switcher->getProdFile()->exists());
+        $this->assertSame($mainData, $switcher->getProdFile()->getData());
+        $this->assertSame($mainLockContent, $switcher->getProdFile()->getLockFile()->getContent());
+    }
+
+    /**
+     * The same recovery in dry-run mode reports the copy as a planned
+     * operation without creating `composer-prod.json` on disk.
+     */
+    public function test_missingProdConfigRecoveryDryRunCreatesNoFile() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToProduction();
+        $switcher->getProdFile()->delete();
+
+        $outcome = $switcher->reconcile(ConfigSwitcher::RECONCILE_TO_PROD, true);
+
+        $this->assertTrue($outcome->isDryRun());
+        $this->assertTrue($outcome->hasOperations());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_BACKED_UP_MAIN_TO_PROD,
+            $this->getMessageCodes($outcome)
+        );
+        $this->assertFalse($switcher->getProdFile()->exists());
+        $this->assertFalse($switcher->getFileSystem()->isDryRun());
+    }
+
+    /**
+     * A PROD->PROD switch with `composer-prod.json` deleted does not
+     * throw — `switch_case_PROD_PROD()` delegates into the same
+     * blocked reconciliation core, so the switch completes and records
+     * {@see MESSAGE_PROD_CONFIG_MISSING} alongside the usual PROD-mode
+     * message, leaving `composer.json` untouched.
+     */
+    public function test_switchToProductionWithMissingProdConfigDoesNotThrow() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToProduction();
+
+        $mainDataBefore = $switcher->getMainFile()->getData();
+        $switcher->getProdFile()->delete();
+
+        $outcome = $switcher->switchToProduction();
+
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_PROD_CONFIG_MISSING,
+            $this->getMessageCodes($outcome)
+        );
+        $this->assertSame($mainDataBefore, $switcher->getMainFile()->getData());
+        $this->assertFalse($switcher->getProdFile()->exists());
+    }
+
+    /**
+     * `switchUpdate()` dispatches to `switchToProduction()` while
+     * already in PROD mode, so it must carry the exact same
+     * no-throw/no-op guarantee with `composer-prod.json` missing.
+     */
+    public function test_switchUpdateWithMissingProdConfigDoesNotThrow() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToProduction();
+        $switcher->getProdFile()->delete();
+
+        $outcome = $switcher->switchUpdate();
+
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_PROD_CONFIG_MISSING,
+            $this->getMessageCodes($outcome)
+        );
+        $this->assertFalse($switcher->getProdFile()->exists());
+    }
+
+    /**
+     * A throw mid-reconcile (a malformed `composer.json`, surfacing
+     * from `verify()`'s `getData()` call) must still restore the file
+     * system facade's dry-run flag — `reconcile()`'s `try`/`finally`
+     * must cover the entire reconciliation, not just the happy path.
+     */
+    public function test_dryRunFlagRestoredAfterMidReconcileThrow() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToProduction();
+
+        // Malformed JSON: verify()'s mainFile->getData() call throws
+        // ERROR_CANNOT_DECODE_JSON before a direction can be resolved.
+        file_put_contents($switcher->getMainFile()->getPath(), '{not valid json');
+
+        try {
+            $switcher->reconcile(null, true);
+            $this->fail('Expected a ComposerSwitcherException to be thrown.');
+        } catch(ComposerSwitcherException $e) {
+            // Expected.
+        }
+
+        $this->assertFalse($switcher->getFileSystem()->isDryRun());
+
+        // A subsequent real reconcile must still be able to write to disk.
+        file_put_contents(
+            $switcher->getMainFile()->getPath(),
+            (string)file_get_contents($switcher->getProdFile()->getPath())
+        );
+        $this->modifyMainConfig($switcher);
+        touch($switcher->getProdFile()->getPath(), time() - 60);
+        touch($switcher->getMainFile()->getPath(), time());
+
+        $mainData = $switcher->getMainFile()->getData();
+
+        $switcher->reconcile();
+
+        $this->assertSame($mainData, $switcher->getProdFile()->getData());
     }
 
     /**

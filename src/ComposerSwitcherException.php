@@ -62,6 +62,14 @@ class ComposerSwitcherException extends Exception
     public const KEY_PACKAGE_NAME = 'packageName';
 
     /**
+     * Context key holding the captured native PHP error message (from
+     * the \ErrorException {@see \Mistralys\ComposerSwitcher\Utils\FileSystem}
+     * captures around a failed native filesystem call) — the same
+     * message is also chained as this exception's `getPrevious()`.
+     */
+    public const KEY_NATIVE_ERROR = 'nativeError';
+
+    /**
      * @var array<string,mixed>
      */
     private array $context = array();
