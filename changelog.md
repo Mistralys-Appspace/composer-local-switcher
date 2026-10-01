@@ -1,61 +1,45 @@
 # Changelog
 
-## v3.0.0 - Observable, programmatically consumable switching
+## v2.0.0 - Observable switching and PHP 8.4 (Breaking-M)
 
-**BREAKING:**
-- `ConfigSwitcher::verify()` now returns a `VerificationResult` object instead of an array. Replace array-key access (`$result['inSync']`, `$result['differences']`) with `$result->isInSync()`/`$result->getDifferences()`; `$result->isDevMode()`/`isComparable()` are new. `toArray()` returns the equivalent array shape for consumers that need it.
-- `ConfigSwitcher::switchTo()`, `switchToDevelopment()`, `switchToProduction()`, and `switchUpdate()` now return a `SwitchOutcome` object instead of `void`. Any consumer relying on these methods returning nothing (e.g. type-hinting `void` in an override, or checking a return value they never expected to exist) must update to the new type; `getMessages()`/`getMessageTexts()` on `ConfigSwitcher` itself are unaffected and still reflect the most recent call.
-- `Utils\BaseFile::tryCopyTo()` no longer silently no-ops when the *target* already exists — it now always copies when the *source* exists (matching its docblock), and only no-ops when the source is missing. Consumers that relied on `tryCopyTo()` refusing to overwrite an existing target must switch to an explicit `$target->exists()` guard before calling it.
+**Switching can now be previewed, inspected and reconciled without touching any files.**
+Switch and verify calls return structured results with message codes, so tools and agents can
+consume them directly. PHP 8.4 is now required, and Composer scripts follow a consistent
+switch-* naming scheme. Projects can also wire up the library directly, with no wrapper code.
 
-**Added:**
-- New `Mistralys\ComposerSwitcher\State` namespace of immutable value objects: `SwitchOutcome`, `SwitchMessage`, `SwitchDescription`, `VerificationResult`, `FileOperation` — each with a `toArray()` (and `SwitchDescription` additionally `toJSON()`) for programmatic/agent consumption.
-- New `Utils\FileSystem` class: a single choke-point for every file mutation, with a dry-run overlay mode that enables true, zero-side-effect switch previews.
-- `ConfigSwitcher::describe()` (+ `composerSwitchDescribe()`/`composerSwitchDescribeJson()` entry points and `switch-describe`/`switch-describe-json` scripts): a full state-of-the-world snapshot — mode, last switch date, per-file existence/modification dates, active flag, verification result, and parsed local repositories — that never throws.
-- `ConfigSwitcher::previewSwitch()` (+ `composerSwitchPreviewDev()`/`composerSwitchPreviewProd()` entry points and `switch-preview-dev`/`switch-preview-prod` scripts): dry-run preview of a switch, returning the exact `FileOperation`s a real switch would perform.
-- `ConfigSwitcher::reconcile()` (+ `composerSwitchReconcile()` entry point and `switch-reconcile` script): unifies drift detection and correction in PROD mode — content decides whether to act, modification time decides which direction, with an explicit direction override (`RECONCILE_TO_MAIN`/`RECONCILE_TO_PROD`) for the ambiguous case. `composer switch-update` now calls this internally in PROD mode instead of a separate, narrower reconciliation path.
-- Structured message codes: every switch/reconcile message now carries a numeric `ConfigSwitcher::MESSAGE_*` code alongside its text, exposed via `getMessages(): SwitchMessage[]` (previously `getMessageTexts()`'s plain-string predecessor was the only option).
-- Structured exception context: `ComposerSwitcherException::setContext()`/`getContext()`/`getContextValue()` attach a typed payload (file paths, offending mode/direction values, expected/actual pairs) to every thrown exception, in addition to its free-form message.
-- A missing lock file no longer aborts a switch: `switchTo()` completes in full (config rewrite, status file, flag file) and records a warning message (`MESSAGE_NO_LOCK_FILE_FOUND`/`MESSAGE_PROD_LOCK_MISSING`) instead.
-- `switchUpdate()` in the `INITIAL` state (no switch ever run) now returns an explicit `SwitchOutcome` with mode `ConfigSwitcher::MODE_INITIAL` and no operations, instead of a silent no-op with no return value.
-- New `docs/agents/project-manifest/switching-decision-table.md` mapping every state × action combination to its command, PHP call, file effects, and message codes.
-- `Utils\FileSystem`'s real-mode file operations now capture native PHP warnings as a structured `\ErrorException` instead of letting them escape the facade; a new `ComposerSwitcherException::KEY_NATIVE_ERROR` context key carries the captured error on every real-mode failure, chained as `getPrevious()`.
-- `reconcile()` no longer throws in the `INITIAL` state or when `composer-prod.json` is missing — it now returns a no-op `SwitchOutcome` with `MESSAGE_INITIAL_NOT_RECONCILABLE`/`MESSAGE_PROD_CONFIG_MISSING`, except an explicit `RECONCILE_TO_PROD` direction, which is honoured and recreates `composer-prod.json`.
-- `reconcile()` now owns the dry-run flag and operation list for its own call (previously owned by the internal `reconcileCore()`), restoring the flag to its prior value in a `finally` block even if the call throws partway through (e.g. on a malformed `composer.json`).
-- Fixed a bug where a PROD-mode `previewSwitch()` with drifted configs could perform a real reconcile write instead of staying a pure preview.
-- The pre-commit hook's local-repository guard is now scoped to the staged `composer.json`'s `repositories` key (via JSON parsing), instead of a file-wide grep that could false-positive on an unrelated `"type": "path"` value elsewhere in the file; falls back to the original grep on any inconclusive parse.
+- Switching: Added dry-run previews of DEV and PROD switches with zero side effects.
+- Switching: Added a full state snapshot, also available as JSON, that never fails.
+- Switching: Added PROD drift reconciliation with an explicit direction override.
+- Switching: Switch calls now return structured outcomes with numeric message codes.
+- Switching: A missing lock file now records a warning instead of aborting the switch.
+- Switching: Fixed PROD previews performing real writes when the configs had drifted.
+- Switching: Reconcile and update in the initial state now return a clear no-op result.
+- Switching: Reconcile no longer fails when the production config is missing.
+- Switching: Duplicate VCS entries are pruned and `require-dev` placement is respected in DEV mode.
+- Switching: Fixed similarly named packages being matched by mistake.
+- Switching: Status file paths are normalized.
+- Verification: Added comparison of the main and production configs, returning a result object.
+- PHP: Raised the minimum version to 8.4; PHP 7.3–8.3 are no longer supported.
+- Scripts: Renamed the verify and hook-install scripts to follow the switch-* convention.
+- Scripts: Added switch-describe, switch-preview and switch-reconcile scripts.
+- Scripts: Added static entry points and a project-root factory for direct wiring.
+- Scripts: Fixed test scripts failing on an unsupported flag.
+- Hooks: Added a shared git hook installer with a bundled pre-commit hook.
+- Hooks: The pre-commit check no longer false-positives on unrelated path entries.
+- Errors: Exceptions now carry structured context, including the native PHP error.
+- Files: Copying now overwrites an existing target file.
+- Docs: Added a switching decision table covering every state and action.
+- Tests: Added an end-to-end suite running the real Composer binary.
+- Tests: Hardened the test harness; warnings and notices now fail the run.
+- Code: Static analysis now covers the test harness.
 
-**Non-breaking:**
-- Test-harness hardening: a `Utils\FileSystem`-equivalent write choke-point in the test harness (`FixtureFileSystem`), atomic `LocalPackageClone` acquisition, a 24-hour stale work-copy purge, a `GitRunner` process choke-point (replacing ad hoc `git` invocations), a documented `LocalPackageClone::cloneInto()` test seam enabling coverage of the concurrent-clone-winner race condition, full Tier 2 entry-point parity (all ten `switch-*` scripts now wired, including `switch-reconcile`, `switch-describe-json`, `switch-preview-dev`), and new Tier 1/Tier 2 coverage for all of the above. See [file-tree.md](docs/agents/project-manifest/file-tree.md) for the full list of new test suites.
-- `phpunit.xml` now sets `failOnWarning="true"`/`failOnNotice="true"`, so a test run reporting any warning or notice fails outright instead of a passing-with-issues result — every warning this surfaced (native PHP filesystem warnings) was fixed at its source rather than suppressed.
+### Breaking Changes
 
-## v2.0.0 - PHP 8.4 and switch-* script namespace
-- Raised the PHP requirement from `>=7.3` to `>=8.4` and removed the `config.platform.php` pin (previously `7.3`) from `composer.json`. This is a breaking change: PHP 7.3–8.3 are no longer supported.
-- Renamed the Composer script keys `verify-config` → `switch-verify-config` and `install-hooks` → `switch-install-hooks` to follow the `switch-*` namespace convention already used by `switch-dev`, `switch-prod`, and `switch-update`. The underlying static entry points (`ConfigSwitcher::composerVerifyConfig`, `ConfigSwitcher::composerInstallHooks`) and the programmatic API (`verify()`, `installGitHooks()`) are unchanged.
-- Added a new Tier 2 integration test suite that runs the real `composer` binary against a cloned dependency to prove entry-point dispatch, DEV/PROD switching, symlink resolution, version overrides, and git hook installation end-to-end, alongside the existing offline Tier 1 suite.
-- Raised the `phpunit/phpunit` dev-dependency floor to `>=13.0` and added `tests/bootstrap.php`, resolving prior floor-mismatch and deprecated-schema issues (dev toolchain now needs PHP `>=8.4.1`; runtime floor stays `>=8.4`).
-- Extended PHPStan static analysis to cover the test harness (`tests/`) alongside `src/`.
-- Added a 24-hour stale work-copy purge (`WorkCopy::STALE_AFTER_SECONDS`) and collision-free work-copy names; retain-on-failure behavior is unchanged.
-- Made `LocalPackageClone` acquisition atomic with an injectable cache directory, fixing a clone-cache deletion bug.
-- Introduced a `GitRunner` process choke-point and renamed `ComposerResult` to `ProcessResult`, consolidating git- and Composer-spawning test code.
-- Hoisted shared Tier 2 helpers into `IntegrationTestCase` and added new Tier 1 and Tier 2 coverage: hyphenated package aliases, malformed version handling, git hook installation, and a full DEV/PROD round trip.
-- Made the prod-edit propagation test deterministic, replacing `sleep()`-based timing.
-
-## v1.1.1 - Switching gaps and sync hardening
-- Fixed PHPStan errors: simplified redundant `else if(!condition)` to `else`, added `@param` docblock on `addMessage()`.
-- Fixed `@subackage` typo in PHPDoc headers (now `@subpackage`).
-- Tightened VCS URL matching with a boundary check via `urlMatchesPackageName()` to prevent substring collisions (e.g., `application-utils` no longer matches `application-utils-core`).
-- Removed invalid `--no-progress` flag from Composer test scripts (`test-file`, `test-suite`, `test-filter`, `test-group`) — the flag does not exist in PHPUnit 9.6.
-
-## v1.1.0 - Sync hardening and Composer script entry points
-- Added static Composer script entry points (`composerSwitchDev`, `composerSwitchProd`, `composerSwitchUpdate`, `composerVerifyConfig`, `composerInstallHooks`) so consumers can wire directly to the library without PHP wrapper boilerplate.
-- Added a `fromProjectRoot()` static factory encoding the three-path convention shared by consumer projects.
-- Added a `verify()` method that compares `composer.json` with `composer-prod.json` and reports differing top-level keys.
-- Added a shared git-hook installer (`installGitHooks()`) with a bundled `pre-commit` hook resource.
-- DEV switch now prunes duplicate VCS repository entries matching a switched package within the same loop pass.
-- DEV switch now respects `require-dev` placement — packages in `require-dev` in the production config stay in `require-dev` during DEV mode.
-- Status file paths are now normalized via `realpath()` to eliminate `/../` segments.
-- HCP Editor and Mailforge rewired to use library entry points directly; per-consumer wrapper boilerplate removed.
-- Removed stale `composer/composer-dev.lock` and `composer/composer-dev.status` entries from Mailforge's `.gitignore`.
+PHP 8.4 or newer is now required. The `verify-config` and `install-hooks` scripts are now
+`switch-verify-config` and `switch-install-hooks`; update any references. `verify()` returns a
+result object instead of an array (use `toArray()` for the old shape), and the switch methods now
+return an outcome object instead of nothing. File copying now always overwrites an existing
+target, so add an explicit existence check if you relied on the old behavior.
 
 ## v1.0.4 - Versioned packages
 - Added an optional `version` setting to handle more version constraint setups.
