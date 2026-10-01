@@ -1,0 +1,8 @@
+{
+  "local-repositories": [
+    {
+      "package-name": "mistralys/simple_html_dom",
+      "path": "__LOCAL_CLONE_PATH__"
+    }
+  ]
+}

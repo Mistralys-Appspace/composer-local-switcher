@@ -28,12 +28,17 @@
     {
       "type": "vcs",
       "url": "git@github.com:Mistralys/application-utils-core.git"
+    },
+    {
+      "type": "vcs",
+      "url": "git@github.com:Mistralys/some-unrelated-library.git"
     }
   ],
   "require": {
     "mistralys/application_framework": ">=4.2.0",
     "mistralys/application-utils-core": ">=2.3.14",
     "mistralys/application-utils": ">=3.1.9",
+    "mistralys/some-unrelated-library": ">=1.0",
     "php": ">=7.3"
   },
   "require-dev": {

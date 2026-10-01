@@ -3,42 +3,43 @@
 ## v2.0.0 - Observable switching and PHP 8.4 (Breaking-M)
 
 **Switching can now be previewed, inspected and reconciled without touching any files.**
-Switch calls return structured results, and their messages carry numeric codes, so tools and
-agents can consume them directly. PHP 8.4 is now required. Verification, git hooks and direct
-wiring ship with the library, and existing hand-written wrapper classes keep working.
+Switch and verify calls return structured results with message codes, so tools and agents can
+consume them directly. PHP 8.4 is now required, and Composer scripts follow a consistent
+switch-* naming scheme. Projects can also wire up the library directly, with no wrapper code.
 
 - Switching: Added dry-run previews of DEV and PROD switches with zero side effects.
 - Switching: Added a full state snapshot, also available as JSON, that never fails.
 - Switching: Added PROD drift reconciliation with an explicit direction override.
-- Switching: Switch calls now return structured outcomes; messages are objects with codes.
+- Switching: Switch calls now return structured outcomes with numeric message codes.
 - Switching: A missing lock file now records a warning instead of aborting the switch.
-- Switching: Update in the initial state now returns a clear no-op result.
+- Switching: Fixed PROD previews performing real writes when the configs had drifted.
+- Switching: Reconcile and update in the initial state now return a clear no-op result.
+- Switching: Reconcile no longer fails when the production config is missing.
 - Switching: Duplicate VCS entries are pruned and `require-dev` placement is respected in DEV mode.
 - Switching: Fixed similarly named packages being matched by mistake.
 - Switching: Status file paths are normalized.
 - Verification: Added comparison of the main and production configs, returning a result object.
 - PHP: Raised the minimum version to 8.4; PHP 7.3–8.3 are no longer supported.
-- Scripts: Added switch-verify-config and switch-install-hooks scripts.
+- Scripts: Renamed the verify and hook-install scripts to follow the switch-* convention.
 - Scripts: Added switch-describe, switch-preview and switch-reconcile scripts.
 - Scripts: Added static entry points and a project-root factory for direct wiring.
+- Scripts: Fixed test scripts failing on an unsupported flag.
 - Hooks: Added a shared git hook installer with a bundled pre-commit hook.
+- Hooks: The pre-commit check no longer false-positives on unrelated path entries.
 - Errors: Exceptions now carry structured context, including the native PHP error.
-- Files: Conditional copying now only requires the source file to exist.
+- Files: Copying now overwrites an existing target file.
 - Docs: Added a switching decision table covering every state and action.
-- Docs: Added a guide for migrating from 1.x.
 - Tests: Added an end-to-end suite running the real Composer binary.
-- Tests: Warnings and notices now fail the test run.
-- Code: Added static analysis covering sources and tests.
+- Tests: Hardened the test harness; warnings and notices now fail the run.
+- Code: Static analysis now covers the test harness.
 
 ### Breaking Changes
 
-PHP 8.4 or newer is now required. `switchTo()`, `switchToDevelopment()`, `switchToProduction()`
-and `switchUpdate()` return a `SwitchOutcome` instead of nothing, so update any override that
-declares a `void` return type. `getMessages()` returns `SwitchMessage` objects instead of strings;
-use `getMessageTexts()` for plain text. `BaseFile::tryCopyTo()` now copies whenever the source
-exists, even if the target does not; add an existence check if you relied on the old behavior.
-Existing wrapper classes and the `switch-dev`, `switch-prod` and `switch-update` scripts keep
-working. See `docs/migrating-from-1x.md`.
+PHP 8.4 or newer is now required. The `verify-config` and `install-hooks` scripts are now
+`switch-verify-config` and `switch-install-hooks`; update any references. `verify()` returns a
+result object instead of an array (use `toArray()` for the old shape), and the switch methods now
+return an outcome object instead of nothing. File copying now always overwrites an existing
+target, so add an explicit existence check if you relied on the old behavior.
 
 ## v1.0.4 - Versioned packages
 - Added an optional `version` setting to handle more version constraint setups.

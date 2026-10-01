@@ -9,14 +9,33 @@ use Mistralys\ComposerSwitcher\ComposerSwitcherException;
 
 abstract class BaseFile
 {
-    /**
-     * @var string
-     */
-    private $path;
+    private readonly string $path;
+    private FileSystem $fileSystem;
 
     public function __construct(string $path)
     {
         $this->path = $path;
+        $this->fileSystem = new FileSystem();
+    }
+
+    /**
+     * Replaces the {@see FileSystem} instance this file performs all
+     * of its I/O through. Used to propagate a single shared facade
+     * (e.g. from {@see \Mistralys\ComposerSwitcher\ConfigSwitcher})
+     * to every file instance so that dry-run mode and recorded
+     * operations apply consistently across all of them.
+     *
+     * @return static
+     */
+    public function setFileSystem(FileSystem $fileSystem) : static
+    {
+        $this->fileSystem = $fileSystem;
+        return $this;
+    }
+
+    public function getFileSystem() : FileSystem
+    {
+        return $this->fileSystem;
     }
 
     public function getPath(): string
@@ -31,16 +50,12 @@ abstract class BaseFile
 
     public function exists() : bool
     {
-        return file_exists($this->path);
+        return $this->fileSystem->exists($this->path);
     }
 
     public function getModifiedDate() : ?DateTime
     {
-        if(!$this->exists()) {
-            return null;
-        }
-
-        return DateTime::createFromFormat('U', (string)filemtime($this->path));
+        return $this->fileSystem->modifiedTime($this->path);
     }
 
     public function requireModifiedDate() : DateTime
@@ -51,27 +66,21 @@ abstract class BaseFile
             return $date;
         }
 
-        throw new ComposerSwitcherException(
+        throw (new ComposerSwitcherException(
             sprintf(
                 'Cannot get modified date, file %s does not exist.',
                 $this->path
             ),
             ComposerSwitcherException::ERROR_CANNOT_GET_MODIFIED_DATE
-        );
+        ))
+            ->setContext(array(
+                ComposerSwitcherException::KEY_FILE_PATH => $this->path
+            ));
     }
 
     public function delete() : void
     {
-        if(!$this->exists()) {
-            return;
-        }
-
-        if(!unlink($this->path)) {
-            throw new ComposerSwitcherException(
-                'Failed to delete file: ' . $this->path,
-                ComposerSwitcherException::ERROR_CANNOT_DELETE_FILE
-            );
-        }
+        $this->fileSystem->delete($this->path, 'Deleting ' . $this->getBaseName() . '.');
     }
 
     public function getName() : string
@@ -81,23 +90,25 @@ abstract class BaseFile
 
     public function copyTo(BaseFile $target) : void
     {
-        if(!copy($this->getPath(), $target->getPath())) {
-            throw new ComposerSwitcherException(
-                'Failed to copy file from ' . $this->getPath() . ' to ' . $target->getPath(),
-                ComposerSwitcherException::ERROR_CANNOT_COPY_FILE
-            );
-        }
+        $this->fileSystem->copy(
+            $this->getPath(),
+            $target->getPath(),
+            'Copying ' . $this->getBaseName() . ' to ' . $target->getBaseName() . '.'
+        );
     }
 
     /**
-     * Like {@see copyTo()}, but only if both source and target files exist.
+     * Like {@see copyTo()}, but only if the source file exists.
+     * Unlike a plain existence check on the target, this lets a
+     * missing target be created from an existing source — the
+     * target file existing beforehand is not required.
      *
      * @param BaseFile $target
      * @return void
      */
     public function tryCopyTo(BaseFile $target) : void
     {
-        if($this->exists() && $target->exists()) {
+        if($this->exists()) {
             $this->copyTo($target);
         }
     }
