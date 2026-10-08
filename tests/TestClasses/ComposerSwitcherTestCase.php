@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace Mistralys\ComposerSwitcher\Tests\TestClasses;
 
+use FilesystemIterator;
 use Mistralys\ComposerSwitcher\ConfigSwitcher;
 use Mistralys\ComposerSwitcher\Utils\ConfigFile;
 use PHPUnit\Framework\TestCase;
+use RecursiveDirectoryIterator;
+use RecursiveIteratorIterator;
 
 abstract class ComposerSwitcherTestCase extends TestCase
 {
@@ -79,5 +82,34 @@ abstract class ComposerSwitcherTestCase extends TestCase
             new ConfigFile($this->testTarget . '/composer/local-repositories.json')
         ))
             ->setWriteToConsole(true);
+    }
+
+    /**
+     * Recursively collects every `.php` file under `$dir`, used by the
+     * source-scan guard tests (the "no filesystem call outside the
+     * facade" rule in {@see \Mistralys\ComposerSwitcher\TestSuites\TestDryRun},
+     * and the entry-point-edge control-flow/duck-typing scans in
+     * {@see \Mistralys\ComposerSwitcher\TestSuites\TestEntryPointEdge}) —
+     * shared here rather than duplicated, since both suites walk the
+     * same `src/` tree for the same reason.
+     *
+     * @return string[]
+     */
+    protected function collectPhpFiles(string $dir) : array
+    {
+        $files = array();
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)
+        );
+
+        foreach($iterator as $fileInfo)
+        {
+            if($fileInfo->isFile() && $fileInfo->getExtension() === 'php') {
+                $files[] = $fileInfo->getPathname();
+            }
+        }
+
+        return $files;
     }
 }

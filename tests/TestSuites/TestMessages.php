@@ -20,10 +20,12 @@ final class TestMessages extends ComposerSwitcherTestCase
     // region: _Tests
 
     /**
-     * A missing lock file no longer aborts the switch after the first
-     * message — the switch now completes in full (config rewrite,
-     * status file, flag file), so {@see ConfigSwitcher::MESSAGE_NO_LOCK_FILE_FOUND}
-     * is the first of several messages rather than the only one.
+     * A missing lock file no longer aborts the switch — the switch
+     * still completes in full (snapshot, config rewrite, status file,
+     * flag file), recording {@see ConfigSwitcher::MESSAGE_NO_LOCK_FILE_FOUND}
+     * as a warning among the switch's other messages (not necessarily
+     * first, since {@see ConfigSwitcher::MESSAGE_USING_DEV_CONFIG} is
+     * recorded before the lock status is even checked).
      */
     public function test_missingLockFileMessageCarriesCode() : void
     {
@@ -32,28 +34,10 @@ final class TestMessages extends ComposerSwitcherTestCase
 
         $switcher->switchToDevelopment();
 
-        $messages = $switcher->getMessages();
-
-        $this->assertNotEmpty($messages);
-        $this->assertSame(ConfigSwitcher::MESSAGE_NO_LOCK_FILE_FOUND, $messages[0]->getCode());
-    }
-
-    /**
-     * The very first switch to DEV mode is routed through the same
-     * "PROD -> DEV" code path (there is no established mode yet), and
-     * since no DEV lock file has ever been created, it forces the main
-     * lock file to be deleted so `composer update` can recreate it,
-     * emitting {@see ConfigSwitcher::MESSAGE_CREATE_NEW_LOCK_FILE}.
-     */
-    public function test_devLockRecreationMessageCarriesCode() : void
-    {
-        $switcher = $this->createSwitcher();
-        $switcher->switchToDevelopment();
-
-        $codes = $this->getMessageCodes($switcher);
-
-        $this->assertContains(ConfigSwitcher::MESSAGE_CREATE_NEW_LOCK_FILE, $codes);
-        $this->assertFalse($switcher->getMainFile()->getLockFile()->exists());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_NO_LOCK_FILE_FOUND,
+            $this->getMessageCodes($switcher)
+        );
     }
 
     /**
@@ -105,10 +89,7 @@ final class TestMessages extends ComposerSwitcherTestCase
         $switcher->switchToProduction();
 
         $this->assertSame(
-            array(
-                'Using Composer PROD configuration.',
-                'Run `composer install` to use the production dependencies.'
-            ),
+            array('Using Composer PROD configuration.'),
             $switcher->getMessageTexts()
         );
     }
@@ -130,7 +111,6 @@ final class TestMessages extends ComposerSwitcherTestCase
         $this->assertSame(
             PHP_EOL
             . 'Using Composer PROD configuration.' . PHP_EOL
-            . 'Run `composer install` to use the production dependencies.' . PHP_EOL
             . PHP_EOL,
             $output
         );
@@ -177,6 +157,41 @@ final class TestMessages extends ComposerSwitcherTestCase
     // endregion
 
     // region: Support methods
+
+    /**
+     * None of the message codes retired by this plan's switching-core
+     * reshape (182202, 182205-182208, 182210-182212, 182215, 182216 —
+     * the pre-v3 reconciliation/verification message family) may be
+     * reintroduced as a `ConfigSwitcher::MESSAGE_*` constant value. A
+     * reflection scan over the class's own constants, rather than a
+     * fixed list of constant names, catches a retired number being
+     * silently reused under a new name just as readily as the old one
+     * reappearing.
+     */
+    public function test_retiredMessageCodesAreAbsent() : void
+    {
+        $retiredCodes = array(182202, 182205, 182206, 182207, 182208, 182210, 182211, 182212, 182215, 182216);
+
+        $reflection = new \ReflectionClass(ConfigSwitcher::class);
+        $constants = $reflection->getConstants();
+
+        $messageCodes = array();
+        foreach($constants as $name => $value)
+        {
+            if(str_starts_with($name, 'MESSAGE_') && is_int($value)) {
+                $messageCodes[] = $value;
+            }
+        }
+
+        foreach($retiredCodes as $retiredCode)
+        {
+            $this->assertNotContains(
+                $retiredCode,
+                $messageCodes,
+                sprintf('Retired message code [%d] must not be reused by any ConfigSwitcher::MESSAGE_* constant.', $retiredCode)
+            );
+        }
+    }
 
     /**
      * @param SwitchMessage[] $messages

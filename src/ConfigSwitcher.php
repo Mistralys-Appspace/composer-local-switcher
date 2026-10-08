@@ -8,17 +8,29 @@ declare(strict_types=1);
 
 namespace Mistralys\ComposerSwitcher;
 
+use Mistralys\ComposerSwitcher\State\ComposerCommand;
+use Mistralys\ComposerSwitcher\State\ConfigChangeSet;
 use Mistralys\ComposerSwitcher\State\FileOperation;
+use Mistralys\ComposerSwitcher\State\InstalledState;
+use Mistralys\ComposerSwitcher\State\LocalRepository;
+use Mistralys\ComposerSwitcher\State\LockStatus;
 use Mistralys\ComposerSwitcher\State\SwitchDescription;
 use Mistralys\ComposerSwitcher\State\SwitchMessage;
 use Mistralys\ComposerSwitcher\State\SwitchOutcome;
-use Mistralys\ComposerSwitcher\State\VerificationResult;
 use Mistralys\ComposerSwitcher\Utils\BaseFile;
+use Mistralys\ComposerSwitcher\Utils\ConfigDiff;
 use Mistralys\ComposerSwitcher\Utils\ConfigFile;
+use Mistralys\ComposerSwitcher\Utils\ComposerProcess;
 use Mistralys\ComposerSwitcher\Utils\ConsoleWriter;
+use Mistralys\ComposerSwitcher\Utils\DevConfigTransformer;
+use Mistralys\ComposerSwitcher\Utils\EventContext;
 use Mistralys\ComposerSwitcher\Utils\FileSystem;
 use Mistralys\ComposerSwitcher\Utils\FlagFile;
+use Mistralys\ComposerSwitcher\Utils\InstalledPackages;
+use Mistralys\ComposerSwitcher\Utils\LockFile;
+use Mistralys\ComposerSwitcher\Utils\OutcomeRenderer;
 use Mistralys\ComposerSwitcher\Utils\StatusFile;
+use Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner;
 
 /**
  * @package Composer Switcher
@@ -33,56 +45,132 @@ class ConfigSwitcher
      * {@see self::switchUpdate()} mode reported when no switch has ever
      * been run yet (the status file does not exist), replacing the
      * previous silent no-op with an explicit, inspectable outcome.
-     *
-     * {@see self::reconcile()} also reports this mode: called before any
-     * switch has ever been run, it is a no-op (no operations, no file
-     * ever touched) that records {@see self::MESSAGE_INITIAL_NOT_RECONCILABLE},
-     * regardless of the `$direction` passed in.
      */
     public const MODE_INITIAL = 'initial';
 
+    /**
+     * {@see self::switch_planProdToDev()} — the main lock is `Missing`
+     * rather than `Stale`: the switch still completes, planning a full
+     * `update` instead of a partial one.
+     */
     public const MESSAGE_NO_LOCK_FILE_FOUND = 182201;
-    public const MESSAGE_CREATE_NEW_LOCK_FILE = 182202;
     public const MESSAGE_USING_DEV_CONFIG = 182203;
     public const MESSAGE_USING_PROD_CONFIG = 182204;
-    public const MESSAGE_BACKED_UP_MAIN_TO_PROD = 182205;
-    public const MESSAGE_RESTORED_PROD_TO_MAIN = 182206;
-    public const MESSAGE_RUN_INSTALL_PROD = 182207;
-    public const MESSAGE_RUN_INSTALL_DEV = 182208;
     public const MESSAGE_REBUILT_DEV_CONFIG = 182209;
-    public const MESSAGE_ALREADY_IN_SYNC = 182210;
-    public const MESSAGE_RECONCILE_AMBIGUOUS = 182211;
-    public const MESSAGE_DEV_MODE_NOT_RECONCILABLE = 182212;
     public const MESSAGE_DRY_RUN_ACTIVE = 182213;
+
+    /**
+     * {@see self::switch_planDevToProd()} — re-scoped under v3 from "no
+     * DEV lock backup to restore" to "no production *snapshot* lock
+     * backup to restore" (`composer-prod.lock`), since the DEV lock
+     * concept no longer exists — `composer.lock` always stays the PROD
+     * lock throughout a DEV session.
+     */
     public const MESSAGE_PROD_LOCK_MISSING = 182214;
 
     /**
-     * {@see self::reconcile()} outcome when called before any switch has
-     * ever been run ({@see self::MODE_INITIAL}) — there is nothing to
-     * reconcile yet, so the call is a no-op regardless of `$direction`.
+     * {@see self::switch_planProdToDev()} — the main lock's
+     * {@see LockFile::getLockStatus()} is {@see LockStatus::Stale}
+     * before the switch even starts, blocking it with no file effects:
+     * the committed PROD state is already inconsistent, so the user
+     * must run `composer update` (or `update --lock`) first.
      */
-    public const MESSAGE_INITIAL_NOT_RECONCILABLE = 182215;
+    public const MESSAGE_PROD_LOCK_OUTDATED = 182217;
 
     /**
-     * {@see self::reconcile()} outcome in PROD mode when `composer-prod.json`
-     * does not exist — blocked for every direction except an explicit
-     * {@see self::RECONCILE_TO_PROD}, which recreates it from `composer.json`.
+     * {@see self::switch_planDevRefresh()} / {@see self::switch_planDevToProd()} —
+     * the production snapshot (`composer-prod.json`/`.lock`) has been
+     * edited since it was taken (its recorded `snapshotHash` no longer
+     * matches its current content), blocking the switch with no file
+     * effects: a manually edited snapshot can no longer be trusted as
+     * the three-way revert's base/target.
      */
-    public const MESSAGE_PROD_CONFIG_MISSING = 182216;
+    public const MESSAGE_SNAPSHOT_MODIFIED = 182218;
+
+    /**
+     * {@see self::switch_planDevToProd()} — the production snapshot is
+     * missing entirely, blocking the switch with no file effects.
+     */
+    public const MESSAGE_SNAPSHOT_MISSING = 182219;
+
+    /**
+     * {@see self::switch_planDevToProd()} — the `prodConfig` section of
+     * the resulting {@see ConfigChangeSet} is non-empty: one or more
+     * DEV-time edits to non-managed entries are becoming permanent in
+     * production.
+     */
+    public const MESSAGE_DEV_CHANGES_CARRIED_BACK = 182220;
+
+    /**
+     * {@see self::switch_planDevRefresh()} / {@see self::switch_planDevToProd()} —
+     * a managed (local package) entry was edited directly in DEV and is
+     * being reset to its snapshot value instead of kept, per
+     * {@see \Mistralys\ComposerSwitcher\State\RevertResult::getOverriddenManagedEntries()}.
+     */
+    public const MESSAGE_MANAGED_ENTRY_OVERRIDDEN = 182221;
+
+    /**
+     * {@see self::switch_cleanLegacyArtifacts()} — a v2-era artifact
+     * (a committed-style `composer-prod.json` found outside an active
+     * DEV session, or a leftover `local-repositories.lock`) was found
+     * and cleaned up.
+     */
+    public const MESSAGE_LEGACY_FILES_FOUND = 182225;
+
+    /**
+     * {@see self::switch_planProdToDev()} / {@see self::switch_planDevRefresh()} —
+     * a local package's path repository alias was derived (from an
+     * explicit override or the PROD lock's locked version), per
+     * {@see \Mistralys\ComposerSwitcher\State\DevTransformResult::getVersionDerivations()}.
+     */
+    public const MESSAGE_VERSION_DERIVED = 182226;
+
+    /**
+     * {@see self::switch_planDevRefresh()} / {@see self::switch_planDevToProd()} /
+     * {@see self::switch_planProdToProd()} — the installed state already
+     * matches what the target mode expects, so no Composer command is
+     * planned.
+     */
+    public const MESSAGE_ALREADY_INSTALLED = 182227;
+
+    /**
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner} —
+     * printed immediately before a planned command is actually executed.
+     */
+    public const MESSAGE_COMPOSER_COMMAND = 182222;
+
+    /**
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner} —
+     * printed instead of executing the planned command, when `--no-install`
+     * was passed.
+     */
+    public const MESSAGE_COMPOSER_SKIPPED = 182223;
+
+    /**
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner} — a
+     * switch entry point no-opped because `COMPOSER_SWITCHER_NESTED` is
+     * set, i.e. this process was itself launched by the switcher (e.g. a
+     * leftover `post-update-cmd` hook firing during the switcher's own
+     * `composer update`), preventing recursion.
+     */
+    public const MESSAGE_NESTED_RUN_SKIPPED = 182224;
+
+    /**
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner} — a
+     * switch that would change `composer.json` was run non-interactively
+     * without `--yes`.
+     */
+    public const MESSAGE_CONFIRMATION_REQUIRED = 182228;
+
+    /**
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner} — the
+     * user declined the interactive confirmation prompt; nothing was
+     * written.
+     */
+    public const MESSAGE_SWITCH_CANCELLED = 182229;
+
     public const KEY_LOCAL_REPOSITORIES = 'local-repositories';
     public const KEY_REPOSITORIES = 'repositories';
-
-    /**
-     * {@see self::reconcile()} direction: prod is newer/wins, and is
-     * copied onto `composer.json`.
-     */
-    public const RECONCILE_TO_MAIN = 'to-main';
-
-    /**
-     * {@see self::reconcile()} direction: `composer.json` is
-     * newer/wins, and is copied onto the production config.
-     */
-    public const RECONCILE_TO_PROD = 'to-prod';
 
     /**
      * @var ConfigFile
@@ -147,40 +235,52 @@ class ConfigSwitcher
         );
     }
 
-    public static function composerSwitchDev() : void
+    /**
+     * Switches to DEV mode, via a {@see SwitchCommandRunner} built from
+     * `$event` — the only place `switch-dev` executes Composer or
+     * prompts the user. See "Confirmation (transparency)" in the plan
+     * for the full sequence.
+     */
+    public static function composerSwitchDev(?object $event = null) : void
     {
-        self::fromProjectRoot(getcwd())->switchToDevelopment();
+        self::buildRunner($event)->runSwitch(self::MODE_DEV);
     }
 
-    public static function composerSwitchProd() : void
+    /**
+     * Switches to PROD mode. See {@see self::composerSwitchDev()}.
+     */
+    public static function composerSwitchProd(?object $event = null) : void
     {
-        self::fromProjectRoot(getcwd())->switchToProduction();
+        self::buildRunner($event)->runSwitch(self::MODE_PROD);
     }
 
-    public static function composerSwitchUpdate() : void
+    /**
+     * Refreshes the current mode (DEV stays DEV, PROD/INITIAL stays
+     * PROD) — see {@see SwitchCommandRunner::runUpdate()}.
+     */
+    public static function composerSwitchUpdate(?object $event = null) : void
     {
-        self::fromProjectRoot(getcwd())->switchUpdate();
+        self::buildRunner($event)->runUpdate();
     }
 
-    public static function composerVerifyConfig() : void
+    /**
+     * Builds the {@see SwitchCommandRunner} every switch/update/preview
+     * entry point delegates to: an {@see EventContext} from `$event`
+     * (the only place this library duck-types Composer's event/IO), a
+     * switcher rooted at the current working directory, a real
+     * {@see ComposerProcess}, and an {@see OutcomeRenderer} writing
+     * through that same context.
+     */
+    private static function buildRunner(?object $event) : SwitchCommandRunner
     {
-        $switcher = self::fromProjectRoot(getcwd());
-        $result = $switcher->verify();
+        $context = EventContext::fromEvent($event);
 
-        if($result->isDevMode()) {
-            echo 'DEV mode is active — config comparison skipped.' . PHP_EOL;
-            return;
-        }
-
-        if($result->isInSync()) {
-            echo 'composer.json and composer-prod.json are in sync.' . PHP_EOL;
-            return;
-        }
-
-        echo 'composer.json and composer-prod.json differ in the following keys:' . PHP_EOL;
-        foreach($result->getDifferences() as $key) {
-            echo '  - ' . $key . PHP_EOL;
-        }
+        return new SwitchCommandRunner(
+            $context,
+            self::fromProjectRoot(getcwd()),
+            new ComposerProcess(),
+            new OutcomeRenderer($context)
+        );
     }
 
     public static function composerInstallHooks() : void
@@ -198,147 +298,41 @@ class ConfigSwitcher
 
     /**
      * Renders {@see self::describe()}'s state-of-the-world snapshot as a
-     * human-readable report.
+     * human-readable report, through an {@see OutcomeRenderer} built
+     * from `$event`.
      */
-    public static function composerSwitchDescribe() : void
+    public static function composerSwitchDescribe(?object $event = null) : void
     {
-        $description = self::fromProjectRoot(getcwd())->describe();
+        $context = EventContext::fromEvent($event);
 
-        echo 'Mode: ' . $description->getMode() . PHP_EOL;
-        echo 'Last switch: ' . ($description->getLastSwitchDate() ?? 'never') . PHP_EOL;
-        echo 'Active flag: ' . ($description->getActiveFlag() ?? 'none') . PHP_EOL;
-        echo PHP_EOL;
-
-        echo 'Files:' . PHP_EOL;
-        foreach($description->getFiles() as $file) {
-            echo sprintf(
-                '  - %-10s %s [%s%s]',
-                $file['label'],
-                $file['path'],
-                $file['exists'] ? 'exists' : 'missing',
-                $file['modifiedDate'] !== null ? ', modified ' . $file['modifiedDate'] : ''
-            ) . PHP_EOL;
-        }
-        echo PHP_EOL;
-
-        $verification = $description->getVerification();
-        if($verification->isDevMode()) {
-            echo 'Verification: DEV mode is active — config comparison skipped.' . PHP_EOL;
-        } else if($verification->isInSync()) {
-            echo 'Verification: composer.json and composer-prod.json are in sync.' . PHP_EOL;
-        } else {
-            echo 'Verification: composer.json and composer-prod.json differ in the following keys:' . PHP_EOL;
-            foreach($verification->getDifferences() as $key) {
-                echo '  - ' . $key . PHP_EOL;
-            }
-        }
-        echo PHP_EOL;
-
-        echo 'Local repositories:' . PHP_EOL;
-        $localRepositories = $description->getLocalRepositories();
-        if(empty($localRepositories)) {
-            echo '  (none)' . PHP_EOL;
-        } else {
-            foreach($localRepositories as $repo) {
-                echo sprintf('  - %s -> %s (%s)', $repo['packageName'], $repo['path'], $repo['version']) . PHP_EOL;
-            }
-        }
-
-        if($description->hasWarnings()) {
-            echo PHP_EOL;
-            echo 'Warnings:' . PHP_EOL;
-            foreach($description->getWarnings() as $warning) {
-                echo '  - ' . $warning . PHP_EOL;
-            }
-        }
+        (new OutcomeRenderer($context))->renderDescription(self::fromProjectRoot(getcwd())->describe());
     }
 
     /**
      * Renders {@see self::describe()}'s state-of-the-world snapshot as
      * pretty-printed JSON, for programmatic consumption.
      */
-    public static function composerSwitchDescribeJson() : void
+    public static function composerSwitchDescribeJson(?object $event = null) : void
     {
-        echo self::fromProjectRoot(getcwd())->describe()->toJSON() . PHP_EOL;
+        EventContext::fromEvent($event)->write(self::fromProjectRoot(getcwd())->describe()->toJSON());
     }
 
     /**
-     * Reconciles `composer.json` and `composer-prod.json`, printing
-     * whichever message {@see self::reconcile()} recorded for the
-     * outcome (already-in-sync, backed-up, restored, ambiguous,
-     * not-reconcilable in DEV mode, not-reconcilable in the INITIAL
-     * state, or blocked on a missing `composer-prod.json`). This CLI
-     * entry point always calls {@see self::reconcile()} with its
-     * `$direction` omitted — the direction is resolved automatically
-     * from modification times (or blocked/reported as ambiguous), never
-     * overridden from the command line.
-     */
-    public static function composerSwitchReconcile() : void
-    {
-        $outcome = self::fromProjectRoot(getcwd())->reconcile();
-
-        foreach($outcome->getMessageTexts() as $text) {
-            echo $text . PHP_EOL;
-        }
-    }
-
-    /**
-     * Previews a switch to DEV mode: prints every {@see FileOperation}
+     * Previews a switch to DEV mode: renders every {@see FileOperation}
      * that a real `switch-dev` would perform, without touching disk.
      */
-    public static function composerSwitchPreviewDev() : void
+    public static function composerSwitchPreviewDev(?object $event = null) : void
     {
-        self::printPreview(self::MODE_DEV);
+        self::buildRunner($event)->runPreview(self::MODE_DEV);
     }
 
     /**
-     * Previews a switch to PROD mode: prints every {@see FileOperation}
+     * Previews a switch to PROD mode: renders every {@see FileOperation}
      * that a real `switch-prod` would perform, without touching disk.
      */
-    public static function composerSwitchPreviewProd() : void
+    public static function composerSwitchPreviewProd(?object $event = null) : void
     {
-        self::printPreview(self::MODE_PROD);
-    }
-
-    /**
-     * Shared rendering logic for {@see self::composerSwitchPreviewDev()}
-     * and {@see self::composerSwitchPreviewProd()}: runs the dry-run
-     * preview, then prints the planned operations followed by the
-     * accumulated messages.
-     *
-     * @param string $mode
-     * @return void
-     */
-    private static function printPreview(string $mode) : void
-    {
-        $outcome = self::fromProjectRoot(getcwd())->previewSwitch($mode);
-
-        foreach($outcome->getOperations() as $operation) {
-            echo self::formatOperation($operation) . PHP_EOL;
-        }
-
-        foreach($outcome->getMessageTexts() as $text) {
-            echo $text . PHP_EOL;
-        }
-    }
-
-    /**
-     * Formats a single {@see FileOperation} as `would <type>: <source>
-     * -> <target> (<reason>)`. Operations with no source (e.g. a plain
-     * write) render `-` in its place, keeping the format uniform.
-     *
-     * @param FileOperation $operation
-     * @return string
-     */
-    private static function formatOperation(FileOperation $operation) : string
-    {
-        return sprintf(
-            'would %s: %s -> %s (%s)',
-            $operation->getType(),
-            $operation->getSourcePath() ?? '-',
-            $operation->getTargetPath(),
-            $operation->getReason()
-        );
+        self::buildRunner($event)->runPreview(self::MODE_PROD);
     }
 
     /**
@@ -417,51 +411,16 @@ class ConfigSwitcher
     }
 
     /**
-     * Read-only comparison of `composer.json` and `composer-prod.json`.
-     *
-     * In DEV mode, `composer.json` has been rewritten with local
-     * repository entries, so the comparison is skipped and not
-     * meaningful — see {@see VerificationResult::isComparable()}.
-     *
-     * @return VerificationResult
-     */
-    public function verify() : VerificationResult
-    {
-        if($this->statusFile->isDEV()) {
-            return new VerificationResult(true, false, array());
-        }
-
-        $mainData = $this->mainFile->getData();
-        $prodData = $this->prodFile->exists() ? $this->prodFile->getData() : array();
-
-        $this->recursiveKsort($mainData);
-        $this->recursiveKsort($prodData);
-
-        $allKeys = array_unique(array_merge(array_keys($mainData), array_keys($prodData)));
-        sort($allKeys);
-
-        $differences = array();
-        foreach($allKeys as $key)
-        {
-            $mainValue = $mainData[$key] ?? null;
-            $prodValue = $prodData[$key] ?? null;
-
-            if($mainValue !== $prodValue) {
-                $differences[] = $key;
-            }
-        }
-
-        return new VerificationResult(false, empty($differences), $differences);
-    }
-
-    /**
      * Assembles the full state-of-the-world snapshot: mode, last switch
      * date, per-file existence/modification-date records, active flag
-     * file, the {@see VerificationResult} from {@see self::verify()},
-     * and the parsed `local-repositories` list.
+     * file, {@see LockStatus}, {@see InstalledState}, the DEV-only
+     * pending production changes ({@see SwitchDescription::getPendingProdChanges()}),
+     * and the parsed `local-repositories` list (each entry carrying its
+     * {@see SwitchDescription::getLocalRepositories() derivedVersion}).
      *
-     * Never throws: a missing or malformed dev config degrades to an
-     * empty repository list plus a {@see SwitchDescription::getWarnings()}
+     * Never throws: a missing/malformed dev config, a missing/modified
+     * snapshot, or a missing/malformed `installed.json` all degrade to
+     * a `null`/safe-default field plus a {@see SwitchDescription::getWarnings()}
      * entry, so this call is safe in any state (INITIAL, DEV, or PROD).
      *
      * @return SwitchDescription
@@ -477,17 +436,112 @@ class ConfigSwitcher
             $activeFlag = self::MODE_DEV;
         }
 
-        [$localRepositories, $warnings] = $this->describe_readLocalRepositories();
+        [$repos, $warnings] = $this->describe_readLocalRepositories();
+
+        $referenceLock = $this->statusFile->isDEV() ? $this->prodFile->getLockFile() : $this->mainFile->getLockFile();
+
+        $localRepositories = array_map(
+            static function(LocalRepository $repo) use ($referenceLock) : array {
+                return array(
+                    'packageName' => $repo->getPackageName(),
+                    'path' => $repo->getPath(),
+                    'version' => $repo->getVersion(),
+                    'derivedVersion' => $repo->getVersionOverride() ?? $referenceLock->getLockedVersion($repo->getPackageName())
+                );
+            },
+            $repos
+        );
+
+        $installedState = InstalledState::fromInstalledPackages(
+            $this->statusFile->isDEV() ? self::MODE_DEV : self::MODE_PROD,
+            array_map(static fn(LocalRepository $repo) : string => $repo->getPackageName(), $repos),
+            $this->switch_installedPackages()
+        );
+
+        [$pendingProdChanges, $pendingWarnings] = $this->describe_computePendingProdChanges($mode);
 
         return new SwitchDescription(
             $mode,
             $this->statusFile->getDate(),
             $this->describe_buildFileRecords(),
             $activeFlag,
-            $this->verify(),
+            $this->mainFile->getLockFile()->getLockStatus(),
+            $installedState,
+            $pendingProdChanges,
             $localRepositories,
-            $warnings
+            array_merge($warnings, $pendingWarnings, $this->describe_legacyArtifactWarnings($mode))
         );
+    }
+
+    /**
+     * Computes {@see SwitchDescription::getPendingProdChanges()}: the
+     * DEV-time edits that would become permanent production changes on
+     * a DEV→PROD switch, via the same `revert()` + {@see ConfigDiff}
+     * pipeline a real switch uses — only its `prodConfig` section is
+     * ever filled. `null` (with an explanatory warning, never a thrown
+     * exception) outside DEV mode, or when the snapshot is missing,
+     * modified, or malformed.
+     *
+     * @return array{0:?ConfigChangeSet,1:string[]}
+     */
+    private function describe_computePendingProdChanges(string $mode) : array
+    {
+        if($mode !== self::MODE_DEV) {
+            return array(null, array());
+        }
+
+        if(!$this->prodFile->exists()) {
+            return array(null, array('Cannot compute pending production changes: the production snapshot (`' . $this->prodFile->getBaseName() . '`) is missing.'));
+        }
+
+        if($this->switch_isSnapshotModified()) {
+            return array(null, array('Cannot compute pending production changes: the production snapshot (`' . $this->prodFile->getBaseName() . '`) has been modified since it was taken.'));
+        }
+
+        try {
+            $snapshotConfig = $this->prodFile->getData();
+            $current = $this->mainFile->getData();
+        } catch(ComposerSwitcherException $e) {
+            return array(null, array('Cannot compute pending production changes: ' . $e->getMessage()));
+        }
+
+        $appliedRepos = $this->switch_readAppliedRepositories();
+        $prodLock = $this->prodFile->getLockFile();
+
+        $revertResult = DevConfigTransformer::revert($current, $snapshotConfig, $appliedRepos, $prodLock);
+
+        $classifier = DevConfigTransformer::makeOriginClassifier($appliedRepos, $revertResult);
+        $prodConfigChanges = ConfigDiff::between($snapshotConfig, $revertResult->getEffectiveConfig(), $classifier);
+
+        return array(new ConfigChangeSet(array(), $prodConfigChanges), array());
+    }
+
+    /**
+     * Surfaces (without cleaning up — `describe()` is read-only) the
+     * same v2-era legacy artifacts {@see self::switch_cleanLegacyArtifacts()}
+     * removes on the next real switch.
+     *
+     * @return string[]
+     */
+    private function describe_legacyArtifactWarnings(string $mode) : array
+    {
+        $warnings = array();
+
+        if($this->devFile->getLockFile()->exists()) {
+            $warnings[] = sprintf(
+                'Legacy artifact found: `%s` (a pre-v3 DEV lock backup) will be cleaned up on the next switch.',
+                $this->devFile->getLockFile()->getBaseName()
+            );
+        }
+
+        if($mode !== self::MODE_DEV && $this->prodFile->exists()) {
+            $warnings[] = sprintf(
+                'Legacy artifact found: `%s` exists outside an active DEV session and will be cleaned up on the next switch.',
+                $this->prodFile->getBaseName()
+            );
+        }
+
+        return $warnings;
     }
 
     /**
@@ -529,75 +583,34 @@ class ConfigSwitcher
      * human-readable warning — rather than propagating an exception —
      * when the dev file is missing, is not valid JSON, or does not
      * contain a well-formed `local-repositories` array, so `describe()`
-     * itself never throws.
+     * itself never throws. The list-structure and per-entry validation
+     * is delegated to {@see LocalRepository::parseListLenient()}, which
+     * also backs the strict validator used elsewhere in the switching
+     * model — the file-existence and read-failure checks here are the
+     * only part of this method's original logic that remains, since
+     * they precede having any decoded data to hand off.
      *
-     * @return array{0:array<int,array{packageName:string,path:string,version:string}>,1:string[]}
+     * Returns the {@see LocalRepository} objects themselves (not yet
+     * flattened into the `describe()` array shape), since `describe()`
+     * also needs each entry's `versionOverride` to compute its
+     * `derivedVersion`.
+     *
+     * @return array{0:LocalRepository[],1:string[]}
      */
     private function describe_readLocalRepositories() : array
     {
-        $localRepositories = array();
-        $warnings = array();
-
         if(!$this->devFile->exists())
         {
-            $warnings[] = 'Dev configuration file not found: ' . $this->devFile->getPath();
-
-            return array($localRepositories, $warnings);
+            return array(array(), array('Dev configuration file not found: ' . $this->devFile->getPath()));
         }
 
         try {
             $devConfig = $this->devFile->getData();
         } catch(ComposerSwitcherException $e) {
-            $warnings[] = 'Failed to read the dev configuration file: ' . $e->getMessage();
-
-            return array($localRepositories, $warnings);
+            return array(array(), array('Failed to read the dev configuration file: ' . $e->getMessage()));
         }
 
-        if(!isset($devConfig[self::KEY_LOCAL_REPOSITORIES]) || !is_array($devConfig[self::KEY_LOCAL_REPOSITORIES]))
-        {
-            $warnings[] = sprintf(
-                'Dev configuration file does not contain a valid [%s] list.',
-                self::KEY_LOCAL_REPOSITORIES
-            );
-
-            return array($localRepositories, $warnings);
-        }
-
-        foreach($devConfig[self::KEY_LOCAL_REPOSITORIES] as $repo)
-        {
-            if(!isset($repo['package-name'], $repo['path']) || !is_string($repo['package-name']) || !is_string($repo['path']))
-            {
-                $warnings[] = sprintf(
-                    'Skipped a malformed entry in the dev configuration [%s] list.',
-                    self::KEY_LOCAL_REPOSITORIES
-                );
-
-                continue;
-            }
-
-            $localRepositories[] = array(
-                'packageName' => $repo['package-name'],
-                'path' => $repo['path'],
-                'version' => is_string($repo['version'] ?? null) ? $repo['version'] : '*'
-            );
-        }
-
-        return array($localRepositories, $warnings);
-    }
-
-    /**
-     * @param array<int|string,mixed> $array
-     * @return void
-     */
-    private function recursiveKsort(array &$array) : void
-    {
-        ksort($array);
-
-        foreach($array as &$value) {
-            if(is_array($value)) {
-                $this->recursiveKsort($value);
-            }
-        }
+        return LocalRepository::parseListLenient($devConfig, $this->devFile->getPath());
     }
 
     /**
@@ -625,42 +638,23 @@ class ConfigSwitcher
     }
 
     /**
-     * Updates the current configuration, if necessary.
-     *
-     * For example, if the current mode is PROD, it will
-     * update the composer configurations depending on which
-     * has been most recently modified.
-     *
-     * In the INITIAL state (no switch has ever been run), this is a
-     * no-op on the file system, but still returns an explicit,
-     * inspectable {@see SwitchOutcome} — mode {@see self::MODE_INITIAL},
-     * no operations — rather than silently doing nothing.
+     * Refreshes the current configuration: in DEV mode this is a
+     * refresh (the DEV→DEV row of the decision table — DEV edits are
+     * preserved, a repository delta is planned); in PROD mode, and in
+     * the INITIAL state (no switch has ever been run), this is the
+     * PROD/INITIAL→PROD row — no file effects beyond legacy cleanup,
+     * status and flags, planning `install` only when the installed
+     * state does not already match.
      *
      * @return SwitchOutcome
      */
     public function switchUpdate() : SwitchOutcome
     {
-        // NOTE: A simple ELSE would not have been enough here,
-        // as the status may be INITIAL, in which case neither
-        // condition would be true.
-
         if($this->getStatus()->isDEV()) {
             return $this->switchToDevelopment();
         }
 
-        if($this->getStatus()->isPROD()) {
-            return $this->switchToProduction();
-        }
-
-        $this->clearMessages();
-        $this->fileSystem->clearOperations();
-
-        return new SwitchOutcome(
-            self::MODE_INITIAL,
-            $this->fileSystem->isDryRun(),
-            $this->messages,
-            $this->fileSystem->getOperations()
-        );
+        return $this->switchToProduction();
     }
 
     public function switchToDevelopment() : SwitchOutcome
@@ -674,13 +668,18 @@ class ConfigSwitcher
     }
 
     /**
-     * Switches to the target mode.
+     * Switches to the target mode, via the v3 decision table's single
+     * post-dispatch planner ({@see self::switch_plan()}): preconditions
+     * decide whether the switch is blocked, file effects follow from
+     * the final state, and exactly one optional {@see ComposerCommand}
+     * is planned — this method itself never executes Composer.
      *
      * A missing lock file no longer aborts the switch: it is a
      * recoverable situation (e.g. a freshly cloned project that has
-     * never run `composer update`), so the switch completes in full —
-     * config rewrite, status file, flag file — and only records
-     * {@see self::MESSAGE_NO_LOCK_FILE_FOUND} as a warning.
+     * never run `composer update`), so a PROD/INITIAL→DEV switch with
+     * no main lock completes in full and only records
+     * {@see self::MESSAGE_NO_LOCK_FILE_FOUND} as a warning, planning a
+     * full `update` instead of a partial one.
      *
      * @param string $mode
      * @param bool $dryRun When `true`, the facade's dry-run flag is set
@@ -689,7 +688,10 @@ class ConfigSwitcher
      *        recorded — and restored to its previous value afterward,
      *        in a `finally` block, so an exception mid-switch can never
      *        leave the switcher stuck in dry-run mode.
-     * @return SwitchOutcome
+     * @return SwitchOutcome A blocked outcome ({@see SwitchOutcome::isBlocked()})
+     *         carries no file effects — only messages and the config
+     *         changes computed before the block was detected (empty, for
+     *         every blocker in this decision table).
      *
      * @see self::MODE_PROD
      * @see self::MODE_DEV
@@ -712,17 +714,24 @@ class ConfigSwitcher
                 $this->addMessage(self::MESSAGE_DRY_RUN_ACTIVE, 'Dry run: no files will actually be changed.');
             }
 
-            if(!$this->mainFile->getLockFile()->exists())
+            $plan = $this->switch_plan($mode);
+
+            if($plan['blocked'])
             {
-                $this->addMessage(
-                    self::MESSAGE_NO_LOCK_FILE_FOUND,
-                    'WARNING: No lock file found. Please run `composer update` after switching the config.'
+                $this->autoDisplayMessages();
+
+                return new SwitchOutcome(
+                    $mode,
+                    $this->fileSystem->isDryRun(),
+                    $this->messages,
+                    $this->fileSystem->getOperations(),
+                    null,
+                    true,
+                    $plan['changes']
                 );
             }
 
-            $this->switch_copyLockFiles($mode);
-
-            $this->statusFile->saveState($mode, $this);
+            $this->statusFile->saveState($mode, $this, $plan['snapshotHash'], $plan['appliedRepositories']);
 
             $this->writeFlagFiles();
 
@@ -732,7 +741,10 @@ class ConfigSwitcher
                 $mode,
                 $this->fileSystem->isDryRun(),
                 $this->messages,
-                $this->fileSystem->getOperations()
+                $this->fileSystem->getOperations(),
+                $plan['command'],
+                false,
+                $plan['changes']
             );
         } finally {
             $this->fileSystem->setDryRun($previousDryRun);
@@ -818,408 +830,628 @@ class ConfigSwitcher
         }
     }
 
-    private function switch_copyLockFiles(string $mode) : void
+    /**
+     * The v3 decision table's single post-dispatch planner: runs legacy
+     * cleanup first (every switch, regardless of direction), then
+     * dispatches to exactly one of the four row-specific planners based
+     * on the current status and the target mode.
+     *
+     * @return array{blocked:bool,command:?ComposerCommand,changes:ConfigChangeSet,snapshotHash:?string,appliedRepositories:?array<int,array<string,mixed>>}
+     */
+    private function switch_plan(string $mode) : array
     {
-        $this->console->line1('Copying files for %s mode...', $mode);
-
         $isDev = $this->getStatus()->isDEV();
         $isProd = $this->getStatus()->isPROD();
         $isInitial = !$isDev && !$isProd;
 
-        // Initial switch: Initialize the production files if they do not exist yet.
-        if($isInitial)
-        {
-            $this->switch_initProductionFiles();
-        }
+        $this->switch_cleanLegacyArtifacts($mode, $isProd || $isInitial);
 
         if($mode === self::MODE_DEV)
         {
             if($isDev) {
-                $this->switch_case_DEV_DEV();
-            } else {
-                $this->switch_case_PROD_DEV();
-            }
-        }
-        else
-        {
-            if($isProd) {
-                $this->switch_case_PROD_PROD();
-            } else {
-                $this->switch_case_DEV_PROD();
-            }
-        }
-    }
-
-    private function switch_case_DEV_DEV() : void
-    {
-        $this->console->line1('Already in DEV mode, refreshing config...');
-        $this->addMessage(self::MESSAGE_USING_DEV_CONFIG, 'Using Composer DEV configuration.');
-
-        $this->switch_adjustConfigForDev();
-    }
-
-    private function switch_case_PROD_PROD() : void
-    {
-        $this->console->line1('Ignoring switch, already in PROD mode.');
-        $this->addMessage(self::MESSAGE_USING_PROD_CONFIG, 'Using Composer PROD configuration.');
-
-        // Delegate to the same reconciliation core used by the public
-        // reconcile() method, so a PROD->PROD switch and a direct
-        // reconcile() call from the same starting state produce
-        // identical file effects. Messages accumulated so far (the
-        // "Using Composer PROD configuration" message above) are
-        // preserved, since the core does not clear them itself.
-        //
-        // No `$dryRun` argument is passed: the dry-run flag and
-        // operation list are now owned exclusively by the outermost
-        // entry point (here, the enclosing switchTo() call already in
-        // progress), so this nested reconcile simply inherits whatever
-        // flag switchTo() already set — it neither sets nor restores it.
-        $this->reconcileCore(null);
-    }
-
-    /**
-     * Reconciles `composer.json` and `composer-prod.json` in PROD mode:
-     * content decides *whether* to act (via {@see self::verify()}),
-     * modification time decides *which direction* to copy in.
-     *
-     * Blocked (no-op, no exception) in three situations, each reporting
-     * its own message via {@see self::reconcile_detectBlocker()}:
-     * DEV mode ({@see self::MESSAGE_DEV_MODE_NOT_RECONCILABLE} —
-     * `composer.json` has been rewritten for local repositories and is
-     * not meaningful to reconcile), the INITIAL state
-     * ({@see self::MESSAGE_INITIAL_NOT_RECONCILABLE} — no switch has
-     * ever been run, so there is nothing to reconcile), and a missing
-     * `composer-prod.json` in PROD mode ({@see self::MESSAGE_PROD_CONFIG_MISSING}) —
-     * unless `$direction` is explicitly {@see self::RECONCILE_TO_PROD},
-     * which recreates `composer-prod.json` from `composer.json` instead
-     * of being blocked.
-     *
-     * Owns the file system facade's dry-run flag and operation list for
-     * the duration of this call: both are reset before reconciling, and
-     * the flag is always restored to its prior value in `finally`, even
-     * if this call throws (e.g. a malformed `composer.json`).
-     *
-     * @param string|null $direction Explicit direction overriding the
-     *        modification-time heuristic. One of {@see self::RECONCILE_TO_MAIN}
-     *        or {@see self::RECONCILE_TO_PROD}.
-     * @param bool $dryRun When `true`, no file is actually written —
-     *        the returned {@see SwitchOutcome} describes the operations
-     *        that would have been performed.
-     * @return SwitchOutcome
-     *
-     * @throws ComposerSwitcherException {@see ComposerSwitcherException::ERROR_INVALID_RECONCILE_DIRECTION} when `$direction` is non-null and not one of the two direction constants — thrown in every state, INITIAL included.
-     */
-    public function reconcile(?string $direction = null, bool $dryRun = false) : SwitchOutcome
-    {
-        $this->requireValidReconcileDirection($direction);
-        $this->clearMessages();
-
-        $previousDryRun = $this->fileSystem->isDryRun();
-        $this->fileSystem->setDryRun($dryRun);
-        $this->fileSystem->clearOperations();
-
-        try {
-            if($dryRun) {
-                $this->addMessage(self::MESSAGE_DRY_RUN_ACTIVE, 'Dry run: no files will actually be changed.');
+                return $this->switch_planDevRefresh();
             }
 
-            return $this->reconcileCore($direction);
-        } finally {
-            $this->fileSystem->setDryRun($previousDryRun);
+            return $this->switch_planProdToDev();
+        }
+
+        if($isDev) {
+            return $this->switch_planDevToProd();
+        }
+
+        return $this->switch_planProdToProd();
+    }
+
+    /**
+     * Cleans up v2-era legacy artifacts, run at the start of every
+     * switch regardless of direction:
+     *
+     * - The DEV config's own lock file (`local-repositories.lock`) is a
+     *   v2 artifact — v3 never backs up a separate DEV lock, since
+     *   `composer.lock` always stays the PROD lock throughout a DEV
+     *   session.
+     * - A committed-style `composer-prod.json` found while in PROD/INITIAL
+     *   mode predates the transient-snapshot model: switching to DEV
+     *   overwrites it as part of the normal snapshot step below;
+     *   staying in (or switching to) PROD deletes it outright, since it
+     *   has no reason to exist outside an active DEV session.
+     *
+     * @param bool $isProdOrInitial Whether the switch starts from PROD or the INITIAL state.
+     */
+    private function switch_cleanLegacyArtifacts(string $mode, bool $isProdOrInitial) : void
+    {
+        $legacyFound = false;
+
+        if($this->devFile->getLockFile()->exists())
+        {
+            $this->devFile->getLockFile()->delete();
+            $legacyFound = true;
+        }
+
+        if($isProdOrInitial && $this->prodFile->exists())
+        {
+            if($mode === self::MODE_PROD)
+            {
+                $this->prodFile->delete();
+                $this->prodFile->getLockFile()->delete();
+            }
+
+            $legacyFound = true;
+        }
+
+        if($legacyFound)
+        {
+            $this->addMessage(self::MESSAGE_LEGACY_FILES_FOUND, 'Found and cleaned up legacy v2 switcher files.');
         }
     }
 
     /**
-     * The reconciliation logic shared by the public {@see self::reconcile()}
-     * and {@see self::switch_case_PROD_PROD()}. Unlike {@see self::reconcile()},
-     * this does not clear the accumulated messages, so a caller already
-     * mid-switch can add its own message beforehand and have it preserved
-     * in the returned outcome.
+     * PROD/INITIAL→DEV: blocked on a `Stale` main lock; otherwise
+     * snapshots the main config and lock into `composer-prod.*`,
+     * writes `apply(snapshot, repos, mainLock)` into `composer.json`,
+     * and plans `update <local names>` (a full `update` when the main
+     * lock is `Missing`).
      *
-     * Direction validation, the dry-run flag, and the operation list are
-     * entirely the caller's responsibility — this method only reads the
-     * current flag/operations state to build the returned outcome, it
-     * never sets or clears either.
-     *
-     * @param string|null $direction Already validated by the caller.
-     * @return SwitchOutcome
+     * @return array{blocked:bool,command:?ComposerCommand,changes:ConfigChangeSet,snapshotHash:?string,appliedRepositories:?array<int,array<string,mixed>>}
      */
-    private function reconcileCore(?string $direction) : SwitchOutcome
-    {
-        $mode = $this->getStatus()->getMode() ?? self::MODE_INITIAL;
-
-        $blocker = $this->reconcile_detectBlocker($direction);
-
-        if($blocker !== null)
-        {
-            $this->messages[] = $blocker;
-
-            return $this->buildReconcileOutcome($mode);
-        }
-
-        $result = $this->verify();
-
-        if($result->isInSync())
-        {
-            $this->addMessage(self::MESSAGE_ALREADY_IN_SYNC, '`composer.json` and `composer-prod.json` are already in sync.');
-
-            return $this->buildReconcileOutcome($mode);
-        }
-
-        $resolvedDirection = $direction ?? $this->resolveReconcileDirection($result);
-
-        if($resolvedDirection === null) {
-            return $this->buildReconcileOutcome($mode);
-        }
-
-        if($resolvedDirection === self::RECONCILE_TO_PROD)
-        {
-            $this->addMessage(self::MESSAGE_BACKED_UP_MAIN_TO_PROD, 'Backing up the modified `composer.json`.');
-            $this->mainFile->copyTo($this->prodFile);
-            $this->mainFile->getLockFile()->tryCopyTo($this->prodFile->getLockFile());
-        }
-        else
-        {
-            $this->addMessage(self::MESSAGE_RESTORED_PROD_TO_MAIN, 'Updating `composer.json` with changes.');
-            $this->prodFile->copyTo($this->mainFile);
-            $this->prodFile->getLockFile()->tryCopyTo($this->mainFile->getLockFile());
-        }
-
-        return $this->buildReconcileOutcome($mode);
-    }
-
-    /**
-     * Detects whether {@see self::reconcileCore()} should be blocked
-     * from reconciling at all, checked in this order:
-     *
-     * 1. DEV mode — `composer.json` has been rewritten for local
-     *    repositories and is not meaningful to reconcile.
-     * 2. The INITIAL state (no switch has ever been run) — there is no
-     *    baseline yet to reconcile against, regardless of `$direction`.
-     * 3. A missing `composer-prod.json` in PROD mode — reconciling
-     *    against a file that does not exist would otherwise reach
-     *    {@see self::resolveReconcileDirection()}'s
-     *    `requireModifiedDate()` call and throw. The one exception is
-     *    an explicit {@see self::RECONCILE_TO_PROD}: naming the
-     *    direction is already treated as consent elsewhere in this API,
-     *    and it recreates `composer-prod.json` from `composer.json`
-     *    instead of reconciling against it.
-     *
-     * @param string|null $direction The already-validated direction passed to {@see self::reconcileCore()}.
-     * @return SwitchMessage|null The blocking message, or `null` when reconciliation may proceed.
-     */
-    private function reconcile_detectBlocker(?string $direction) : ?SwitchMessage
-    {
-        if($this->getStatus()->isDEV())
-        {
-            return new SwitchMessage(
-                self::MESSAGE_DEV_MODE_NOT_RECONCILABLE,
-                'DEV mode is active: `composer.json` has been rewritten for local repositories and cannot be reconciled.'
-            );
-        }
-
-        if($this->getStatus()->getMode() === null)
-        {
-            return new SwitchMessage(
-                self::MESSAGE_INITIAL_NOT_RECONCILABLE,
-                'No switch has been run yet: there is nothing to reconcile.'
-            );
-        }
-
-        if(!$this->prodFile->exists() && $direction !== self::RECONCILE_TO_PROD)
-        {
-            return new SwitchMessage(
-                self::MESSAGE_PROD_CONFIG_MISSING,
-                sprintf(
-                    'Production configuration file not found: `%s` is missing. Pass RECONCILE_TO_PROD to recreate it from `%s`.',
-                    $this->prodFile->getBaseName(),
-                    $this->mainFile->getBaseName()
-                )
-            );
-        }
-
-        return null;
-    }
-
-    /**
-     * Resolves the reconciliation direction from the modification times
-     * of the main and production config files. Returns `null` for the
-     * ambiguous case (equal modification times, differing content),
-     * after recording {@see self::MESSAGE_RECONCILE_AMBIGUOUS}.
-     *
-     * @param VerificationResult $result
-     * @return string|null One of {@see self::RECONCILE_TO_MAIN}, {@see self::RECONCILE_TO_PROD}, or `null` when ambiguous.
-     */
-    private function resolveReconcileDirection(VerificationResult $result) : ?string
-    {
-        $mainModified = $this->mainFile->requireModifiedDate();
-        $prodModified = $this->prodFile->requireModifiedDate();
-
-        if($mainModified > $prodModified) {
-            return self::RECONCILE_TO_PROD;
-        }
-
-        if($mainModified < $prodModified) {
-            return self::RECONCILE_TO_MAIN;
-        }
-
-        $this->addMessage(
-            self::MESSAGE_RECONCILE_AMBIGUOUS,
-            'Cannot determine a reconciliation direction: `composer.json` and `composer-prod.json` have the same modification time, but differ in [%s].',
-            implode(', ', $result->getDifferences())
-        );
-
-        return null;
-    }
-
-    /**
-     * Validates an explicit reconcile direction, if given.
-     *
-     * @param string|null $direction
-     * @return void
-     * @throws ComposerSwitcherException {@see ComposerSwitcherException::ERROR_INVALID_RECONCILE_DIRECTION}
-     */
-    private function requireValidReconcileDirection(?string $direction) : void
-    {
-        if($direction === null) {
-            return;
-        }
-
-        $allowed = [self::RECONCILE_TO_MAIN, self::RECONCILE_TO_PROD];
-
-        if(in_array($direction, $allowed, true)) {
-            return;
-        }
-
-        throw (new ComposerSwitcherException(
-            sprintf(
-                'Invalid reconcile direction [%s]. Allowed values are: %s',
-                $direction,
-                implode(', ', $allowed)
-            ),
-            ComposerSwitcherException::ERROR_INVALID_RECONCILE_DIRECTION
-        ))
-            ->setContext([
-                ComposerSwitcherException::KEY_DIRECTION => $direction,
-                ComposerSwitcherException::KEY_EXPECTED => $allowed
-            ]);
-    }
-
-    /**
-     * Pure {@see SwitchOutcome} builder for {@see self::reconcileCore()}:
-     * reads the file system facade's current dry-run flag and
-     * accumulated operations as-is, without touching either — flag and
-     * operation-list ownership belongs entirely to {@see self::reconcile()}
-     * (or, for a nested PROD→PROD call, to the enclosing {@see self::switchTo()}).
-     *
-     * @param string $mode
-     * @return SwitchOutcome
-     */
-    private function buildReconcileOutcome(string $mode) : SwitchOutcome
-    {
-        return new SwitchOutcome(
-            $mode,
-            $this->fileSystem->isDryRun(),
-            $this->messages,
-            $this->fileSystem->getOperations()
-        );
-    }
-
-    private function switch_case_DEV_PROD() : void
-    {
-        $this->console->line1('Switching from DEV to PROD...');
-        $this->addMessage(self::MESSAGE_USING_PROD_CONFIG, 'Using Composer PROD configuration.');
-
-        $mainLockFile = $this->mainFile->getLockFile();
-
-        // Back up the DEV lock file if present
-        if($mainLockFile->exists()) {
-            $mainLockFile->copyTo($this->devFile->getLockFile());
-        }
-
-        // Restore the PROD files
-        $this->prodFile->copyTo($this->mainFile);
-
-        $prodLockFile = $this->prodFile->getLockFile();
-
-        // Guard against the unconditional copyTo() below throwing
-        // ERROR_CANNOT_COPY_FILE when no production lock backup exists
-        // yet (e.g. a failed `composer update` in DEV never produced
-        // one). Falling back to deleting the main lock file mirrors
-        // switch_case_PROD_DEV()'s "force re-creation" handling for the
-        // equivalent missing-lock case in the other direction.
-        if($prodLockFile->exists())
-        {
-            $prodLockFile->copyTo($mainLockFile);
-
-            $this->addMessage(self::MESSAGE_RUN_INSTALL_PROD, 'Run `composer install` to use the production dependencies.');
-        }
-        else
-        {
-            $mainLockFile->delete();
-
-            $this->addMessage(
-                self::MESSAGE_PROD_LOCK_MISSING,
-                'WARNING: No production lock file found. Please run `composer update` after switching the config.'
-            );
-        }
-    }
-
-    private function switch_case_PROD_DEV() : void
+    private function switch_planProdToDev() : array
     {
         $this->console->line1('Switching from PROD to DEV...');
         $this->addMessage(self::MESSAGE_USING_DEV_CONFIG, 'Using Composer DEV configuration.');
 
-        $prodLockFile = $this->mainFile->getLockFile();
+        $lockStatus = $this->mainFile->getLockFile()->getLockStatus();
 
-        // Back up the PROD lock file if present
-        if($prodLockFile->exists()) {
-            $prodLockFile->copyTo($this->prodFile->getLockFile());
+        if($lockStatus === LockStatus::Stale)
+        {
+            $this->addMessage(
+                self::MESSAGE_PROD_LOCK_OUTDATED,
+                'WARNING: The production lock file is outdated. Run `composer update` (or `update --lock`) before switching to DEV.'
+            );
+
+            return $this->switch_blockedPlan();
         }
 
-        if($this->devFile->getLockFile()->exists())
-        {
-            $this->devFile->getLockFile()->copyTo($this->mainFile->getLockFile());
+        $repos = $this->switch_requireCurrentLocalRepositories();
 
-            $this->addMessage(self::MESSAGE_RUN_INSTALL_DEV, 'Run `composer install` to use the development dependencies.');
+        $snapshotConfig = $this->mainFile->getData();
+        $lockExists = $this->mainFile->getLockFile()->exists();
+        $lockContent = $lockExists ? $this->mainFile->getLockFile()->getContent() : '';
+
+        // Snapshot the main config and lock into composer-prod.* before
+        // rewriting composer.json — composer.lock itself stays the PROD
+        // lock throughout the DEV session.
+        $this->mainFile->copyTo($this->prodFile);
+        $this->mainFile->getLockFile()->tryCopyTo($this->prodFile->getLockFile());
+
+        $applyResult = DevConfigTransformer::apply($snapshotConfig, $repos, $this->mainFile->getLockFile());
+
+        $this->mainFile->putData($applyResult->getConfig());
+
+        $this->switch_recordVersionDerivations($applyResult->getVersionDerivations());
+
+        $this->addMessage(self::MESSAGE_REBUILT_DEV_CONFIG, 'Rebuilt a fresh DEV `composer.json`.');
+
+        $classifier = DevConfigTransformer::makeOriginClassifier($repos);
+        $composerJsonChanges = ConfigDiff::between($snapshotConfig, $applyResult->getConfig(), $classifier);
+
+        if(!$lockExists)
+        {
+            $this->addMessage(
+                self::MESSAGE_NO_LOCK_FILE_FOUND,
+                'WARNING: No lock file found. Please run `composer update` after switching the config.'
+            );
+
+            $command = new ComposerCommand(array('update'), 'No lock file exists yet; installing all dependencies.');
         }
         else
         {
-            // Force re-creation of the lock file
-            $this->mainFile->getLockFile()->delete();
+            $packageNames = array_map(static fn(LocalRepository $r) : string => $r->getPackageName(), $repos);
 
-            $this->addMessage(
-                self::MESSAGE_CREATE_NEW_LOCK_FILE,
-                'Run `composer update` to create a DEV lock file.'
-            );
+            $command = count($packageNames) > 0
+                ? new ComposerCommand(array_merge(array('update'), $packageNames), 'Installing the switched local packages at their aliased versions.')
+                : null;
         }
 
-        // Generate and copy the DEV files
-        $this->switch_adjustConfigForDev();
+        return array(
+            'blocked' => false,
+            'command' => $command,
+            'changes' => new ConfigChangeSet($composerJsonChanges, array()),
+            'snapshotHash' => md5(json_encode($snapshotConfig, JSON_THROW_ON_ERROR) . '|' . $lockContent),
+            'appliedRepositories' => $this->switch_serializeRepositories($repos)
+        );
     }
 
     /**
-     * Called on the initial switch only, independent of the target mode.
-     * Ensures that the production files exist by copying them from the main file.
+     * DEV→DEV refresh (`switch-dev`/`switch-update` while already in
+     * DEV): blocked on a modified snapshot; otherwise computes
+     * `effective = revert(current, snapshot, appliedRepos)` and writes
+     * `apply(effective, currentRepos)` only when it differs from the
+     * current `composer.json` — no write operation is recorded, and
+     * the file's bytes stay untouched, when nothing changed.
+     *
+     * @return array{blocked:bool,command:?ComposerCommand,changes:ConfigChangeSet,snapshotHash:?string,appliedRepositories:?array<int,array<string,mixed>>}
      */
-    private function switch_initProductionFiles() : void
+    private function switch_planDevRefresh() : array
     {
+        $this->console->line1('Already in DEV mode, refreshing config...');
+        $this->addMessage(self::MESSAGE_USING_DEV_CONFIG, 'Using Composer DEV configuration.');
+
+        if($this->switch_isSnapshotModified())
+        {
+            $this->addMessage(
+                self::MESSAGE_SNAPSHOT_MODIFIED,
+                'WARNING: The production snapshot (`%s`) has been modified since it was taken; switch to PROD and back to DEV to retake it.',
+                $this->prodFile->getBaseName()
+            );
+
+            return $this->switch_blockedPlan();
+        }
+
+        $snapshotConfig = $this->prodFile->exists() ? $this->prodFile->getData() : array();
+        $appliedRepos = $this->switch_readAppliedRepositories();
+        $prodLock = $this->prodFile->getLockFile();
+
+        $current = $this->mainFile->getData();
+
+        $revertResult = DevConfigTransformer::revert($current, $snapshotConfig, $appliedRepos, $prodLock);
+
+        $this->switch_recordOverriddenEntries($revertResult->getOverriddenManagedEntries());
+
+        $currentRepos = $this->switch_requireCurrentLocalRepositories();
+
+        $applyResult = DevConfigTransformer::apply($revertResult->getEffectiveConfig(), $currentRepos, $prodLock);
+        $newConfig = $applyResult->getConfig();
+
+        $classifier = DevConfigTransformer::makeOriginClassifier($currentRepos, $revertResult);
+        $composerJsonChanges = ConfigDiff::between($current, $newConfig, $classifier);
+
+        if(count($composerJsonChanges) > 0)
+        {
+            $this->mainFile->putData($newConfig);
+            $this->addMessage(self::MESSAGE_REBUILT_DEV_CONFIG, 'Rebuilt a fresh DEV `composer.json`.');
+        }
+
+        $this->switch_recordVersionDerivations($applyResult->getVersionDerivations());
+
+        $command = $this->switch_planRefreshCommand($appliedRepos, $currentRepos, $prodLock);
+
+        return array(
+            'blocked' => false,
+            'command' => $command,
+            'changes' => new ConfigChangeSet($composerJsonChanges, array()),
+            'snapshotHash' => $this->statusFile->getSnapshotHash(),
+            'appliedRepositories' => $this->switch_serializeRepositories($currentRepos)
+        );
+    }
+
+    /**
+     * Plans the command for a DEV→DEV refresh: a repository delta
+     * (added, path-changed, override-changed, or removed, by package
+     * name) plans a partial `update`, with `--with <removed>:<prod-locked
+     * version>` for each removed package; with no delta, `install` is
+     * planned unless the installed state already {@see InstalledState::Matches}.
+     *
+     * @param LocalRepository[] $appliedRepos
+     * @param LocalRepository[] $currentRepos
+     */
+    private function switch_planRefreshCommand(array $appliedRepos, array $currentRepos, LockFile $prodLock) : ?ComposerCommand
+    {
+        $appliedByName = array();
+        foreach($appliedRepos as $repo) {
+            $appliedByName[$repo->getPackageName()] = $repo;
+        }
+
+        $currentByName = array();
+        foreach($currentRepos as $repo) {
+            $currentByName[$repo->getPackageName()] = $repo;
+        }
+
+        $changedOrAdded = array();
+        foreach($currentByName as $name => $repo) {
+            $previous = $appliedByName[$name] ?? null;
+
+            if($previous === null || $previous->getPath() !== $repo->getPath() || $previous->getVersionOverride() !== $repo->getVersionOverride()) {
+                $changedOrAdded[] = $name;
+            }
+        }
+
+        $removed = array();
+        foreach($appliedByName as $name => $repo) {
+            if(!isset($currentByName[$name])) {
+                $removed[] = $name;
+            }
+        }
+
+        if(count($changedOrAdded) > 0 || count($removed) > 0)
+        {
+            $arguments = array_merge(array('update'), $changedOrAdded);
+
+            foreach($removed as $name) {
+                $arguments[] = '--with';
+                $arguments[] = $name . ':' . ($prodLock->getLockedVersion($name) ?? '*');
+            }
+
+            return new ComposerCommand($arguments, 'Refreshing the switched local packages after a `local-repositories.json` change.');
+        }
+
+        $installedState = InstalledState::fromInstalledPackages(
+            self::MODE_DEV,
+            array_map(static fn(LocalRepository $r) : string => $r->getPackageName(), $currentRepos),
+            $this->switch_installedPackages()
+        );
+
+        if($installedState === InstalledState::Matches)
+        {
+            $this->addMessage(self::MESSAGE_ALREADY_INSTALLED, 'The switched packages are already installed; nothing to do.');
+
+            return null;
+        }
+
+        return new ComposerCommand(array('install'), 'Installing the switched local packages.');
+    }
+
+    /**
+     * DEV→PROD: blocked on a modified or missing snapshot; otherwise
+     * writes the three-way `revert()`'s `effectiveConfig` into
+     * `composer.json`, restores the snapshot lock into `composer.lock`,
+     * deletes the (now-applied) snapshot, and plans a command per the
+     * decision table.
+     *
+     * @return array{blocked:bool,command:?ComposerCommand,changes:ConfigChangeSet,snapshotHash:?string,appliedRepositories:?array<int,array<string,mixed>>}
+     */
+    private function switch_planDevToProd() : array
+    {
+        $this->console->line1('Switching from DEV to PROD...');
+        $this->addMessage(self::MESSAGE_USING_PROD_CONFIG, 'Using Composer PROD configuration.');
+
         if(!$this->prodFile->exists())
         {
-            $this->console->line1('Creating production config...');
+            $this->addMessage(
+                self::MESSAGE_SNAPSHOT_MISSING,
+                'WARNING: The production snapshot (`%s`) is missing; cannot switch back to PROD safely.',
+                $this->prodFile->getBaseName()
+            );
 
-            $this->console->line2('%s -> %s', $this->mainFile->getName(), $this->prodFile->getName());
-            $this->mainFile->copyTo($this->prodFile);
+            return $this->switch_blockedPlan();
         }
 
-        if($this->mainFile->getLockFile()->exists())
+        if($this->switch_isSnapshotModified())
         {
-            $this->console->line1('Creating production lock file...');
+            $this->addMessage(
+                self::MESSAGE_SNAPSHOT_MODIFIED,
+                'WARNING: The production snapshot (`%s`) has been modified since it was taken.',
+                $this->prodFile->getBaseName()
+            );
 
-            $this->console->line2('%s -> %s', $this->mainFile->getLockFile()->getName(), $this->prodFile->getLockFile()->getName());
-            $this->mainFile->getLockFile()->copyTo($this->prodFile->getLockFile());
+            return $this->switch_blockedPlan();
         }
+
+        $snapshotConfig = $this->prodFile->getData();
+        $appliedRepos = $this->switch_readAppliedRepositories();
+        $prodLock = $this->prodFile->getLockFile();
+
+        $current = $this->mainFile->getData();
+
+        $revertResult = DevConfigTransformer::revert($current, $snapshotConfig, $appliedRepos, $prodLock);
+        $effectiveConfig = $revertResult->getEffectiveConfig();
+
+        $this->switch_recordOverriddenEntries($revertResult->getOverriddenManagedEntries());
+
+        $classifier = DevConfigTransformer::makeOriginClassifier($appliedRepos, $revertResult);
+        $prodConfigChanges = ConfigDiff::between($snapshotConfig, $effectiveConfig, $classifier);
+        $composerJsonChanges = ConfigDiff::between($current, $effectiveConfig, $classifier);
+
+        $this->mainFile->putData($effectiveConfig);
+
+        $lockRestored = false;
+        if($prodLock->exists())
+        {
+            $prodLock->copyTo($this->mainFile->getLockFile());
+            $lockRestored = true;
+        }
+
+        // The snapshot is transient: delete it now that it has been
+        // applied back onto the main files.
+        $this->prodFile->delete();
+        $this->prodFile->getLockFile()->delete();
+
+        $changes = new ConfigChangeSet($composerJsonChanges, $prodConfigChanges);
+
+        if($changes->hasPermanentChanges())
+        {
+            $this->addMessage(
+                self::MESSAGE_DEV_CHANGES_CARRIED_BACK,
+                'DEV-time edits were carried back into production — keys: [%s], packages: [%s].',
+                implode(', ', $changes->getProdChangedKeys()),
+                implode(', ', $changes->getProdChangedPackages())
+            );
+        }
+
+        if(!$lockRestored)
+        {
+            // Force re-creation of the lock file: with no snapshot lock
+            // to restore, whatever is currently at `composer.lock`
+            // (e.g. a DEV-session lock) cannot be trusted as a PROD lock.
+            $this->mainFile->getLockFile()->delete();
+
+            $this->addMessage(
+                self::MESSAGE_PROD_LOCK_MISSING,
+                'WARNING: No production lock backup found. Please run `composer update` after switching the config.'
+            );
+
+            return array(
+                'blocked' => false,
+                'command' => new ComposerCommand(array('update'), 'No production lock backup exists; installing all dependencies.'),
+                'changes' => $changes,
+                'snapshotHash' => null,
+                'appliedRepositories' => null
+            );
+        }
+
+        $changedPackages = $changes->getProdChangedPackages();
+
+        if(count($changedPackages) > 0)
+        {
+            $command = new ComposerCommand(array_merge(array('update'), $changedPackages), 'Updating the packages carried back from DEV.');
+        }
+        else if($this->mainFile->getLockFile()->getLockStatus() === LockStatus::Stale)
+        {
+            $command = new ComposerCommand(array('update', '--lock'), 'Refreshing the lock hash after a non-package config change.');
+        }
+        else
+        {
+            $installedState = InstalledState::fromInstalledPackages(
+                self::MODE_PROD,
+                array_map(static fn(LocalRepository $r) : string => $r->getPackageName(), $appliedRepos),
+                $this->switch_installedPackages()
+            );
+
+            if($installedState === InstalledState::Matches) {
+                $this->addMessage(self::MESSAGE_ALREADY_INSTALLED, 'The production dependencies are already installed; nothing to do.');
+                $command = null;
+            } else {
+                $command = new ComposerCommand(array('install'), 'Installing the production dependencies.');
+            }
+        }
+
+        return array(
+            'blocked' => false,
+            'command' => $command,
+            'changes' => $changes,
+            'snapshotHash' => null,
+            'appliedRepositories' => null
+        );
+    }
+
+    /**
+     * PROD/INITIAL→PROD: no file effects beyond legacy cleanup, status
+     * and flags; plans `install` only when nothing has ever been
+     * installed yet.
+     *
+     * @return array{blocked:bool,command:?ComposerCommand,changes:ConfigChangeSet,snapshotHash:?string,appliedRepositories:?array<int,array<string,mixed>>}
+     */
+    private function switch_planProdToProd() : array
+    {
+        $this->console->line1('Already in PROD mode.');
+        $this->addMessage(self::MESSAGE_USING_PROD_CONFIG, 'Using Composer PROD configuration.');
+
+        $installed = $this->switch_installedPackages();
+
+        if(!$installed->exists())
+        {
+            // Nothing has ever been installed: a bare file-existence
+            // check is enough here, since InstalledState::fromInstalledPackages()
+            // would otherwise report `Matches` trivially whenever there
+            // are no local packages to check, regardless of whether
+            // `vendor/` exists at all.
+            $command = new ComposerCommand(array('install'), 'No installed dependencies found.');
+        }
+        else
+        {
+            $installedState = InstalledState::fromInstalledPackages(
+                self::MODE_PROD,
+                $this->switch_currentLocalPackageNamesLenient(),
+                $installed
+            );
+
+            if($installedState === InstalledState::Matches)
+            {
+                $this->addMessage(self::MESSAGE_ALREADY_INSTALLED, 'The production dependencies are already installed; nothing to do.');
+                $command = null;
+            }
+            else
+            {
+                $command = new ComposerCommand(array('install'), 'Installing the production dependencies.');
+            }
+        }
+
+        return array(
+            'blocked' => false,
+            'command' => $command,
+            'changes' => new ConfigChangeSet(array(), array()),
+            'snapshotHash' => null,
+            'appliedRepositories' => null
+        );
+    }
+
+    /**
+     * @return array{blocked:bool,command:?ComposerCommand,changes:ConfigChangeSet,snapshotHash:?string,appliedRepositories:?array<int,array<string,mixed>>}
+     */
+    private function switch_blockedPlan() : array
+    {
+        return array(
+            'blocked' => true,
+            'command' => null,
+            'changes' => new ConfigChangeSet(array(), array()),
+            'snapshotHash' => null,
+            'appliedRepositories' => null
+        );
+    }
+
+    /**
+     * Whether the production snapshot's current content (its config
+     * plus lock) still matches the `snapshotHash` recorded in the
+     * status file at the moment it was taken. A legacy status file
+     * (or one written before a snapshot hash existed) has no stored
+     * hash at all, and the tamper check is skipped entirely — a `null`
+     * stored hash never blocks a switch.
+     */
+    private function switch_isSnapshotModified() : bool
+    {
+        $storedHash = $this->statusFile->getSnapshotHash();
+
+        if($storedHash === null) {
+            return false;
+        }
+
+        $configData = $this->prodFile->exists() ? $this->prodFile->getData() : array();
+        $lockContent = $this->prodFile->getLockFile()->exists() ? $this->prodFile->getLockFile()->getContent() : '';
+
+        return $storedHash !== md5(json_encode($configData, JSON_THROW_ON_ERROR) . '|' . $lockContent);
+    }
+
+    /**
+     * @return LocalRepository[]
+     */
+    private function switch_readAppliedRepositories() : array
+    {
+        $data = $this->statusFile->getAppliedRepositories();
+
+        if($data === null) {
+            return array();
+        }
+
+        return array_map(
+            static fn(array $entry) : LocalRepository => LocalRepository::fromArray($entry),
+            $data
+        );
+    }
+
+    /**
+     * @param LocalRepository[] $repos
+     * @return array<int,array<string,mixed>>
+     */
+    private function switch_serializeRepositories(array $repos) : array
+    {
+        return array_map(
+            static fn(LocalRepository $repo) : array => $repo->toArray(),
+            $repos
+        );
+    }
+
+    /**
+     * Reads and strictly validates the DEV configuration's current
+     * `local-repositories` list — identical file-existence guard and
+     * validator ({@see LocalRepository::parseList()}) as the pre-v3
+     * `switch_adjustConfigForDev()` used.
+     *
+     * @return LocalRepository[]
+     * @throws ComposerSwitcherException {@see ComposerSwitcherException::ERROR_DEV_FILE_MISSING} {@see ComposerSwitcherException::ERROR_INVALID_JSON_STRUCTURE}
+     */
+    private function switch_requireCurrentLocalRepositories() : array
+    {
+        if(!$this->devFile->exists()) {
+            throw (new ComposerSwitcherException(
+                'ERROR: The DEV composer config file does not exist.',
+                ComposerSwitcherException::ERROR_DEV_FILE_MISSING
+            ))
+                ->setContext(array(
+                    ComposerSwitcherException::KEY_FILE_PATH => $this->devFile->getPath()
+                ));
+        }
+
+        return LocalRepository::parseList($this->devFile->getData(), $this->devFile->getPath());
+    }
+
+    /**
+     * The current `local-repositories` package names, read leniently
+     * (never throws) — used by {@see self::switch_planProdToProd()},
+     * where a missing or malformed DEV config must not block an
+     * otherwise file-effect-free PROD/INITIAL→PROD switch.
+     *
+     * @return string[]
+     */
+    private function switch_currentLocalPackageNamesLenient() : array
+    {
+        if(!$this->devFile->exists()) {
+            return array();
+        }
+
+        try {
+            $devConfig = $this->devFile->getData();
+        } catch(ComposerSwitcherException) {
+            return array();
+        }
+
+        [$repos, ] = LocalRepository::parseListLenient($devConfig, $this->devFile->getPath());
+
+        return array_map(
+            static fn(LocalRepository $repo) : string => $repo->getPackageName(),
+            $repos
+        );
+    }
+
+    /**
+     * @param array<int,array{packageName:string,version:string|null,source:string}> $derivations
+     */
+    private function switch_recordVersionDerivations(array $derivations) : void
+    {
+        foreach($derivations as $derivation) {
+            if($derivation['version'] === null) {
+                continue;
+            }
+
+            $this->addMessage(
+                self::MESSAGE_VERSION_DERIVED,
+                'Package [%s] aliased to version [%s] (source: %s).',
+                $derivation['packageName'],
+                $derivation['version'],
+                $derivation['source']
+            );
+        }
+    }
+
+    /**
+     * @param array<int,array{section:string,packageName:string,snapshotValue:mixed,currentValue:mixed}> $overrides
+     */
+    private function switch_recordOverriddenEntries(array $overrides) : void
+    {
+        foreach($overrides as $override) {
+            $this->addMessage(
+                self::MESSAGE_MANAGED_ENTRY_OVERRIDDEN,
+                'A manual edit to the managed [%s] entry for [%s] was discarded (restored to the production-aliased value).',
+                $override['section'],
+                $override['packageName']
+            );
+        }
+    }
+
+    private function switch_installedPackages() : InstalledPackages
+    {
+        $projectRoot = dirname($this->mainFile->getPath());
+        $configData = $this->mainFile->exists() ? $this->mainFile->getData() : array();
+
+        return (new InstalledPackages($projectRoot, $configData))->setFileSystem($this->fileSystem);
     }
 
     private function autoDisplayMessages() : void
@@ -1310,163 +1542,4 @@ class ConfigSwitcher
         );
     }
 
-    private function switch_adjustConfigForDev() : void
-    {
-        $config = $this->prodFile->getData();
-
-        if(!$this->devFile->exists()) {
-            throw (new ComposerSwitcherException(
-                'ERROR: The DEV composer config file does not exist.',
-                ComposerSwitcherException::ERROR_DEV_FILE_MISSING
-            ))
-                ->setContext(array(
-                    ComposerSwitcherException::KEY_FILE_PATH => $this->devFile->getPath()
-                ));
-        }
-
-        $devConfig = $this->devFile->getData();
-
-        $this->console->line1('Adjusting config for DEV...');
-
-        if(!isset($devConfig[self::KEY_LOCAL_REPOSITORIES]) || !is_array($devConfig[self::KEY_LOCAL_REPOSITORIES])) {
-            throw (new ComposerSwitcherException(
-                sprintf(
-                    'ERROR: The DEV composer config does not contain the [%s] key, or it is not an array.',
-                    self::KEY_LOCAL_REPOSITORIES
-                ),
-                ComposerSwitcherException::ERROR_INVALID_JSON_STRUCTURE
-            ))
-                ->setContext(array(
-                    ComposerSwitcherException::KEY_FILE_PATH => $this->devFile->getPath(),
-                    ComposerSwitcherException::KEY_EXPECTED => self::KEY_LOCAL_REPOSITORIES
-                ));
-        }
-
-        foreach($devConfig[self::KEY_LOCAL_REPOSITORIES] as $repo)
-        {
-            if(!isset($repo['package-name'], $repo['path']) || !is_string($repo['package-name']) || !is_string($repo['path'])) {
-                throw (new ComposerSwitcherException(
-                    'ERROR: Invalid local repository entry in DEV composer config.',
-                    ComposerSwitcherException::ERROR_INVALID_JSON_STRUCTURE
-                ))
-                    ->setContext(array(
-                        ComposerSwitcherException::KEY_FILE_PATH => $this->devFile->getPath(),
-                        ComposerSwitcherException::KEY_PACKAGE_NAME => is_string($repo['package-name'] ?? null) ? $repo['package-name'] : null
-                    ));
-            }
-
-            $packageName = $repo['package-name'];
-            $path = $repo['path'];
-            $version = $repo['version'] ?? '*';
-
-            // Write to require-dev if the package lives there in the PROD baseline.
-            $requireKey = isset($config['require-dev'][$packageName]) ? 'require-dev' : 'require';
-            $config[$requireKey][$packageName] = $version;
-
-            // Default wildcard version in the path repository.
-            // This means that no version constraint is applied,
-            // and the package will always be treated as the latest version,
-            // which equals to `dev-main`.
-            $repoEntry = array(
-                'type' => 'path',
-                'url' => $path,
-                'options' => array(
-                    'symlink' => true
-                ),
-            );
-
-            // Specific version constraint: This means that the version cannot
-            // be inferred from the local package (no `version` field in its
-            // `composer.json`), and therefore we need to define the package
-            // version explicitly.
-            if($version !== '*')
-            {
-                $versions = array(
-                    $packageName => $version
-                );
-
-                if(strpos($packageName, '_') !== false)
-                {
-                    // Some package names use underscores instead of hyphens.
-                    // The repository URL may use either, so we need to add
-                    // both versions to ensure that Composer can find it.
-                    $versions[str_replace('_', '-', $packageName)] = $version;
-                }
-
-                $repoEntry['options']['versions'] = $versions;
-            }
-
-            if(!isset($config[self::KEY_REPOSITORIES]) || !is_array($config[self::KEY_REPOSITORIES])) {
-                $config[self::KEY_REPOSITORIES] = array();
-            }
-
-            // Attempt to find existing repository entries and replace
-            // the first match with the path entry. Any additional
-            // matches (stale VCS duplicates) are removed.
-            $found = false;
-            foreach ($config[self::KEY_REPOSITORIES] as $i => $repository)
-            {
-                if (!isset($repository['url'])) {
-                    continue;
-                }
-
-                if(
-                    !$this->urlMatchesPackageName($repository['url'], $packageName)
-                    &&
-                    // GitHub repository URLs use hyphens instead of underscores.
-                    // The package name may use either.
-                    !$this->urlMatchesPackageName($repository['url'], str_replace('_', '-', $packageName)))
-                {
-                    continue;
-                }
-
-                if(!$found) {
-                    $found = true;
-                    $this->console->line1('- UPDATE | [%s] | Overwriting existing repository entry.', $packageName);
-                    $config[self::KEY_REPOSITORIES][$i] = $repoEntry;
-                } else {
-                    $this->console->line1('- PRUNE  | [%s] | Removing duplicate repository entry.', $packageName);
-                    unset($config[self::KEY_REPOSITORIES][$i]);
-                }
-            }
-
-            if($found) {
-                $config[self::KEY_REPOSITORIES] = array_values($config[self::KEY_REPOSITORIES]);
-            } else {
-                $config[self::KEY_REPOSITORIES][] = $repoEntry;
-                $this->console->line1('- ADD | [%s] | Adding new repository entry.', $packageName);
-            }
-        }
-
-        $this->mainFile->putData($config);
-
-        $this->console->newline();
-
-        $this->addMessage(self::MESSAGE_REBUILT_DEV_CONFIG, 'Rebuilt a fresh DEV `composer.json`.');
-    }
-
-    /**
-     * Checks whether a repository URL contains the package name
-     * followed by a valid boundary character (`.`, `/`, or end-of-string).
-     * Prevents substring collisions like `application-utils` matching
-     * `application-utils-core`.
-     */
-    private function urlMatchesPackageName(string $url, string $name) : bool
-    {
-        $pos = stripos($url, $name);
-
-        if($pos === false) {
-            return false;
-        }
-
-        $afterPos = $pos + strlen($name);
-
-        if($afterPos >= strlen($url)) {
-            return true;
-        }
-
-        $nextChar = $url[$afterPos];
-
-        return $nextChar === '.' || $nextChar === '/';
-    }
 }

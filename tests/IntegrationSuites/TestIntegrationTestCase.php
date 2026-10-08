@@ -59,18 +59,20 @@ final class TestIntegrationTestCase extends IntegrationTestCase
         $this->assertStringEndsWith('/integration-project', $this->testSource);
 
         $mainJson = file_get_contents($this->testTarget . '/composer.json');
-        $prodJson = file_get_contents($this->testTarget . '/composer/composer-prod.json');
         $localRepositoriesJson = file_get_contents($this->testTarget . '/composer/local-repositories.json');
 
         $this->assertStringNotContainsString('__LIBRARY_SRC_PATH__', (string)$mainJson);
-        $this->assertStringNotContainsString('__LIBRARY_SRC_PATH__', (string)$prodJson);
         $this->assertStringNotContainsString('__LOCAL_CLONE_PATH__', (string)$localRepositoriesJson);
 
         $expectedSourcePath = realpath(__DIR__ . '/../../src');
 
         $this->assertNotFalse($expectedSourcePath);
         $this->assertStringContainsString($expectedSourcePath, (string)$mainJson);
-        $this->assertStringContainsString($expectedSourcePath, (string)$prodJson);
+
+        // Under v3, `composer/composer-prod.json` is a transient snapshot
+        // the switcher itself creates — it is never part of the committed
+        // fixture, so there is no second placeholder copy to substitute.
+        $this->assertFileDoesNotExist($this->testTarget . '/composer/composer-prod.json');
     }
 
     /**
@@ -81,12 +83,12 @@ final class TestIntegrationTestCase extends IntegrationTestCase
     public function test_setUpDoesNotModifyCommittedFixtureFiles() : void
     {
         $committedMainJson = file_get_contents($this->assetsFolder . '/integration-project/composer.json');
-        $committedProdJson = file_get_contents($this->assetsFolder . '/integration-project/composer/composer-prod.json');
         $committedLocalRepositoriesJson = file_get_contents($this->assetsFolder . '/integration-project/composer/local-repositories.json');
 
         $this->assertStringContainsString('__LIBRARY_SRC_PATH__', (string)$committedMainJson);
-        $this->assertStringContainsString('__LIBRARY_SRC_PATH__', (string)$committedProdJson);
         $this->assertStringContainsString('__LOCAL_CLONE_PATH__', (string)$committedLocalRepositoriesJson);
+
+        $this->assertFileDoesNotExist($this->assetsFolder . '/integration-project/composer/composer-prod.json');
     }
 
     public function test_bootstrapProdProducesLockFileAndVendorDirectory() : void
@@ -105,9 +107,9 @@ final class TestIntegrationTestCase extends IntegrationTestCase
         $this->assertStringContainsString('Composer version', $result->getOutput());
     }
 
-    public function test_setLocalRepositoryVersionAddsVersionKeyWithoutDisturbingOtherKeys() : void
+    public function test_setLocalRepositoryVersionOverrideAddsVersionKeyWithoutDisturbingOtherKeys() : void
     {
-        $this->setLocalRepositoryVersion('2.1.0');
+        $this->setLocalRepositoryVersionOverride('2.1.0');
 
         $repository = $this->getFirstLocalRepositoryEntry();
 
@@ -116,10 +118,10 @@ final class TestIntegrationTestCase extends IntegrationTestCase
         $this->assertArrayHasKey('path', $repository);
     }
 
-    public function test_setLocalRepositoryVersionRemovesVersionKeyWithoutDisturbingOtherKeys() : void
+    public function test_setLocalRepositoryVersionOverrideRemovesVersionKeyWithoutDisturbingOtherKeys() : void
     {
-        $this->setLocalRepositoryVersion('2.1.0');
-        $this->setLocalRepositoryVersion(null);
+        $this->setLocalRepositoryVersionOverride('2.1.0');
+        $this->setLocalRepositoryVersionOverride(null);
 
         $repository = $this->getFirstLocalRepositoryEntry();
 

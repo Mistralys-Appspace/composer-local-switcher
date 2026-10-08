@@ -226,5 +226,38 @@ final class TestExceptionContext extends ComposerSwitcherTestCase
         }
     }
 
+    /**
+     * The pre-v3 reconciliation/verification surface this plan retires
+     * must leave no trace: {@see ComposerSwitcherException} carries no
+     * `KEY_DIRECTION` or `RECONCILE_*` constant (the retired
+     * `ERROR_INVALID_RECONCILE_DIRECTION` code, 182111, is never
+     * reused — see the class's own "not reused" comment), and
+     * {@see ConfigSwitcher} has no `switch_initProductionFiles` method
+     * (the v2-era committed-copy bootstrap this plan's transient
+     * snapshot model replaces).
+     */
+    public function test_retiredReconciliationArtifactsAreAbsent() : void
+    {
+        $exceptionReflection = new \ReflectionClass(ComposerSwitcherException::class);
+        $constantNames = array_keys($exceptionReflection->getConstants());
+
+        $this->assertNotContains('KEY_DIRECTION', $constantNames);
+
+        foreach($constantNames as $name)
+        {
+            $this->assertStringStartsNotWith(
+                'RECONCILE_',
+                $name,
+                sprintf('ComposerSwitcherException must not carry a RECONCILE_* constant; found [%s].', $name)
+            );
+        }
+
+        $switcherReflection = new \ReflectionClass(ConfigSwitcher::class);
+        $this->assertFalse(
+            $switcherReflection->hasMethod('switch_initProductionFiles'),
+            'ConfigSwitcher must not carry the retired switch_initProductionFiles() method.'
+        );
+    }
+
     // endregion
 }

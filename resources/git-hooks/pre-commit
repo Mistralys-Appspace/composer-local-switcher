@@ -36,8 +36,7 @@ if [ -f "$DEV_MARKER" ]; then
             echo "  - $FILE"
         done
         echo ""
-        echo "Switch to PROD config first:  composer switch-prod"
-        echo "Then run composer install:    composer install"
+        echo "Switch to PROD config:  composer switch-prod"
         echo ""
         exit 1
     fi

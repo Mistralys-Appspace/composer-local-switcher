@@ -18,11 +18,11 @@ use Mistralys\ComposerSwitcher\Utils\ConfigFile;
  * that assembles the WP-003 fixture-source seam, the WP-005 fixture, the
  * WP-006 clone resolution, and the WP-007 runner.
  *
- * The substitution is applied to both `composer.json` and
- * `composer/composer-prod.json` because {@see ConfigSwitcher} rebuilds the
- * active `composer.json` from the prod baseline on every DEV switch — a
- * substitution applied only to the former would be silently discarded by
- * the first `switch-dev` call.
+ * The `__LIBRARY_SRC_PATH__` substitution is only ever applied to
+ * `composer.json` — under v3 `composer/composer-prod.json` is a
+ * transient snapshot {@see ConfigSwitcher} copies *from* `composer.json`
+ * at switch time, never a committed baseline the fixture ships with, so
+ * there is no second copy of the placeholder to substitute.
  */
 abstract class IntegrationTestCase extends ComposerSwitcherTestCase
 {
@@ -60,14 +60,14 @@ abstract class IntegrationTestCase extends ComposerSwitcherTestCase
         $librarySourcePath = $this->getLibrarySourcePath();
 
         $this->substitutePlaceholder($this->testTarget . '/composer.json', self::PLACEHOLDER_LIBRARY_SRC_PATH, $librarySourcePath);
-        $this->substitutePlaceholder($this->testTarget . '/composer/composer-prod.json', self::PLACEHOLDER_LIBRARY_SRC_PATH, $librarySourcePath);
     }
 
     /**
      * Runs `composer update` once in the work copy, producing a real
      * `composer.lock` and `vendor/` tree in a PROD-shaped INITIAL state
-     * (the fixture's `composer.json` still mirrors `composer-prod.json`
-     * at this point, since no switch has happened yet).
+     * (no switch has happened yet, so `composer/composer-prod.json`
+     * does not exist — it is only ever created as a transient snapshot
+     * by the first `switch-dev`).
      *
      * @return void
      */
@@ -79,14 +79,28 @@ abstract class IntegrationTestCase extends ComposerSwitcherTestCase
     /**
      * Runs the sequence every DEV-mode assertion needs before it can run:
      * bootstraps a PROD lock file (a switch is a no-op without one), then
-     * runs a checked `composer switch-dev`.
+     * runs a checked, non-interactive `composer switch-dev -- --yes` via
+     * {@see self::runSwitch()} — under v3 the switch itself completes the
+     * Composer command in one invocation, so no separate `composer update`
+     * follows (unlike the pre-v3 two-step sequence this method used to
+     * run).
      *
      * @return void
      */
     protected function switchToDev() : void
     {
         $this->bootstrapProd();
-        $this->runComposerChecked('switch-dev');
+
+        $result = $this->runSwitch('switch-dev');
+
+        if(!$result->isSuccess()) {
+            $this->fail(sprintf(
+                "'composer switch-dev -- --yes' failed unexpectedly, exit code %d.\nOutput:\n%s\nError output:\n%s",
+                $result->getExitCode(),
+                $result->getOutput(),
+                $result->getErrorOutput()
+            ));
+        }
     }
 
     /**
@@ -100,6 +114,30 @@ abstract class IntegrationTestCase extends ComposerSwitcherTestCase
     protected function updateDependencies() : void
     {
         $this->runComposerChecked('update');
+    }
+
+    /**
+     * Runs a switch-family script (`switch-dev`, `switch-prod`,
+     * `switch-update`, or either preview script) in the work copy, with
+     * `-- --yes` plus any given script arguments appended — every Tier 2
+     * switch call goes through this helper, so `--yes` (required under
+     * v3's confirmation sequence, since every Tier 2 run is
+     * non-interactive) and `ComposerRunner`'s `--no-interaction`-before-`--`
+     * placement are both exercised consistently rather than hand-rolled
+     * per call site.
+     *
+     * Deliberately not failure-checked, unlike {@see self::runComposerChecked()} —
+     * a blocked-switch assertion (e.g. a stale lock exiting non-zero)
+     * needs the raw {@see ProcessResult} to assert against; a caller
+     * expecting success wraps this in its own assertion instead.
+     *
+     * @param string $script e.g. `switch-dev`, `switch-prod`, `switch-update`.
+     * @param string ...$scriptArgs Additional script arguments, e.g. `--no-install`.
+     * @return ProcessResult
+     */
+    protected function runSwitch(string $script, string ...$scriptArgs) : ProcessResult
+    {
+        return $this->runComposer($script, '--', '--yes', ...$scriptArgs);
     }
 
     /**
@@ -196,7 +234,7 @@ abstract class IntegrationTestCase extends ComposerSwitcherTestCase
      * @param string|null $version NULL removes the `version` key entirely.
      * @return void
      */
-    protected function setLocalRepositoryVersion(?string $version) : void
+    protected function setLocalRepositoryVersionOverride(?string $version) : void
     {
         $configFile = new ConfigFile($this->testTarget . '/composer/local-repositories.json');
         $data = $configFile->getData();

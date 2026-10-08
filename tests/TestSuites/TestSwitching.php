@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Mistralys\ComposerSwitcher\TestSuites;
 
 use Mistralys\ComposerSwitcher\ConfigSwitcher;
+use Mistralys\ComposerSwitcher\State\FileOperation;
 use Mistralys\ComposerSwitcher\State\SwitchMessage;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\ComposerSwitcherTestCase;
 use Mistralys\ComposerSwitcher\Utils\ConfigFile;
@@ -37,11 +38,13 @@ final class TestSwitching extends ComposerSwitcherTestCase
 
     /**
      * `switchUpdate()` in the INITIAL state (no switch has ever been
-     * run) is a no-op on disk: it returns an explicit {@see ConfigSwitcher::MODE_INITIAL}
-     * outcome with no operations and no messages, rather than silently
-     * doing nothing or implicitly initializing the production files.
+     * run) is the PROD/INITIAL→PROD decision-table row (per this plan's
+     * WP-008 "Reshape the switching core" notes) — it reports mode
+     * `prod`, has no file effects on `composer-prod.*` (that is a
+     * transient DEV-only snapshot under v3), and still creates the
+     * status/flag files like any other switch.
      */
-    public function test_switchUpdateInInitialStateReturnsInitialOutcome() : void
+    public function test_switchUpdateInInitialStateRoutesToProdToProd() : void
     {
         $switcher = $this->createSwitcher();
 
@@ -50,12 +53,11 @@ final class TestSwitching extends ComposerSwitcherTestCase
 
         $outcome = $switcher->switchUpdate();
 
-        $this->assertSame(ConfigSwitcher::MODE_INITIAL, $outcome->getMode());
-        $this->assertFalse($outcome->hasOperations());
-        $this->assertEmpty($outcome->getMessages());
+        $this->assertSame(ConfigSwitcher::MODE_PROD, $outcome->getMode());
         $this->assertFalse($outcome->isDryRun());
 
-        $this->assertFalse($switcher->getStatus()->exists());
+        $this->assertTrue($switcher->getStatus()->exists());
+        $this->assertTrue($switcher->getStatus()->isPROD());
         $this->assertFalse($switcher->getProdFile()->exists());
     }
 
@@ -64,16 +66,17 @@ final class TestSwitching extends ComposerSwitcherTestCase
      * has the following tasks:
      *
      * - Create the status file, marking the mode as DEV.
-     * - Create the `composer-prod.json` file (copy from `composer.json`).
-     * - Create the `composer-prod.lock` file (copy from `composer.lock`).
-     * - Update the `composer.json` file repositories.
+     * - Snapshot `composer.json`/`.lock` into the transient
+     *   `composer-prod.json`/`.lock`.
+     * - Rewrite `composer.json`'s repositories for the local packages.
      *
      * Expected file structure after this operation:
      *
      * - `composer.json` (DEV configuration, with DEV repositories)
-     * - `composer.lock` (NONE, as the DEV repositories have not been installed)
-     * - `composer/composer-prod.json` (copy of the original `composer.json`)
-     * - `composer/composer-prod.lock` (copy of the original `composer.lock`)
+     * - `composer.lock` (unchanged — it stays the PROD lock throughout
+     *   the DEV session; v3 never backs it up to a separate DEV lock)
+     * - `composer/composer-prod.json` (snapshot of the original `composer.json`)
+     * - `composer/composer-prod.lock` (snapshot of the original `composer.lock`)
      */
     public function test_initialSwitchToDEV() : void
     {
@@ -92,16 +95,19 @@ final class TestSwitching extends ComposerSwitcherTestCase
 
         $this->assertTrue($switcher->getProdFile()->exists());
         $this->assertTrue($switcher->getProdFile()->getLockFile()->exists());
-        $this->assertFalse($switcher->getMainFile()->getLockFile()->exists());
+        $this->assertTrue($switcher->getMainFile()->getLockFile()->exists());
 
         $this->assertConfigHasExpectedPaths($switcher);
         $this->assertLockFileIsPROD($switcher->getProdFile());
+        $this->assertLockFileIsPROD($switcher->getMainFile());
         $this->assertFlagIsDEV($switcher);
     }
 
     /**
-     * No switch has been made yet, so switching to PROD
-     * must only create the missing production files.
+     * No switch has been made yet: under v3, PROD/INITIAL→PROD has no
+     * file effects on `composer-prod.*` at all — that file is a
+     * transient DEV-only snapshot now, never a committed-style
+     * production baseline. Only the status and flag files are created.
      */
     public function test_initialSwitchToPROD() : void
     {
@@ -118,15 +124,18 @@ final class TestSwitching extends ComposerSwitcherTestCase
         $this->assertTrue($status->isPROD());
         $this->assertFalse($status->isDEV());
 
-        // The main composer.json file has been copied to the
-        // production file, and the lock file has been copied.
-        $this->assertTrue($switcher->getProdFile()->exists());
-        $this->assertTrue($switcher->getProdFile()->getLockFile()->exists());
+        $this->assertFalse($switcher->getProdFile()->exists());
+        $this->assertFalse($switcher->getProdFile()->getLockFile()->exists());
 
-        $this->assertLockFileIsPROD($switcher->getMainFile());
         $this->assertFlagIsPROD($switcher);
     }
 
+    /**
+     * A DEV→PROD switch restores `composer.lock` from the snapshot
+     * (`composer-prod.lock`), overwriting whatever the user's own
+     * tooling wrote to `composer.lock` while in DEV — v3 has no
+     * separate DEV lock backup file to restore from instead.
+     */
     public function test_switchDEVToPROD() : void
     {
         //$this->setKeepWorkFiles();
@@ -134,7 +143,8 @@ final class TestSwitching extends ComposerSwitcherTestCase
         $switcher = $this->createSwitcher();
         $switcher->switchToDevelopment();
 
-        // Simulate the user creating the DEV lock file
+        // Simulate the user's own `composer update` producing a new
+        // DEV lock file.
         $this->assertNotFalse(file_put_contents(
             $switcher->getMainFile()->getLockFile()->getPath(),
             'DEV'
@@ -143,7 +153,6 @@ final class TestSwitching extends ComposerSwitcherTestCase
         $switcher->switchToProduction();
 
         $this->assertLockFileIsPROD($switcher->getMainFile());
-        $this->assertLockFileIsDEV($switcher->getDevFile());
         $this->assertFlagIsPROD($switcher);
     }
 
@@ -174,28 +183,25 @@ final class TestSwitching extends ComposerSwitcherTestCase
     }
 
     /**
-     * A DEV->PROD switch with no `composer-prod.lock` backup to restore
-     * from used to throw `ERROR_CANNOT_COPY_FILE` from the unconditional
-     * `copyTo()` call in `switch_case_DEV_PROD()`. It now removes the
-     * stale DEV `composer.lock` instead (mirroring the equivalent
-     * missing-lock handling in `switch_case_PROD_DEV()`) and records
+     * A DEV->PROD switch with no `composer-prod.lock` backup to
+     * restore from removes `composer.lock` instead (forcing
+     * re-creation via the planned full `update`), and records
      * {@see ConfigSwitcher::MESSAGE_PROD_LOCK_MISSING}.
+     *
+     * The snapshot lock is legitimately absent only when the main lock
+     * was already `Missing` *before* the snapshot was taken — deleting
+     * it afterward would instead trip the snapshot-modified tamper
+     * check ({@see ConfigSwitcher::MESSAGE_SNAPSHOT_MODIFIED}) and
+     * block the switch entirely, which is covered separately.
      */
     public function test_prodSwitchWithoutProdLockDeletesMainLock() : void
     {
         $switcher = $this->createSwitcher();
+        unlink($switcher->getMainFile()->getLockFile()->getPath());
+
         $switcher->switchToDevelopment();
 
-        // Simulate the user creating the DEV lock file.
-        $this->assertNotFalse(file_put_contents(
-            $switcher->getMainFile()->getLockFile()->getPath(),
-            'DEV'
-        ));
-
-        // Simulate a missing production lock backup.
-        $prodLockFile = $switcher->getProdFile()->getLockFile();
-        $this->assertTrue($prodLockFile->exists());
-        unlink($prodLockFile->getPath());
+        $this->assertFalse($switcher->getProdFile()->getLockFile()->exists());
 
         $switcher->switchToProduction();
 
@@ -209,48 +215,313 @@ final class TestSwitching extends ComposerSwitcherTestCase
     }
 
     /**
-     * `BaseFile::tryCopyTo()` used to require both the source AND the
-     * target to already exist, so the lock backup in
-     * `switch_case_PROD_PROD()` silently did nothing whenever
-     * `composer-prod.lock` had not been created yet. It now only
-     * requires the source to exist, so a missing target is created.
-     *
-     * Since `switch_case_PROD_PROD()` now delegates to the content-first
-     * `reconcile()` core, the two files must actually differ in content
-     * (not just modification time) for the backup branch to trigger —
-     * see {@see \Mistralys\ComposerSwitcher\ConfigSwitcher::reconcile()}.
+     * Deleting the snapshot's lock backup after it was taken (rather
+     * than before, as in {@see self::test_prodSwitchWithoutProdLockDeletesMainLock()})
+     * is detected as a modified snapshot and blocks the switch
+     * entirely — `composer.lock` is left untouched rather than being
+     * force-deleted.
      */
-    public function test_tryCopyToCreatesMissingTarget() : void
+    public function test_deletingSnapshotLockAfterTheFactBlocksTheSwitch() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $this->assertTrue($switcher->getProdFile()->getLockFile()->exists());
+        unlink($switcher->getProdFile()->getLockFile()->getPath());
+
+        $mainLockContentBefore = $switcher->getMainFile()->getLockFile()->getContent();
+
+        $outcome = $switcher->switchToProduction();
+
+        $this->assertTrue($outcome->isBlocked());
+        $this->assertSame($mainLockContentBefore, $switcher->getMainFile()->getLockFile()->getContent());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_SNAPSHOT_MODIFIED,
+            $this->getMessageCodes($switcher)
+        );
+    }
+
+    /**
+     * A `Stale` main lock (content-hash mismatch against the current
+     * `composer.json`) blocks a PROD/INITIAL→DEV switch entirely — no
+     * snapshot is taken and `composer.json` stays untouched.
+     */
+    public function test_prodToDevBlockedOnStaleMainLock() : void
+    {
+        $switcher = $this->createSwitcher();
+
+        file_put_contents(
+            $switcher->getMainFile()->getLockFile()->getPath(),
+            json_encode(array('content-hash' => 'deliberately-wrong-hash', 'packages' => array()), JSON_THROW_ON_ERROR)
+        );
+
+        $mainDataBefore = $switcher->getMainFile()->getData();
+
+        $outcome = $switcher->switchToDevelopment();
+
+        $this->assertTrue($outcome->isBlocked());
+        $this->assertSame($mainDataBefore, $switcher->getMainFile()->getData());
+        $this->assertFalse($switcher->getProdFile()->exists());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_PROD_LOCK_OUTDATED,
+            $this->getMessageCodes($switcher)
+        );
+    }
+
+    /**
+     * A `Missing` main lock does not block a PROD/INITIAL→DEV switch —
+     * it completes in full and plans a full `update` (no package names)
+     * rather than the usual partial one.
+     */
+    public function test_prodToDevWithMissingLockPlansFullUpdate() : void
+    {
+        $switcher = $this->createSwitcher();
+        unlink($switcher->getMainFile()->getLockFile()->getPath());
+
+        $outcome = $switcher->switchToDevelopment();
+
+        $this->assertFalse($outcome->isBlocked());
+        $this->assertNotNull($outcome->getComposerCommand());
+        $this->assertSame(array('update'), $outcome->getComposerCommand()->getArguments());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_NO_LOCK_FILE_FOUND,
+            $this->getMessageCodes($switcher)
+        );
+    }
+
+    /**
+     * A missing production snapshot blocks a DEV→PROD switch with no
+     * file effects — distinct from a modified snapshot, which is
+     * covered by {@see self::test_deletingSnapshotLockAfterTheFactBlocksTheSwitch()}.
+     */
+    public function test_devToProdBlockedOnMissingSnapshot() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $switcher->getProdFile()->delete();
+        $switcher->getProdFile()->getLockFile()->delete();
+
+        $mainDataBefore = $switcher->getMainFile()->getData();
+
+        $outcome = $switcher->switchToProduction();
+
+        $this->assertTrue($outcome->isBlocked());
+        $this->assertSame($mainDataBefore, $switcher->getMainFile()->getData());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_SNAPSHOT_MISSING,
+            $this->getMessageCodes($switcher)
+        );
+    }
+
+    /**
+     * An edit to the production snapshot (`composer-prod.json`) itself
+     * blocks a DEV→DEV refresh, with no file effects — the three-way
+     * revert can no longer trust a tampered base/target.
+     */
+    public function test_devRefreshBlockedOnModifiedSnapshot() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $prodConfig = $switcher->getProdFile()->getData();
+        $prodConfig['extra']['tampered'] = true;
+        $switcher->getProdFile()->putData($prodConfig);
+
+        $mainDataBefore = $switcher->getMainFile()->getData();
+
+        $outcome = $switcher->switchToDevelopment();
+
+        $this->assertTrue($outcome->isBlocked());
+        $this->assertSame($mainDataBefore, $switcher->getMainFile()->getData());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_SNAPSHOT_MODIFIED,
+            $this->getMessageCodes($switcher)
+        );
+    }
+
+    /**
+     * A DEV→DEV refresh (here via `switchUpdate()`) with no repository
+     * delta must not rewrite `composer.json` at all when the
+     * three-way-merged result is structurally identical to what is
+     * already on disk — even when that disk content uses non-canonical
+     * formatting `ConfigFile::putData()` would never reproduce byte for
+     * byte, and even after the user's own `composer require` added a
+     * non-managed package directly. No write operation for
+     * `composer.json` is recorded, and the manual edit survives.
+     */
+    public function test_devRefreshWithNoDeltaLeavesComposerJsonByteIdenticalAndKeepsUserEdits() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $config = $switcher->getMainFile()->getData();
+        $config['require']['acme/manually-required'] = '^1.0';
+
+        // Non-canonical formatting: a two-space indent instead of
+        // ConfigFile::putData()'s four-space JSON_PRETTY_PRINT output.
+        $nonCanonicalJson = str_replace(
+            '    ',
+            '  ',
+            (string)json_encode($config, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)
+        );
+        file_put_contents($switcher->getMainFile()->getPath(), $nonCanonicalJson);
+
+        $bytesBefore = file_get_contents($switcher->getMainFile()->getPath());
+
+        $outcome = $switcher->switchUpdate();
+
+        $bytesAfter = file_get_contents($switcher->getMainFile()->getPath());
+
+        $this->assertSame(
+            $bytesBefore,
+            $bytesAfter,
+            'composer.json must stay byte-for-byte unchanged when the refresh has no delta.'
+        );
+
+        $mainFilePath = $switcher->getMainFile()->getPath();
+        $writeOperations = array_filter(
+            $outcome->getOperations(),
+            static fn(FileOperation $operation) : bool => $operation->getType() === FileOperation::TYPE_WRITE
+                && $operation->getTargetPath() === $mainFilePath
+        );
+        $this->assertEmpty($writeOperations, 'No write operation must be recorded for composer.json.');
+
+        $configAfter = $switcher->getMainFile()->getData();
+        $this->assertSame('^1.0', $configAfter['require']['acme/manually-required'] ?? null);
+    }
+
+    /**
+     * Cleans up a leftover v2-era `local-repositories.lock` file on
+     * every switch, regardless of direction, emitting
+     * {@see ConfigSwitcher::MESSAGE_LEGACY_FILES_FOUND} without ever
+     * throwing.
+     */
+    public function test_legacyDevLockFileIsCleanedUpOnAnySwitch() : void
+    {
+        $switcher = $this->createSwitcher();
+
+        $legacyLockPath = $switcher->getDevFile()->getLockFile()->getPath();
+        file_put_contents($legacyLockPath, 'legacy dev lock content');
+
+        $outcome = $switcher->switchToProduction();
+
+        $this->assertFileDoesNotExist($legacyLockPath);
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_LEGACY_FILES_FOUND,
+            $this->getMessageCodes($switcher)
+        );
+        $this->assertFalse($outcome->isBlocked());
+    }
+
+    /**
+     * A committed-style `composer-prod.json` found while in PROD mode
+     * (a v2-era leftover) is deleted outright on a PROD/INITIAL→PROD
+     * switch — it has no reason to exist outside an active DEV session
+     * under v3.
+     */
+    public function test_legacyCommittedProdConfigIsDeletedOnProdSwitch() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToProduction();
+        $this->bootstrapProdSnapshot($switcher);
+
+        $this->assertTrue($switcher->getProdFile()->exists());
+
+        $outcome = $switcher->switchToProduction();
+
+        $this->assertFalse($switcher->getProdFile()->exists());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_LEGACY_FILES_FOUND,
+            $this->getMessageCodes($switcher)
+        );
+        $this->assertFalse($outcome->isBlocked());
+    }
+
+    /**
+     * PROD/INITIAL→PROD plans `install` only when nothing has ever been
+     * installed yet (no `vendor/composer/installed.json`); with one
+     * already present, it plans no command at all.
+     */
+    public function test_prodToProdPlansInstallOnlyWhenNothingInstalled() : void
+    {
+        $switcher = $this->createSwitcher();
+
+        $outcomeWithoutInstalled = $switcher->switchToProduction();
+        $this->assertNotNull($outcomeWithoutInstalled->getComposerCommand());
+        $this->assertSame(array('install'), $outcomeWithoutInstalled->getComposerCommand()->getArguments());
+
+        $installedJsonPath = $this->testTarget . '/vendor/composer/installed.json';
+        mkdir(dirname($installedJsonPath), 0777, true);
+        file_put_contents($installedJsonPath, json_encode(array('packages' => array()), JSON_THROW_ON_ERROR));
+
+        $outcomeWithInstalled = $switcher->switchToProduction();
+        $this->assertNull($outcomeWithInstalled->getComposerCommand());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_ALREADY_INSTALLED,
+            $this->getMessageCodes($switcher)
+        );
+    }
+
+    /**
+     * `vendor/composer/installed.json` existing is not, by itself,
+     * enough for PROD/INITIAL→PROD to consider the dependencies
+     * installed: if it still shows a configured local package
+     * installed from a path repository (a stale/orphaned DEV-session
+     * install left behind, e.g. by a dry run or a manual flag-file
+     * reset), the installed state is `Pending`, not `Matches`, and
+     * `install` must still be planned so the mismatch self-heals.
+     */
+    public function test_prodToProdPlansInstallWhenInstalledJsonShowsStalePathInstall() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToProduction();
+
+        $installedJsonPath = $this->testTarget . '/vendor/composer/installed.json';
+        mkdir(dirname($installedJsonPath), 0777, true);
+        file_put_contents($installedJsonPath, json_encode(array(
+            'packages' => array(
+                array('name' => 'mistralys/application_framework', 'version' => 'dev-main', 'dist' => array('type' => 'path'))
+            )
+        ), JSON_THROW_ON_ERROR));
+
+        $outcome = $switcher->switchToProduction();
+
+        $this->assertNotNull($outcome->getComposerCommand());
+        $this->assertSame(array('install'), $outcome->getComposerCommand()->getArguments());
+        $this->assertNotContains(
+            ConfigSwitcher::MESSAGE_ALREADY_INSTALLED,
+            $this->getMessageCodes($switcher)
+        );
+    }
+
+    /**
+     * A PROD→PROD switch (`switch_planProdToProd()`) has no file
+     * effects at all under v3 — not even when `composer.json` itself
+     * has been modified since the previous switch. The reconcile
+     * machinery this used to delegate into (two committed, editable
+     * copies of the config) no longer exists; `composer.json` is now
+     * the single source of truth in PROD mode.
+     */
+    public function test_prodToProdHasNoFileEffectsEvenWhenMainConfigChanges() : void
     {
         //$this->setKeepWorkFiles();
 
         $switcher = $this->createSwitcher();
         $switcher->switchToProduction();
 
-        $prodLockFile = $switcher->getProdFile()->getLockFile();
-        $this->assertTrue($prodLockFile->exists());
-
-        // Simulate a missing production lock backup, with the main
-        // composer.json modified more recently than composer-prod.json
-        // and actually different in content, so that
-        // switch_case_PROD_PROD()'s backup branch triggers.
-        unlink($prodLockFile->getPath());
-        $this->assertFalse($prodLockFile->exists());
-
         $config = $switcher->getMainFile()->getData();
         $config['require']['php'] = '>=8.0';
         $switcher->getMainFile()->putData($config);
 
-        touch($switcher->getProdFile()->getPath(), time() - 60);
-        touch($switcher->getMainFile()->getPath());
+        $mainDataBefore = $switcher->getMainFile()->getData();
+        $mainLockContentBefore = $switcher->getMainFile()->getLockFile()->getContent();
 
         $switcher->switchToProduction();
 
-        $this->assertTrue($prodLockFile->exists());
-        $this->assertSame(
-            file_get_contents($switcher->getMainFile()->getLockFile()->getPath()),
-            file_get_contents($prodLockFile->getPath())
-        );
+        $this->assertSame($mainDataBefore, $switcher->getMainFile()->getData());
+        $this->assertSame($mainLockContentBefore, $switcher->getMainFile()->getLockFile()->getContent());
+        $this->assertFalse($switcher->getProdFile()->exists());
     }
 
     public function test_specificPackageVersion() : void
@@ -284,12 +555,19 @@ final class TestSwitching extends ComposerSwitcherTestCase
     }
 
     /**
-     * `ConfigSwitcher` writes the `version` field from a local
-     * repository entry into `composer.json` verbatim — it is a
-     * deliberate boundary that no validation of the version string
-     * happens here. A malformed value is the caller's responsibility;
-     * this characterises that the switcher itself never rejects or
-     * silently corrects one.
+     * `DevConfigTransformer::apply()` writes the `version` field from
+     * a local repository entry into the path repository's
+     * `options.versions` alias verbatim — no validation of the version
+     * string happens there, so a malformed value is the caller's
+     * responsibility. The root `require` constraint, however, is no
+     * longer overwritten with that literal value: since the package
+     * is already root-required in the PROD baseline (`>=3.1.9`) and an
+     * alias was derived (the override), the constraint is kept from
+     * PROD — aliasing the symlinked package to the override is what
+     * satisfies it, rather than replacing it outright. This
+     * characterises that the switcher itself never rejects or
+     * silently corrects a malformed override, while also no longer
+     * needing to loosen the root constraint to accommodate one.
      */
     public function test_malformedVersionIsWrittenVerbatim() : void
     {
@@ -313,7 +591,7 @@ final class TestSwitching extends ComposerSwitcherTestCase
 
         $config = $switcher->getMainFile()->getData();
 
-        $this->assertSame($malformedVersion, $config['require']['mistralys/application-utils'] ?? null);
+        $this->assertSame('>=3.1.9', $config['require']['mistralys/application-utils'] ?? null);
 
         $versions = $this->findVersionsForPackage($config, 'mistralys/application-utils');
 
@@ -399,48 +677,6 @@ final class TestSwitching extends ComposerSwitcherTestCase
 
         $this->assertSame(1, $pathCount, 'Expected exactly one path entry for application-framework.');
         $this->assertSame(0, $vcsCount, 'Expected no VCS entries for application-framework after DEV switch.');
-    }
-
-    public function test_verifyReturnsInSyncWhenIdentical() : void
-    {
-        $switcher = $this->createSwitcher();
-        $switcher->switchToProduction();
-
-        $result = $switcher->verify();
-
-        $this->assertTrue($result->isInSync());
-        $this->assertEmpty($result->getDifferences());
-        $this->assertFalse($result->isDevMode());
-        $this->assertTrue($result->isComparable());
-    }
-
-    public function test_verifyReturnsOutOfSyncWhenDifferent() : void
-    {
-        $switcher = $this->createSwitcher();
-        $switcher->switchToProduction();
-
-        // Modify the main composer.json to create a difference.
-        $config = $switcher->getMainFile()->getData();
-        $config['require']['php'] = '>=8.0';
-        $switcher->getMainFile()->putData($config);
-
-        $result = $switcher->verify();
-
-        $this->assertFalse($result->isInSync());
-        $this->assertContains('require', $result->getDifferences());
-    }
-
-    public function test_verifyWarnsInDevMode() : void
-    {
-        $switcher = $this->createSwitcher();
-        $switcher->switchToDevelopment();
-
-        $result = $switcher->verify();
-
-        $this->assertFalse($result->isInSync());
-        $this->assertEmpty($result->getDifferences());
-        $this->assertTrue($result->isDevMode());
-        $this->assertFalse($result->isComparable());
     }
 
     public function test_statusFileStoresCanonicalPaths() : void
@@ -570,6 +806,21 @@ final class TestSwitching extends ComposerSwitcherTestCase
         );
     }
 
+    /**
+     * Manually creates the `composer-prod.json`/`.lock` snapshot that
+     * `switchToProduction()` no longer produces under v3 (it has no
+     * file effects on `composer-prod.*` at all) — for tests whose real
+     * subject is a committed-style `composer-prod.*` leftover being
+     * recognised and cleaned up as a v2-era legacy artifact (see
+     * {@see ConfigSwitcher::switch_cleanLegacyArtifacts()}) rather than
+     * being produced by a real DEV session.
+     */
+    private function bootstrapProdSnapshot(ConfigSwitcher $switcher) : void
+    {
+        $switcher->getMainFile()->copyTo($switcher->getProdFile());
+        $switcher->getMainFile()->getLockFile()->tryCopyTo($switcher->getProdFile()->getLockFile());
+    }
+
     private function assertFlagIsDEV(ConfigSwitcher $switcher) : void
     {
         $this->assertTrue($switcher->getFlagFile(ConfigSwitcher::MODE_DEV)->exists());
@@ -582,15 +833,6 @@ final class TestSwitching extends ComposerSwitcherTestCase
         $this->assertTrue($switcher->getFlagFile(ConfigSwitcher::MODE_PROD)->exists());
     }
     
-    /**
-     * @param ConfigFile|LockFile $target
-     * @return void
-     */
-    private function assertLockFileIsDEV($target) : void
-    {
-        $this->assertLockFileIs($target, 'DEV');
-    }
-
     /**
      * @param ConfigFile|LockFile $target
      * @return void

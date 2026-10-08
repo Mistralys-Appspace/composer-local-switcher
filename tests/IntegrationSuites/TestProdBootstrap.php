@@ -24,72 +24,78 @@ final class TestProdBootstrap extends IntegrationTestCase
         'switch-dev',
         'switch-prod',
         'switch-update',
-        'switch-verify-config',
         'switch-install-hooks',
     );
 
     // region: _Tests
 
     /**
-     * The work copy is a valid three-path project: the three convention
-     * files exist, both manifests map all five `switch-*` script keys, and
-     * neither placeholder survived {@see IntegrationTestCase::setUp()}'s
-     * substitution.
+     * The work copy is a valid v3 three-path project: `composer.json` and
+     * `composer/local-repositories.json` exist, `composer.json` maps all
+     * four `switch-*` script keys, neither placeholder survived
+     * {@see IntegrationTestCase::setUp()}'s substitution, and no committed
+     * `composer/composer-prod.json` snapshot exists — under v3 that file is
+     * only ever a transient snapshot the switcher itself creates.
      */
     public function test_fixtureIsValidThreePathProject() : void
     {
         $this->assertFileExists($this->testTarget . '/composer.json');
-        $this->assertFileExists($this->testTarget . '/composer/composer-prod.json');
         $this->assertFileExists($this->testTarget . '/composer/local-repositories.json');
+        $this->assertFileDoesNotExist($this->testTarget . '/composer/composer-prod.json');
 
         $mainData = $this->decodeJsonFile($this->testTarget . '/composer.json');
-        $prodData = $this->decodeJsonFile($this->testTarget . '/composer/composer-prod.json');
+        $scripts = $mainData['scripts'] ?? array();
 
-        foreach(array($mainData, $prodData) as $data)
-        {
-            $scripts = $data['scripts'] ?? array();
-
-            foreach(self::SWITCH_SCRIPT_KEYS as $key) {
-                $this->assertArrayHasKey($key, $scripts, sprintf('Expected scripts key "%s" to be present.', $key));
-            }
+        foreach(self::SWITCH_SCRIPT_KEYS as $key) {
+            $this->assertArrayHasKey($key, $scripts, sprintf('Expected scripts key "%s" to be present.', $key));
         }
 
         $mainJson = $this->readFile($this->testTarget . '/composer.json');
-        $prodJson = $this->readFile($this->testTarget . '/composer/composer-prod.json');
 
-        foreach(array($mainJson, $prodJson) as $json)
-        {
-            $this->assertStringNotContainsString('__LIBRARY_SRC_PATH__', $json);
-            $this->assertStringNotContainsString('__LOCAL_CLONE_PATH__', $json);
-        }
+        $this->assertStringNotContainsString('__LIBRARY_SRC_PATH__', $mainJson);
+        $this->assertStringNotContainsString('__LOCAL_CLONE_PATH__', $mainJson);
     }
 
     /**
      * The committed fixture under `tests/assets/integration-project/` — not
-     * the work copy — still carries both placeholders verbatim, and neither
-     * manifest leaks a machine-specific absolute path in their place: each
-     * placeholder-bearing value decodes to exactly the placeholder string.
+     * the work copy — still carries both placeholders verbatim, and
+     * `composer.json` leaks no machine-specific absolute path in their
+     * place: the placeholder-bearing value decodes to exactly the
+     * placeholder string. There is no committed `composer-prod.json` to
+     * carry a placeholder copy of its own.
      */
     public function test_committedFixtureCarriesPlaceholders() : void
     {
         $committedMainJson = $this->readFile($this->assetsFolder . '/integration-project/composer.json');
-        $committedProdJson = $this->readFile($this->assetsFolder . '/integration-project/composer/composer-prod.json');
         $committedLocalRepositoriesJson = $this->readFile($this->assetsFolder . '/integration-project/composer/local-repositories.json');
 
         $this->assertStringContainsString('__LIBRARY_SRC_PATH__', $committedMainJson);
-        $this->assertStringContainsString('__LIBRARY_SRC_PATH__', $committedProdJson);
         $this->assertStringContainsString('__LOCAL_CLONE_PATH__', $committedLocalRepositoriesJson);
 
+        $this->assertFileDoesNotExist($this->assetsFolder . '/integration-project/composer/composer-prod.json');
+
         $committedMain = $this->decodeJsonFile($this->assetsFolder . '/integration-project/composer.json');
-        $committedProd = $this->decodeJsonFile($this->assetsFolder . '/integration-project/composer/composer-prod.json');
         $committedLocalRepositories = $this->decodeJsonFile($this->assetsFolder . '/integration-project/composer/local-repositories.json');
 
         // Decoding each placeholder-bearing value to exactly the placeholder
         // string (rather than merely string-containing it) proves no
         // machine-specific absolute path rides alongside it in the same field.
         $this->assertSame('__LIBRARY_SRC_PATH__', $committedMain['autoload']['classmap'][0]);
-        $this->assertSame('__LIBRARY_SRC_PATH__', $committedProd['autoload']['classmap'][0]);
         $this->assertSame('__LOCAL_CLONE_PATH__', $committedLocalRepositories['local-repositories'][0]['path']);
+    }
+
+    /**
+     * The committed fixture's `composer.json` scripts block carries none
+     * of the retired `switch-reconcile`/`switch-verify-config` entry
+     * points this plan removes.
+     */
+    public function test_fixtureScriptsHaveNoRetiredEntryPoints() : void
+    {
+        $committedMain = $this->decodeJsonFile($this->assetsFolder . '/integration-project/composer.json');
+        $scripts = $committedMain['scripts'] ?? array();
+
+        $this->assertArrayNotHasKey('switch-reconcile', $scripts);
+        $this->assertArrayNotHasKey('switch-verify-config', $scripts);
     }
 
     /**

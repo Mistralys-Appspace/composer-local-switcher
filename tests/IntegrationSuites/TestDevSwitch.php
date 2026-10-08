@@ -55,6 +55,11 @@ final class DevSwitchWorkDirectoryHarness extends IntegrationTestCase
     {
         return $this->runComposer(...$arguments);
     }
+
+    public function runSwitchPublic(string $script, string ...$scriptArgs) : ProcessResult
+    {
+        return $this->runSwitch($script, ...$scriptArgs);
+    }
 }
 
 /**
@@ -103,8 +108,17 @@ final class TestDevSwitch extends IntegrationTestCase
         $this->assertTrue($repository['options']['symlink'] ?? false);
         $this->assertSame($clonePath, $repository['url']);
 
+        // Since the fixture package is already root-required in PROD
+        // (`^2.0`) and v3 derived an alias for it from the PROD lock even
+        // without an explicit `local-repositories.json` override, the
+        // original PROD constraint is kept as-is rather than wildcarded —
+        // DevConfigTransformer::apply() only falls back to `*` when the
+        // package either isn't root-required or no alias could be
+        // derived. The actual resolved version comes from the path
+        // repository's own inline alias (options.versions), not from
+        // this constraint (see TestVersionOverride::test_wildcardVersionDerivesFromProdLock()).
         $this->assertArrayHasKey(self::PACKAGE_NAME, $data['require'] ?? array());
-        $this->assertSame('*', $data['require'][self::PACKAGE_NAME]);
+        $this->assertSame('^2.0', $data['require'][self::PACKAGE_NAME]);
     }
 
     /**
@@ -133,7 +147,6 @@ final class TestDevSwitch extends IntegrationTestCase
     public function test_devUpdateCreatesVendorSymlink() : void
     {
         $this->switchToDev();
-        $this->updateDependencies();
 
         $vendorPath = $this->testTarget . '/vendor/' . self::PACKAGE_NAME;
         $clonePath = $this->resolveClonePath();
@@ -157,7 +170,6 @@ final class TestDevSwitch extends IntegrationTestCase
     public function test_cloneEditIsVisibleThroughVendorPath() : void
     {
         $this->switchToDev();
-        $this->updateDependencies();
 
         $clonePath = $this->resolveClonePath();
         $markerName = 'WP010-MARKER-' . uniqid('', true) . '.tmp';
@@ -198,11 +210,8 @@ final class TestDevSwitch extends IntegrationTestCase
 
         $harness->bootstrapProdPublic();
 
-        $switchResult = $harness->runComposerPublic('switch-dev');
+        $switchResult = $harness->runSwitchPublic('switch-dev');
         $this->assertTrue($switchResult->isSuccess(), 'Expected switch-dev to succeed in the harness work copy.');
-
-        $updateResult = $harness->runComposerPublic('update');
-        $this->assertTrue($updateResult->isSuccess(), 'Expected composer update to succeed in the harness work copy.');
 
         $workCopyPath = $harness->getWorkCopyPath();
         $vendorPath = $workCopyPath . '/vendor/' . self::PACKAGE_NAME;

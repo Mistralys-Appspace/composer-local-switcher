@@ -66,9 +66,11 @@ final class TestGitHooks extends IntegrationTestCase
 
     /**
      * With `composer.json.DEV` present and `composer.json` staged, the
-     * installed hook's Guard 1 blocks the commit (non-zero exit) and
-     * names `composer.json` among the blocked files in its output —
-     * AC-10.
+     * installed hook's Guard 1 blocks the commit (non-zero exit), names
+     * `composer.json` among the blocked files in its output, and
+     * instructs the single v3 remediation command `composer switch-prod`
+     * (not the retired two-command `switch-prod` + `install` sequence) —
+     * AC-10, AC-18.
      */
     public function test_guard1BlocksCommitInDevMode() : void
     {
@@ -82,6 +84,8 @@ final class TestGitHooks extends IntegrationTestCase
 
         $this->assertNotSame(0, $result->getExitCode(), 'Expected Guard 1 to block the commit while composer.json.DEV is present.');
         $this->assertStringContainsString('composer.json', $result->getOutput());
+        $this->assertStringContainsString('composer switch-prod', $result->getOutput());
+        $this->assertStringNotContainsString('composer install', $result->getOutput());
     }
 
     /**

@@ -18,12 +18,58 @@ class ComposerSwitcherException extends Exception
     public const ERROR_CANNOT_READ_FILE = 182108;
     public const ERROR_CANNOT_GET_MODIFIED_DATE = 182109;
     public const ERROR_INVALID_SWITCH_MODE = 182110;
-    public const ERROR_INVALID_RECONCILE_DIRECTION = 182111;
+
+    // 182111 (ERROR_INVALID_RECONCILE_DIRECTION) retired with the
+    // reconciliation family (this plan's WP-010) — not reused.
 
     /**
-     * Context key naming the offending value passed as a reconciliation direction.
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner} — the
+     * executed {@see \Mistralys\ComposerSwitcher\Utils\ComposerProcess::run()}
+     * call returned a non-zero exit code. Context carries
+     * {@see self::KEY_COMMAND} and {@see self::KEY_EXIT_CODE}.
      */
-    public const KEY_DIRECTION = 'direction';
+    public const ERROR_COMPOSER_COMMAND_FAILED = 182112;
+
+    /**
+     * {@see \Mistralys\ComposerSwitcher\Utils\ComposerProcess} — neither
+     * the `COMPOSER_BINARY` environment variable nor an executable
+     * `composer` on `PATH` could be resolved.
+     */
+    public const ERROR_COMPOSER_BINARY_NOT_FOUND = 182113;
+
+    /**
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner} — the
+     * planned switch is blocked by a precondition (see the printed
+     * messages for the reason); no file was written.
+     */
+    public const ERROR_SWITCH_BLOCKED = 182114;
+
+    /**
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner} — a
+     * switch that would change `composer.json` was run non-interactively
+     * without `--yes`; the changes were printed, but nothing was written.
+     */
+    public const ERROR_CONFIRMATION_REQUIRED = 182115;
+
+    /**
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner} — the
+     * second, post-confirmation preview no longer
+     * {@see \Mistralys\ComposerSwitcher\State\SwitchOutcome::hasSameEffectsAs()}
+     * the first one shown to the user; nothing was written.
+     */
+    public const ERROR_INPUTS_CHANGED = 182116;
+
+    /**
+     * Context key naming the shell-rendered Composer command that
+     * failed, paired with {@see self::KEY_EXIT_CODE}.
+     */
+    public const KEY_COMMAND = 'command';
+
+    /**
+     * Context key naming the failed command's exit code, paired with
+     * {@see self::KEY_COMMAND}.
+     */
+    public const KEY_EXIT_CODE = 'exitCode';
 
     /**
      * Context key naming the path of the file a throw site was

@@ -4,11 +4,16 @@ declare(strict_types=1);
 
 namespace Mistralys\ComposerSwitcher\TestSuites;
 
+use Mistralys\ComposerSwitcher\State\ComposerCommand;
+use Mistralys\ComposerSwitcher\State\ConfigChange;
+use Mistralys\ComposerSwitcher\State\ConfigChangeOrigin;
+use Mistralys\ComposerSwitcher\State\ConfigChangeSet;
 use Mistralys\ComposerSwitcher\State\FileOperation;
+use Mistralys\ComposerSwitcher\State\InstalledState;
+use Mistralys\ComposerSwitcher\State\LockStatus;
 use Mistralys\ComposerSwitcher\State\SwitchDescription;
 use Mistralys\ComposerSwitcher\State\SwitchMessage;
 use Mistralys\ComposerSwitcher\State\SwitchOutcome;
-use Mistralys\ComposerSwitcher\State\VerificationResult;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -106,55 +111,6 @@ final class TestStateValueObjects extends TestCase
 
     // endregion
 
-    // region: _Tests - VerificationResult
-
-    public function test_verificationResult_inSyncOutsideDevMode() : void
-    {
-        $result = new VerificationResult(false, true, array());
-
-        $this->assertFalse($result->isDevMode());
-        $this->assertTrue($result->isComparable());
-        $this->assertTrue($result->isInSync());
-        $this->assertSame(array(), $result->getDifferences());
-        $this->assertSame(
-            array('inSync' => true, 'differences' => array(), 'devMode' => false),
-            $result->toArray()
-        );
-    }
-
-    public function test_verificationResult_differencesOutsideDevMode() : void
-    {
-        $result = new VerificationResult(false, false, array('require', 'require-dev'));
-
-        $this->assertFalse($result->isInSync());
-        $this->assertSame(array('require', 'require-dev'), $result->getDifferences());
-    }
-
-    /**
-     * Matches today's DEV-mode behavior: comparison is not
-     * meaningful, so `isInSync()` always reports `false`,
-     * regardless of what `$inSync` was constructed with.
-     */
-    public function test_verificationResult_devModeForcesNotInSync() : void
-    {
-        $result = new VerificationResult(true, true, array());
-
-        $this->assertTrue($result->isDevMode());
-        $this->assertFalse($result->isComparable());
-        $this->assertFalse($result->isInSync());
-    }
-
-    public function test_verificationResult_toArrayAlwaysIncludesDevModeKey() : void
-    {
-        $devResult = new VerificationResult(true, false, array());
-        $prodResult = new VerificationResult(false, true, array());
-
-        $this->assertTrue($devResult->toArray()['devMode']);
-        $this->assertFalse($prodResult->toArray()['devMode']);
-    }
-
-    // endregion
-
     // region: _Tests - SwitchOutcome
 
     public function test_switchOutcome_gettersAndArray() : void
@@ -186,6 +142,105 @@ final class TestStateValueObjects extends TestCase
         $this->assertFalse($array['dryRun']);
         $this->assertSame($messages[0]->toArray(), $array['messages'][0]);
         $this->assertSame($operations[0]->toArray(), $array['operations'][0]);
+
+        // Defaults for the extended fields, when not supplied at construction time.
+        $this->assertNull($outcome->getComposerCommand());
+        $this->assertFalse($outcome->isBlocked());
+        $this->assertTrue($outcome->getConfigChanges()->isEmpty());
+        $this->assertFalse($outcome->requiresConfirmation());
+        $this->assertNull($array['composerCommand']);
+        $this->assertFalse($array['blocked']);
+        $this->assertSame(array('composerJson' => array(), 'prodConfig' => array()), $array['configChanges']);
+    }
+
+    public function test_switchOutcome_extendedFieldsGettersAndArray() : void
+    {
+        $command = new ComposerCommand(array('update', 'acme/local-one'), 'Installing the switched package.');
+        $changes = new ConfigChangeSet(
+            array(new ConfigChange(array('require', 'acme/local-one'), '*', '2.3.0', ConfigChange::KIND_CHANGED, ConfigChangeOrigin::LocalSwitch)),
+            array()
+        );
+
+        $outcome = new SwitchOutcome('dev', false, array(), array(), $command, true, $changes);
+
+        $this->assertSame($command, $outcome->getComposerCommand());
+        $this->assertTrue($outcome->isBlocked());
+        $this->assertSame($changes, $outcome->getConfigChanges());
+        $this->assertTrue($outcome->requiresConfirmation());
+
+        $array = $outcome->toArray();
+        $this->assertSame($command->toArray(), $array['composerCommand']);
+        $this->assertTrue($array['blocked']);
+        $this->assertSame($changes->toArray(), $array['configChanges']);
+    }
+
+    /**
+     * `requiresConfirmation()` is true exactly when the `composerJson`
+     * section is non-empty — a `prodConfig`-only change set (e.g.
+     * `describe()`'s pending-carry-back view) does not, by itself,
+     * require confirmation.
+     */
+    public function test_switchOutcome_requiresConfirmationOnlyForComposerJsonSection() : void
+    {
+        $prodOnlyChanges = new ConfigChangeSet(
+            array(),
+            array(new ConfigChange(array('require', 'acme/carried'), null, '^1.0', ConfigChange::KIND_ADDED, ConfigChangeOrigin::CarriedBack))
+        );
+
+        $outcome = new SwitchOutcome('dev', false, array(), array(), null, false, $prodOnlyChanges);
+
+        $this->assertFalse($outcome->requiresConfirmation());
+    }
+
+    public function test_switchOutcome_hasSameEffectsAsTrueForIdenticalOutcomes() : void
+    {
+        $command = new ComposerCommand(array('install'), 'Installing dependencies.');
+        $changes = new ConfigChangeSet(array(), array());
+        $operations = array(new FileOperation(FileOperation::TYPE_COPY, '/target', '/source', 'Copying.', true));
+
+        $first = new SwitchOutcome('dev', false, array(new SwitchMessage(1, 'first')), $operations, $command, false, $changes);
+        $second = new SwitchOutcome('dev', false, array(new SwitchMessage(2, 'second')), $operations, $command, false, $changes);
+
+        $this->assertTrue($first->hasSameEffectsAs($second));
+    }
+
+    public function test_switchOutcome_hasSameEffectsAsFalseWhenBlockedDiffers() : void
+    {
+        $first = new SwitchOutcome('dev', false, array(), array(), null, false);
+        $second = new SwitchOutcome('dev', false, array(), array(), null, true);
+
+        $this->assertFalse($first->hasSameEffectsAs($second));
+    }
+
+    public function test_switchOutcome_hasSameEffectsAsFalseWhenConfigChangesDiffer() : void
+    {
+        $first = new SwitchOutcome('dev', false, array(), array(), null, false, new ConfigChangeSet(array(), array()));
+        $second = new SwitchOutcome('dev', false, array(), array(), null, false, new ConfigChangeSet(
+            array(new ConfigChange(array('extra'), null, array('foo' => 'bar'), ConfigChange::KIND_ADDED, ConfigChangeOrigin::CarriedBack)),
+            array()
+        ));
+
+        $this->assertFalse($first->hasSameEffectsAs($second));
+    }
+
+    public function test_switchOutcome_hasSameEffectsAsFalseWhenCommandDiffers() : void
+    {
+        $first = new SwitchOutcome('dev', false, array(), array(), new ComposerCommand(array('install'), 'r'));
+        $second = new SwitchOutcome('dev', false, array(), array(), new ComposerCommand(array('update'), 'r'));
+
+        $this->assertFalse($first->hasSameEffectsAs($second));
+    }
+
+    public function test_switchOutcome_hasSameEffectsAsFalseWhenOperationsDiffer() : void
+    {
+        $first = new SwitchOutcome('dev', false, array(), array(
+            new FileOperation(FileOperation::TYPE_COPY, '/target', '/source', 'Copying.', true)
+        ));
+        $second = new SwitchOutcome('dev', false, array(), array(
+            new FileOperation(FileOperation::TYPE_DELETE, '/target', null, 'Deleting.', true)
+        ));
+
+        $this->assertFalse($first->hasSameEffectsAs($second));
     }
 
     public function test_switchOutcome_noOperations() : void
@@ -220,24 +275,29 @@ final class TestStateValueObjects extends TestCase
 
     public function test_switchDescription_gettersAndArray() : void
     {
-        $verification = new VerificationResult(false, true, array());
-
         $files = array(
             array('label' => 'main', 'path' => '/project/composer.json', 'exists' => true, 'modifiedDate' => '2026-09-30 10:00:00')
         );
 
         $localRepositories = array(
-            array('packageName' => 'mistralys/some-dev-tool', 'path' => '../some-dev-tool', 'version' => '*')
+            array('packageName' => 'mistralys/some-dev-tool', 'path' => '../some-dev-tool', 'version' => '*', 'derivedVersion' => '1.2.3')
         );
 
         $warnings = array('No lock file found.');
+
+        $pendingProdChanges = new ConfigChangeSet(
+            array(),
+            array(new ConfigChange(array('require', 'mistralys/some-dev-tool'), null, '^1.0', ConfigChange::KIND_ADDED, ConfigChangeOrigin::CarriedBack))
+        );
 
         $description = new SwitchDescription(
             'dev',
             '2026-09-30 10:00:00',
             $files,
             'dev',
-            $verification,
+            LockStatus::Fresh,
+            InstalledState::Matches,
+            $pendingProdChanges,
             $localRepositories,
             $warnings
         );
@@ -247,7 +307,10 @@ final class TestStateValueObjects extends TestCase
         $this->assertSame($files, $description->getFiles());
         $this->assertSame('dev', $description->getActiveFlag());
         $this->assertTrue($description->hasActiveFlag());
-        $this->assertSame($verification, $description->getVerification());
+        $this->assertSame(LockStatus::Fresh, $description->getLockStatus());
+        $this->assertSame(InstalledState::Matches, $description->getInstalledState());
+        $this->assertSame($pendingProdChanges, $description->getPendingProdChanges());
+        $this->assertTrue($description->hasPendingProdChanges());
         $this->assertSame($localRepositories, $description->getLocalRepositories());
         $this->assertSame($warnings, $description->getWarnings());
         $this->assertTrue($description->hasWarnings());
@@ -258,21 +321,23 @@ final class TestStateValueObjects extends TestCase
         $this->assertSame('2026-09-30 10:00:00', $array['lastSwitchDate']);
         $this->assertSame($files, $array['files']);
         $this->assertSame('dev', $array['activeFlag']);
-        $this->assertSame($verification->toArray(), $array['verification']);
+        $this->assertSame('fresh', $array['lockStatus']);
+        $this->assertSame('matches', $array['installedState']);
+        $this->assertSame($pendingProdChanges->toArray(), $array['pendingProdChanges']);
         $this->assertSame($localRepositories, $array['localRepositories']);
         $this->assertSame($warnings, $array['warnings']);
     }
 
     public function test_switchDescription_noSwitchYet() : void
     {
-        $verification = new VerificationResult(false, false, array());
-
         $description = new SwitchDescription(
             null,
             null,
             array(),
             null,
-            $verification,
+            LockStatus::Missing,
+            InstalledState::Unknown,
+            null,
             array(),
             array()
         );
@@ -282,24 +347,27 @@ final class TestStateValueObjects extends TestCase
         $this->assertNull($description->getActiveFlag());
         $this->assertFalse($description->hasActiveFlag());
         $this->assertFalse($description->hasWarnings());
+        $this->assertNull($description->getPendingProdChanges());
+        $this->assertFalse($description->hasPendingProdChanges());
     }
 
     /**
      * `toArray()`/`toJSON()` must round-trip cleanly with every
      * collection empty (no files, no local repositories, no warnings)
-     * — the shape `describe()` produces for a freshly initialized
-     * project before any file records have been gathered.
+     * and `pendingProdChanges` `null` — the shape `describe()` produces
+     * for a freshly initialized project before any file records have
+     * been gathered.
      */
     public function test_switchDescription_toArrayAndJsonWithEmptyCollections() : void
     {
-        $verification = new VerificationResult(false, true, array());
-
         $description = new SwitchDescription(
             null,
             null,
             array(),
             null,
-            $verification,
+            LockStatus::Missing,
+            InstalledState::Unknown,
+            null,
             array(),
             array()
         );
@@ -312,11 +380,84 @@ final class TestStateValueObjects extends TestCase
         $this->assertNull($array['mode']);
         $this->assertNull($array['lastSwitchDate']);
         $this->assertNull($array['activeFlag']);
+        $this->assertNull($array['pendingProdChanges']);
 
         $json = $description->toJSON();
         $decoded = json_decode($json, true, 512, JSON_THROW_ON_ERROR);
 
         $this->assertSame($array, $decoded);
+    }
+
+    // endregion
+
+    // region: _Tests - LockStatus
+
+    /**
+     * Only {@see LockStatus::Stale} signals that an update/install is
+     * required — the other three cases (no lock file, a lock that
+     * still matches its config, and an undeterminable status) are
+     * handled by dedicated recovery paths elsewhere, not by treating
+     * them as "needs an update".
+     */
+    public function test_lockStatus_requiresUpdate() : void
+    {
+        $this->assertTrue(LockStatus::Stale->requiresUpdate());
+        $this->assertFalse(LockStatus::Fresh->requiresUpdate());
+        $this->assertFalse(LockStatus::Missing->requiresUpdate());
+        $this->assertFalse(LockStatus::Unknown->requiresUpdate());
+    }
+
+    // endregion
+
+    // region: _Tests - ComposerCommand
+
+    public function test_composerCommand_gettersAndArray() : void
+    {
+        $command = new ComposerCommand(
+            array('update', '--no-interaction'),
+            'Refreshing the lock file after a DEV switch.'
+        );
+
+        $this->assertSame(array('update', '--no-interaction'), $command->getArguments());
+        $this->assertSame('Refreshing the lock file after a DEV switch.', $command->getReason());
+        $this->assertSame(
+            array('arguments' => array('update', '--no-interaction'), 'reason' => 'Refreshing the lock file after a DEV switch.'),
+            $command->toArray()
+        );
+    }
+
+    public function test_composerCommand_toArrayFromArrayRoundTrip() : void
+    {
+        $original = new ComposerCommand(array('install', '--no-dev'), 'Installing PROD dependencies.');
+
+        $restored = ComposerCommand::fromArray($original->toArray());
+
+        $this->assertSame($original->getArguments(), $restored->getArguments());
+        $this->assertSame($original->getReason(), $restored->getReason());
+    }
+
+    public function test_composerCommand_toShellStringEscapesEachArgument() : void
+    {
+        $command = new ComposerCommand(
+            array('update', 'vendor/with a space', '--with=foo/bar:1.0.0'),
+            'Partial update.'
+        );
+
+        $this->assertSame(
+            implode(' ', array(
+                escapeshellarg('update'),
+                escapeshellarg('vendor/with a space'),
+                escapeshellarg('--with=foo/bar:1.0.0')
+            )),
+            $command->toShellString()
+        );
+    }
+
+    public function test_composerCommand_toShellStringWithNoArguments() : void
+    {
+        $command = new ComposerCommand(array(), 'Nothing to run.');
+
+        $this->assertSame('', $command->toShellString());
     }
 
     // endregion

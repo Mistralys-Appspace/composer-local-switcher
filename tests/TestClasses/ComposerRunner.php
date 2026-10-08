@@ -23,7 +23,14 @@ class ComposerRunner
 
     /**
      * Runs a Composer command in the configured working directory.
-     * `--no-interaction` is always appended.
+     * `--no-interaction` is always inserted — before the first `--`
+     * separator when one is present (e.g. `run('switch-dev', '--',
+     * '--yes')`, which must become `switch-dev --no-interaction --
+     * --yes`, not `switch-dev -- --yes --no-interaction`: everything
+     * after `--` is a script argument the switcher's own
+     * `EventContext::getArguments()` reads, not a Composer global flag,
+     * so appending `--no-interaction` there would hand it to the
+     * script instead of Composer), or appended at the end otherwise.
      *
      * `--no-progress` is deliberately not appended here: it is rejected
      * by several commands (e.g. `show`) that don't declare it, and it
@@ -36,11 +43,15 @@ class ComposerRunner
      */
     public function run(string ...$arguments): ProcessResult
     {
-        $command = array_merge(
-            array($this->resolveBinary()),
-            $arguments,
-            array('--no-interaction')
-        );
+        $separatorIndex = array_search('--', $arguments, true);
+
+        if($separatorIndex !== false) {
+            array_splice($arguments, $separatorIndex, 0, array('--no-interaction'));
+        } else {
+            $arguments[] = '--no-interaction';
+        }
+
+        $command = array_merge(array($this->resolveBinary()), $arguments);
 
         $process = new Process($command, $this->workingDirectory);
         $process->run();

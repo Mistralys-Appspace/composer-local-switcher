@@ -14,11 +14,9 @@
     "switch-dev": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchDev",
     "switch-prod": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchProd",
     "switch-update": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchUpdate",
-    "switch-verify-config": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerVerifyConfig",
     "switch-install-hooks": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerInstallHooks",
     "switch-describe": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchDescribe",
     "switch-describe-json": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchDescribeJson",
-    "switch-reconcile": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchReconcile",
     "switch-preview-dev": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchPreviewDev",
     "switch-preview-prod": "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchPreviewProd"
   },

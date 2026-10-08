@@ -1,0 +1,48 @@
+# Synthesis Report — Switching Model V3
+
+### Outcome Summary
+
+This plan reshaped composer-local-switcher's switching model from a two-committed-copies reconciliation scheme into a single-source-of-truth model built around a transient `composer-prod.*` snapshot, a three-way `DevConfigTransformer` revert, PROD-lock-derived DEV version aliasing, and a `plan-in-the-core / execute-at-the-edge` architecture where every switch command runs its own Composer step with explicit, diff-backed confirmation. All 15 work packages completed across implementation, QA, a dedicated security audit, code review, release engineering and documentation, shipping as a breaking v3.0.0 release with a full migration guide. Three rework cycles (WP-008, WP-011, WP-015) caught and fixed real defects before completion; two known, non-blocking classification edge cases in the origin-tagging logic were deliberately deferred to a follow-up work package rather than risked as late-cycle churn.
+
+### Metrics
+
+- **Final verification gate (WP-015):** `composer dump-autoload` clean; `composer test` (Tier 1) 252/252 passing, 935 assertions; `composer test-integration` (Tier 2) 77/77 passing, 445 assertions; `composer analyze` (PHPStan) 79/79 files, zero errors. Combined 329 tests, 0 failures, across the whole suite.
+- **Security audit (WP-011 only, the single WP carrying this stage):** 0 Critical / High / Medium findings across all 14 audit areas (OWASP Top 10 + input validation, data handling, dependency audit, authn/authz patterns). 3 Low/Info hardening observations recorded, none requiring action.
+- **Code review:** 0 Blocking issues across all 15 WPs; several Documentation-Forward items raised and resolved in-WP (manifest docs kept in lockstep with each change).
+- **Rework cycles:** WP-008 (1 implementation + 1 QA rework — `InstalledState` gating bug in `switch_planProdToProd()`), WP-011 (1 implementation + 1 QA rework — confirmation-default origin check and 5 dead `MESSAGE_*` constants), WP-015 (1 QA rework — 5 missing/stale documentation deliverables). All three were resolved within a single rework cycle each.
+- **Release:** Major version bump to v3.0.0 (Release Engineering sign-off), changelog `## v3.0.0` entry with a full Breaking Changes section, no untracked snapshot artifacts in the working tree at release time.
+
+### Strategic Recommendations
+
+- **Golden-vector verification against the real binary (WP-001):** `ComposerContentHash`'s test vectors were captured by running the actual Composer 2.9.5 binary and reading its lock file directly, rather than deriving expected values from the implementation under test — the strongest verification pattern available for an algorithm meant to mirror third-party behavior exactly. Worth reusing whenever this project re-implements another tool's internal algorithm.
+- **Diff-over-derive for change visibility (WP-007):** `ConfigDiff` structurally diffs the actual before/after arrays that get written, rather than having the transformer emit change records as a side effect. This is what keeps the preview, the confirmation prompt and `describe()` permanently unable to drift from what a switch actually does, even when `revert()` and `apply()` compose (the DEV→DEV refresh path).
+- **One architectural seam, not a split core (WP-008):** The decision-table reshape was deliberately kept as a single high-complexity WP rather than split further, because any split would leave an intermediate WP compiling against an inconsistent planner. The project ledger bears this out — it was the only WP needing two rework cycles to reach a correct decision table, but both were caught by QA before merge.
+- **Real-process regression tests catch real bugs (WP-013):** `ComposerRunner`'s `--no-interaction` placement fix (inserted before the `--` separator rather than always appended) was a genuine pre-existing correctness bug, caught only because the harness WP added direct unit coverage for both argument-ordering branches rather than trusting existing behavior.
+
+### Code Insights
+
+**Developer**
+- [high, fixed] `DevConfigTransformer::isManagedRepositoryEntry()`'s package-name-in-URL heuristic was unreliable for real `path` repository URLs; replaced with exact-path equality against the applied repos' own paths (WP-007).
+- [medium, open] `DevConfigTransformer::revertSection()` checks managed-package membership per-section only, so a package moved between `require`/`require-dev` in live DEV config between `apply()`/`revert()` can be duplicated into both sections (WP-006, confirmed by Reviewer, carried into WP-007/WP-012's follow-up list — not fixed).
+- [medium, open] `DevConfigTransformer::makeOriginClassifier()`'s managed/non-managed split classifies a first PROD/INITIAL→DEV switch's own VCS-repository pruning as `ConfigChangeOrigin::CarriedBack` rather than `LocalSwitch`, causing `SwitchCommandRunner`'s confirmation prompt to default to "no" on every ordinary first DEV switch that prunes a VCS repo (WP-012 code review finding; pinned in `TestConfirmation.php`'s docblock, not fixed).
+- [low] `ComposerRunner::run()` previously appended `--no-interaction` after all arguments instead of before the `--` separator, leaking the flag into the switcher's own script-argument parsing; fixed with direct regression coverage for both branches (WP-013).
+
+**Reviewer / QA**
+- Confirmed cross-cutting classification issues above rather than silently patching them, judging the fixes out of scope for the WPs that found them (correctly deferred to avoid churn against code a later WP would immediately touch).
+- Multiple low-priority coverage gaps flagged across the lock/diff/describe layers (see Deferred & Follow-Up Items) — all manually verified safe at the time, none blocking.
+
+### Deferred & Follow-Up Items
+
+- **[Deferred, medium priority]** `DevConfigTransformer::revertSection()` cross-section duplication bug — a managed package moved between `require`/`require-dev` in live DEV config between `apply()`/`revert()` can appear in both sections after a revert. Source: WP-006 (found), re-confirmed WP-007/WP-012. Originating agents: QA, Reviewer. Rationale for deferral: touches the same managed/non-managed classification logic a near-term follow-up WP would also need to revisit; fixing now risked churn against code about to be refactored again.
+- **[Deferred, medium priority]** `ConfigChangeOrigin::CarriedBack` misclassifies a first PROD/INITIAL→DEV switch's own VCS-repository pruning, causing the confirmation prompt to default to "no" on every ordinary first DEV switch that prunes a VCS repo (a confirm-prompt UX defect, not a data-safety one). Source: WP-007 (discovered), WP-012 (confirmed, raised for PM triage). Originating agent: Reviewer. Recommended target: a small follow-up WP against `src/Utils/DevConfigTransformer.php` / `src/Utils/SwitchCommandRunner.php`.
+- **[Out-of-scope, low priority]** Guard 2 of `resources/git-hooks/pre-commit` still carries the stale two-command remediation text ("Switch to PROD config first / Then run composer install"), inconsistent with Guard 1's new single-command text. Source: WP-011 (noted, explicitly out of that WP's scope), reconfirmed WP-012/WP-013. Originating agent: Developer.
+- **[Out-of-scope, low priority]** `describe()`'s `installedState` computation can still throw `ComposerSwitcherException` if `composer.json` itself is malformed JSON (mirrors the pre-existing, untouched `verify()` gap). Source: WP-009 code review. Originating agent: Reviewer. Rationale: the AC and class docblock only promise never-throws for the snapshot and `installed.json`, not `composer.json` itself.
+- **[Coverage gap, low priority]** Several test-coverage gaps were manually verified safe but left uncodified as regression tests: `LockFile::getLockedVersion()` malformed package-list entries (WP-005); `ConfigDiff` edge cases — duplicate list entries, malformed non-list `repositories`, scalar↔array type changes (WP-007); `describe()`'s composer-prod.json-outside-DEV-session legacy-warning branch (WP-009); `DevConfigTransformer::apply()`/`revert()` against a fully empty `composer.json` (WP-006 QA); `TestNestedRun` only exercises the retained hook via `composer require`, not `composer update` (WP-014 QA); `TestLockFidelity`'s stale-lock test uses synthetic content-hash corruption rather than a drifted `composer.json` (WP-014 QA).
+- **[Convention note, low priority]** `EventContext::confirm()` intentionally does not gate on `isInteractive()` itself — `SwitchCommandRunner` already gates correctly, but this is worth knowing for any future `EventContext` consumer. Source: WP-012. Originating agent: Developer.
+
+### Next Steps
+
+- Prioritize a small follow-up work package addressing the two open `DevConfigTransformer`/origin-classifier issues above (cross-section package duplication on revert, and the CarriedBack misclassification of first-switch VCS-repo pruning) — both are well-understood, narrowly scoped, and already have regression-test placeholders documented in the existing suites.
+- Align Guard 2 of the pre-commit hook with Guard 1's single-command v3 text in a trivial documentation/hook-polish pass.
+- Consider a small hardening pass codifying the manually-verified-but-uncovered edge cases listed above into permanent regression tests, particularly around `ConfigDiff` and `LockFile`, since both are foundational to confirmation-prompt correctness.
+- The v3.0.0 release and its migration guide (`docs/migrating-from-2x.md`) are complete and gate-clean; the Planner can treat this plan as fully closed out and build the next cycle's scope on top of the single-source-of-truth model rather than any legacy reconciliation assumptions.

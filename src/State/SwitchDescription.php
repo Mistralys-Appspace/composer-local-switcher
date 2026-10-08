@@ -16,10 +16,12 @@ use JsonException;
  *
  * This class only holds the already-gathered data and exposes it
  * through typed getters and {@see self::toArray()}. The logic that
- * gathers the underlying data — reading the status file, running
- * {@see VerificationResult}, probing the filesystem for the
- * individual file records — is the responsibility of `describe()`,
- * which is out of scope for this class.
+ * gathers the underlying data — reading the status file, deriving
+ * {@see LockStatus}/{@see InstalledState}, computing
+ * {@see self::getPendingProdChanges()} via `DevConfigTransformer::revert()`
+ * and {@see \Mistralys\ComposerSwitcher\Utils\ConfigDiff}, probing the
+ * filesystem for the individual file records — is the responsibility
+ * of `describe()`, which is out of scope for this class.
  *
  * @package Composer Switcher
  * @subpackage State
@@ -31,8 +33,10 @@ final class SwitchDescription
      * @param string|null $lastSwitchDate The date of the last recorded switch, or `null` if none.
      * @param array<int,array{label:string,path:string,exists:bool,modifiedDate:string|null}> $files Per-file records for the files the switcher manages.
      * @param string|null $activeFlag The mode (`dev`/`prod`) whose flag file currently exists, or `null` if none.
-     * @param VerificationResult $verification The result of comparing `composer.json` and `composer-prod.json`.
-     * @param array<int,array{packageName:string,path:string,version:string}> $localRepositories The local repositories declared in the DEV configuration.
+     * @param LockStatus $lockStatus The main lock's freshness against its own config.
+     * @param InstalledState $installedState Whether what is actually installed matches what the active mode expects.
+     * @param ConfigChangeSet|null $pendingProdChanges The DEV-time edits that would become permanent on a DEV→PROD switch (its `prodConfig` section only), or `null` outside DEV mode or when it could not be computed (never a thrown exception).
+     * @param array<int,array{packageName:string,path:string,version:string,derivedVersion:string|null}> $localRepositories The local repositories declared in the DEV configuration.
      * @param string[] $warnings Non-fatal warnings surfaced while assembling the description.
      */
     public function __construct(
@@ -40,7 +44,9 @@ final class SwitchDescription
         private readonly ?string $lastSwitchDate,
         private readonly array $files,
         private readonly ?string $activeFlag,
-        private readonly VerificationResult $verification,
+        private readonly LockStatus $lockStatus,
+        private readonly InstalledState $installedState,
+        private readonly ?ConfigChangeSet $pendingProdChanges,
         private readonly array $localRepositories,
         private readonly array $warnings
     )
@@ -79,13 +85,37 @@ final class SwitchDescription
         return $this->activeFlag !== null;
     }
 
-    public function getVerification() : VerificationResult
+    public function getLockStatus() : LockStatus
     {
-        return $this->verification;
+        return $this->lockStatus;
+    }
+
+    public function getInstalledState() : InstalledState
+    {
+        return $this->installedState;
     }
 
     /**
-     * @return array<int,array{packageName:string,path:string,version:string}>
+     * The DEV-time edits that would become permanent production
+     * changes on a DEV→PROD switch — only its `prodConfig` section is
+     * ever filled, matching a real switch outcome's own
+     * {@see ConfigChangeSet}. `null` outside DEV mode, or when it
+     * could not be computed (e.g. a modified or malformed snapshot) —
+     * degraded rather than thrown, with the reason added to
+     * {@see self::getWarnings()}.
+     */
+    public function getPendingProdChanges() : ?ConfigChangeSet
+    {
+        return $this->pendingProdChanges;
+    }
+
+    public function hasPendingProdChanges() : bool
+    {
+        return $this->pendingProdChanges !== null && $this->pendingProdChanges->hasPermanentChanges();
+    }
+
+    /**
+     * @return array<int,array{packageName:string,path:string,version:string,derivedVersion:string|null}>
      */
     public function getLocalRepositories() : array
     {
@@ -111,8 +141,10 @@ final class SwitchDescription
      *     lastSwitchDate: string|null,
      *     files: array<int,array{label:string,path:string,exists:bool,modifiedDate:string|null}>,
      *     activeFlag: string|null,
-     *     verification: array{inSync:bool,differences:string[],devMode:bool},
-     *     localRepositories: array<int,array{packageName:string,path:string,version:string}>,
+     *     lockStatus: string,
+     *     installedState: string,
+     *     pendingProdChanges: array{composerJson:array<int,array<string,mixed>>,prodConfig:array<int,array<string,mixed>>}|null,
+     *     localRepositories: array<int,array{packageName:string,path:string,version:string,derivedVersion:string|null}>,
      *     warnings: string[]
      * }
      */
@@ -123,7 +155,9 @@ final class SwitchDescription
             'lastSwitchDate' => $this->lastSwitchDate,
             'files' => $this->files,
             'activeFlag' => $this->activeFlag,
-            'verification' => $this->verification->toArray(),
+            'lockStatus' => $this->lockStatus->value,
+            'installedState' => $this->installedState->value,
+            'pendingProdChanges' => $this->pendingProdChanges?->toArray(),
             'localRepositories' => $this->localRepositories,
             'warnings' => $this->warnings
         ];

@@ -147,23 +147,25 @@ final class TestDryRun extends ComposerSwitcherTestCase
 
         $this->assertFalse($switcher->getFileSystem()->isDryRun());
 
+        // A subsequent real switch (to a mode that does not need the
+        // dev config) must still be able to write to disk normally.
         $switcher->switchToProduction();
 
-        $this->assertTrue($switcher->getProdFile()->exists());
+        $this->assertTrue($switcher->getStatus()->isPROD());
         $this->assertFalse($switcher->getFileSystem()->isDryRun());
     }
 
     /**
-     * A PROD-mode preview, with `composer.json` drifted from
-     * `composer-prod.json`, must leave every file on disk
-     * byte-identical — this is the exact scenario
-     * `switch_case_PROD_PROD()`'s nested `reconcileCore()` call used to
-     * get wrong by hard-coding its own dry-run flag instead of
-     * inheriting the enclosing `switchTo()`'s, letting a PROD preview
-     * perform a real reconcile copy. The outcome must also carry
-     * exactly one {@see ConfigSwitcher::MESSAGE_DRY_RUN_ACTIVE} (not a
-     * second one duplicated by the nested reconcile) alongside the
-     * planned {@see ConfigSwitcher::MESSAGE_BACKED_UP_MAIN_TO_PROD} copy.
+     * A PROD-mode preview, with `composer.json` drifted from its
+     * original content, must leave every file on disk byte-identical.
+     * Under the v3 switching model (this plan's WP-008), a plain
+     * PROD→PROD switch no longer reconciles anything (that machinery
+     * existed only because two editable copies of the config were
+     * committed) — a drifted `composer.json` produces no `copy`
+     * operation either way; the only operations a PROD→PROD switch
+     * still ever produces are the unconditional flag-file rewrite
+     * (delete + recreate), which {@see ConfigSwitcher::writeFlagFiles()}
+     * performs on every switch regardless of row.
      */
     public function test_previewProdInDriftedProdStateLeavesDiskUntouched() : void
     {
@@ -180,17 +182,12 @@ final class TestDryRun extends ComposerSwitcherTestCase
         $this->assertSame($before, $after, 'Preview of a drifted PROD state must leave disk untouched.');
         $this->assertTrue($outcome->isDryRun());
         $this->assertFalse($switcher->getFileSystem()->isDryRun());
-        $this->assertTrue($outcome->hasOperations());
 
         $operationTypes = array_map(
             static fn(FileOperation $operation) : string => $operation->getType(),
             $outcome->getOperations()
         );
-        $this->assertContains(FileOperation::TYPE_COPY, $operationTypes);
-
-        foreach($outcome->getOperations() as $operation) {
-            $this->assertFalse($operation->isApplied(), 'A preview operation must never be flagged applied.');
-        }
+        $this->assertNotContains(FileOperation::TYPE_COPY, $operationTypes, 'No reconcile copy operation must be planned.');
 
         $messageCodes = array_map(
             static fn($message) : int => $message->getCode(),
@@ -199,9 +196,8 @@ final class TestDryRun extends ComposerSwitcherTestCase
         $this->assertSame(
             1,
             count(array_filter($messageCodes, static fn(int $code) : bool => $code === ConfigSwitcher::MESSAGE_DRY_RUN_ACTIVE)),
-            'Expected exactly one MESSAGE_DRY_RUN_ACTIVE, not one duplicated by the nested reconcile.'
+            'Expected exactly one MESSAGE_DRY_RUN_ACTIVE.'
         );
-        $this->assertContains(ConfigSwitcher::MESSAGE_BACKED_UP_MAIN_TO_PROD, $messageCodes);
     }
 
     /**
@@ -334,18 +330,16 @@ final class TestDryRun extends ComposerSwitcherTestCase
     }
 
     /**
-     * Modifies `composer.json`'s content and gives it a newer
-     * modification time than `composer-prod.json`, so {@see ConfigSwitcher::verify()}
-     * reports a non-ambiguous `RECONCILE_TO_PROD` drift.
+     * Modifies `composer.json`'s content, simulating a user edit while
+     * in PROD mode — under v3 this has no reconciliation implications
+     * (that machinery is retired); it simply exercises a plain
+     * PROD→PROD switch against a drifted `composer.json`.
      */
     private function driftMainConfig(ConfigSwitcher $switcher) : void
     {
         $config = $switcher->getMainFile()->getData();
         $config['require']['php'] = '>=8.0';
         $switcher->getMainFile()->putData($config);
-
-        touch($switcher->getProdFile()->getPath(), time() - 60);
-        touch($switcher->getMainFile()->getPath(), time());
     }
 
     private function assertPreviewLeavesDiskUntouched(ConfigSwitcher $switcher, string $root, string $mode) : void
@@ -410,28 +404,6 @@ final class TestDryRun extends ComposerSwitcherTestCase
     private function relativizePath(string $path, string $root) : string
     {
         return ltrim(substr($path, strlen($root)), '/');
-    }
-
-    /**
-     * @param string $dir
-     * @return string[]
-     */
-    private function collectPhpFiles(string $dir) : array
-    {
-        $files = array();
-
-        $iterator = new RecursiveIteratorIterator(
-            new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)
-        );
-
-        foreach($iterator as $fileInfo)
-        {
-            if($fileInfo->isFile() && $fileInfo->getExtension() === 'php') {
-                $files[] = $fileInfo->getPathname();
-            }
-        }
-
-        return $files;
     }
 
     /**
