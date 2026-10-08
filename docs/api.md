@@ -7,9 +7,7 @@ Everything the Composer commands do is available as PHP methods on `Mistralys\Co
 | You want to... | Call | Returns |
 |---|---|---|
 | Perform a switch or update | `switchTo()`, `switchToDevelopment()`, `switchToProduction()`, `switchUpdate()` | `SwitchOutcome` |
-| Fix drift without switching | `reconcile()` | `SwitchOutcome` |
 | Preview a switch with no disk writes | `previewSwitch()` | `SwitchOutcome` (`isDryRun()` always `true`) |
-| Compare `composer.json` vs `composer-prod.json` | `verify()` | `VerificationResult` |
 | Get a full state snapshot | `describe()` | `SwitchDescription` |
 
 Every one of these value objects is immutable and exposes a `toArray()` (`SwitchDescription` also exposes `toJSON()`).
@@ -23,81 +21,73 @@ Create a switcher for the standard file layout with `ConfigSwitcher::fromProject
 ```php
 $outcome = $switcher->switchToProduction();
 
-$outcome->getMode();          // string - the mode that was switched to
-$outcome->getMessages();      // SwitchMessage[]
-$outcome->getMessageTexts();  // string[]
-$outcome->getOperations();    // FileOperation[] - files copied or removed, in order
-$outcome->hasOperations();    // bool - true if at least one file was touched
+$outcome->getMode();              // string - the mode that was switched to
+$outcome->getMessages();          // SwitchMessage[]
+$outcome->getMessageTexts();      // string[]
+$outcome->getOperations();        // FileOperation[] - files copied or removed, in order
+$outcome->hasOperations();        // bool - true if at least one file was touched
+$outcome->getComposerCommand();   // ?ComposerCommand - the Composer command the switch wants run next
+$outcome->isBlocked();            // bool - true when a precondition blocked the switch (no file effects)
+$outcome->getConfigChanges();     // ConfigChangeSet - what changed (or would change) in composer.json/production
+$outcome->requiresConfirmation(); // bool - true when composer.json itself would change
+$outcome->hasSameEffectsAs($other); // bool - "shown equals applied": same blocked/changes/command/operations
 ```
+
+`switchTo()`/`switchToDevelopment()`/`switchToProduction()`/`switchUpdate()` never execute Composer or prompt
+for confirmation themselves - "plan in the core, execute at the edge". They only ever hand back a
+`ComposerCommand` (via `getComposerCommand()`) for the caller to run. The built-in `composer switch-*`
+commands run that command themselves, through `Utils\SwitchCommandRunner` - see
+["Running the planned command"](#running-the-planned-command) below. A library consumer that wants the
+same single-command behavior can run `getComposerCommand()` with its own process runner, or use
+`Utils\ComposerProcess` directly.
 
 `switchUpdate()` returns the outcome of whichever of `switchToDevelopment()`/`switchToProduction()` it dispatches to. If no switch has ever been run yet, it performs no file operations and returns a `SwitchOutcome` with mode `initial` (`ConfigSwitcher::MODE_INITIAL`) and no operations.
 
 `MODE_INITIAL` is not a valid argument to `switchTo()`; it only appears as an outcome mode.
 
-## Verification
+### Inspecting and showing changes
 
-`verify()` returns a `VerificationResult`:
+`getConfigChanges()` returns a `ConfigChangeSet`, split into two sections: `getComposerJsonChanges()` (what
+changes in `composer.json` itself) and `getProdConfigChanges()` (what becomes permanent in production - only
+meaningful on a DEV→PROD switch, or `describe()`'s pending-carry-back view in DEV). `requiresConfirmation()`
+is `true` exactly when the `composerJson` section is non-empty, which is also the condition the built-in
+commands prompt on. Showing a `ConfigChangeSet` to a user before applying it is exactly what
+`Utils\OutcomeRenderer::renderChangeSet()` does for the console - a custom tool can build the same summary
+from `getConfigChanges()`/`getComposerJsonChanges()`/`getProdConfigChanges()` without parsing console text.
 
-```php
-$result = $switcher->verify();
+`hasSameEffectsAs(SwitchOutcome $other)` compares two outcomes' blocked flag, config changes, planned command
+and file operations (messages are deliberately excluded). This is how the built-in commands confirm that what
+they show is what they apply: preview, render to the user, preview again right before writing, and refuse to
+write if the two previews no longer agree.
 
-$result->isDevMode();      // bool - whether the switcher was in DEV mode
-$result->isComparable();   // bool - false in DEV mode, since the comparison isn't meaningful
-$result->isInSync();       // bool - always false when not comparable
-$result->getDifferences(); // string[] - top-level key names that differ
-```
+### Running the planned command
 
-`toArray()` returns the equivalent `array{inSync:bool,differences:string[],devMode:bool}` shape.
-
-## Reconciling and previewing
-
-### reconcile()
-
-`composer switch-update` calls `reconcile()` internally in PROD mode, but it is also available directly - for example to preview a reconciliation, force a direction, or inspect exactly which files were touched:
-
-```php
-$outcome = $switcher->reconcile();
-
-$outcome->getMode();          // string - the mode reconciliation ran in
-$outcome->isDryRun();         // bool
-$outcome->getMessages();      // SwitchMessage[]
-$outcome->getMessageTexts();  // string[]
-$outcome->getOperations();    // FileOperation[] - files copied, in order
-$outcome->hasOperations();    // bool - true if at least one file was (or would be) touched
-```
-
-Content decides whether a reconciliation is needed; by default the more recently modified file wins. To resolve an ambiguous case (equal modification times) or to force a specific outcome, pass an explicit direction:
+`Utils\ComposerProcess::run(ComposerCommand $command, string $workingDir): int` runs a planned command as a
+real child process (via `proc_open()`, inherited STDIN/STDOUT/STDERR), returning its exit code. It resolves
+the Composer binary from an injected path, else `COMPOSER_BINARY`, else an executable `composer` on `PATH`,
+and sets `COMPOSER_SWITCHER_NESTED=1` in the child's environment so a `post-update-cmd` hook that re-invokes
+a switch command can detect the nesting and no-op instead of recursing:
 
 ```php
-use Mistralys\ComposerSwitcher\ConfigSwitcher;
+use Mistralys\ComposerSwitcher\Utils\ComposerProcess;
 
-$switcher->reconcile(ConfigSwitcher::RECONCILE_TO_PROD); // composer.json -> composer-prod.json
-$switcher->reconcile(ConfigSwitcher::RECONCILE_TO_MAIN); // composer-prod.json -> composer.json
+$outcome = $switcher->switchToProduction();
+$command = $outcome->getComposerCommand();
+
+if ($command !== null) {
+    $exitCode = (new ComposerProcess())->run($command, getcwd());
+}
 ```
 
-Pass `true` as the second argument to preview the outcome without writing any files:
+A non-zero exit throws `ComposerSwitcherException::ERROR_COMPOSER_COMMAND_FAILED` only when you route
+execution through `Utils\SwitchCommandRunner` (what the built-in `composer switch-*` commands use) - calling
+`ComposerProcess::run()` directly just returns the exit code, leaving the decision to the caller.
 
-```php
-$preview = $switcher->reconcile(null, true);
-```
-
-The no-op states (DEV mode, `INITIAL`, missing `composer-prod.json`) are described in [Reconciling drift](usage.md#reconciling-drift). In API terms:
-
-| State | Message code | Notes |
-|---|---|---|
-| DEV mode | `MESSAGE_DEV_MODE_NOT_RECONCILABLE` | No-op. |
-| `INITIAL` | `MESSAGE_INITIAL_NOT_RECONCILABLE` | No-op for every direction; outcome mode is `ConfigSwitcher::MODE_INITIAL`. |
-| `composer-prod.json` missing | `MESSAGE_PROD_CONFIG_MISSING` | No-op, except for an explicit `RECONCILE_TO_PROD`, which recreates `composer-prod.json` (and its lock file, when present) from `composer.json` and reports `MESSAGE_BACKED_UP_MAIN_TO_PROD`. |
-| Already in sync | `MESSAGE_ALREADY_IN_SYNC` | No-op. |
-| Equal modification times, differing content | `MESSAGE_RECONCILE_AMBIGUOUS` | No-op unless a direction is passed. |
-
-An invalid direction (anything other than `RECONCILE_TO_MAIN`/`RECONCILE_TO_PROD`) throws `ComposerSwitcherException::ERROR_INVALID_RECONCILE_DIRECTION` in every state, `INITIAL` included.
-
-A preview never writes to disk. If `reconcile()` throws partway through a call, the switcher's dry-run flag is always restored to its prior value before the exception propagates.
+## Previewing a switch
 
 ### previewSwitch()
 
-`previewSwitch(string $mode)` runs the same code path as a real switch, under a dry-run overlay that never touches disk. Its `getOperations()` matches exactly what a real switch from the same starting state would perform. In PROD mode with drifted configs, the nested reconcile is planned but not written.
+`previewSwitch(string $mode)` runs the same code path as a real switch, under a dry-run overlay that never touches disk. Its `getOperations()` matches exactly what a real switch from the same starting state would perform, including from the `INITIAL` state. In PROD mode, a preview has no file effects of its own beyond legacy cleanup/status/flags, since `composer-prod.json` is a transient DEV-session snapshot rather than a committed baseline to compare against.
 
 ```php
 $outcome = $switcher->previewSwitch(ConfigSwitcher::MODE_PROD);
@@ -120,13 +110,16 @@ $description->getMode();              // string|null - 'dev'/'prod'/'initial', o
 $description->getLastSwitchDate();    // string|null
 $description->getFiles();             // array<int,array{label,path,exists,modifiedDate}>
 $description->getActiveFlag();        // string|null - mode whose flag file currently exists
-$description->getVerification();      // VerificationResult, same object verify() returns
-$description->getLocalRepositories(); // array<int,array{packageName,path,version}>
-$description->getWarnings();          // string[] - e.g. an unreadable dev config
+$description->getLockStatus();        // LockStatus - the main lock's own freshness against its config
+$description->getInstalledState();    // InstalledState - whether what's installed matches the active mode
+$description->getPendingProdChanges(); // ?ConfigChangeSet - DEV-only: edits a DEV->PROD switch would carry back
+$description->hasPendingProdChanges(); // bool
+$description->getLocalRepositories(); // array<int,array{packageName,path,version,derivedVersion}>
+$description->getWarnings();          // string[] - e.g. an unreadable dev config, or a legacy artifact found on disk
 $description->hasWarnings();          // bool
 ```
 
-`toArray()` returns the equivalent nested array, and `toJSON()` encodes it as pretty-printed JSON (`JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES`). See the [Usage Guide](usage.md#inspecting-switcher-state) for an example payload.
+`getPendingProdChanges()` reuses the same `revert()` + `ConfigDiff` pipeline a real DEV→PROD switch runs, so what it reports always matches what that switch would actually carry back — it degrades to `null` plus a warning (never a thrown exception) when the production snapshot is missing, modified, or unreadable. `toArray()` returns the equivalent nested array, and `toJSON()` encodes it as pretty-printed JSON (`JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES`). See the [Usage Guide](usage.md#inspecting-switcher-state) for an example payload.
 
 ## Options
 
@@ -187,10 +180,20 @@ try {
 Common context keys:
 
 - `filePath` / `targetPath` - the file involved, or a copy's source/destination pair.
-- `mode` / `direction` - an offending `switchTo()` mode or `reconcile()` direction string.
+- `mode` - an offending `switchTo()` mode string.
 - `expected` / `actual` - an offending value paired with what was expected.
+- `command` / `exitCode` - the shell-rendered Composer command and its exit code, on `ERROR_COMPOSER_COMMAND_FAILED`.
 
 See the `KEY_*` constants on `ComposerSwitcherException` for the full list.
+
+Errors specific to running the planned command (thrown by `Utils\SwitchCommandRunner`/`Utils\ComposerProcess`,
+i.e. by the built-in `composer switch-*` commands, not by `switchTo()` itself):
+
+- `ERROR_SWITCH_BLOCKED` - the switch is blocked by a precondition; nothing was written.
+- `ERROR_CONFIRMATION_REQUIRED` - a non-interactive run needed confirmation (`composer.json` would change) but was not given `--yes`; the changes were printed, nothing was written.
+- `ERROR_INPUTS_CHANGED` - the post-confirmation preview no longer matches the one shown to the user; nothing was written.
+- `ERROR_COMPOSER_COMMAND_FAILED` - the executed `composer` command exited non-zero (context: `command`, `exitCode`).
+- `ERROR_COMPOSER_BINARY_NOT_FOUND` - neither `COMPOSER_BINARY` nor an executable `composer` on `PATH` could be resolved.
 
 A filesystem failure (a failed read, write, copy, or delete) never leaks a bare PHP warning, even when a stricter host such as Composer's own error handler would turn an unsuppressed warning into an `\ErrorException`. It always surfaces as a `ComposerSwitcherException`, with the native error message under `KEY_NATIVE_ERROR` and the captured native error chained as `getPrevious()`:
 

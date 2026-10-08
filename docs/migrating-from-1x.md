@@ -1,5 +1,8 @@
 # Migrating from 1.x
 
+> The 2.x file layout this guide describes (`composer/composer-prod.json`, `reconcile()`,
+> `switch-verify-config`) was replaced in 3.0.0 — see [Migrating from 2.x](migrating-from-2x.md).
+
 Version 2.0.0 raises the PHP requirement, replaces `void` returns with typed result objects, and fixes the `tryCopyTo()` behavior. The Composer script keys `switch-dev`, `switch-prod` and `switch-update` keep their names, and a project-owned wrapper class that constructs `ConfigSwitcher` with three `ConfigFile` instances continues to work (the constructor signature is unchanged).
 
 1. **PHP 8.4 or newer is required.** Version 1.x supported PHP 7.3 and up; 2.0.0 declares `php: >=8.4` in `composer.json`. Upgrade the PHP runtime that executes Composer before updating the package.
@@ -21,4 +24,6 @@ Version 2.0.0 raises the PHP requirement, replaces `void` returns with typed res
 
 4. **Hand-written script wrappers are now optional.** In 1.x, the `switch-dev`, `switch-prod` and `switch-update` scripts pointed to a `ComposerScripts` class you wrote yourself. 2.0.0 ships static entry points (`ConfigSwitcher::composerSwitchDev`, `composerSwitchProd`, `composerSwitchUpdate`) that use the standard file layout (`composer/composer-prod.json` and `composer/local-repositories.json`). Your existing wrapper, with its own file paths, keeps working; switch to the entry points only if you want to drop the wrapper and adopt that layout. See the [Setup Guide](setup.md#3-script-wiring).
 
-5. **New scripts and capabilities are additive.** `switch-verify-config` and `switch-install-hooks` (with `verify()` and `installGitHooks()`), `describe()`, `previewSwitch()`, `reconcile()`, structured message codes (`SwitchMessage`), and exception context (`ComposerSwitcherException::getContext()`) did not exist in 1.x. Nothing requires you to adopt them. See the [API Guide](api.md), [Git Hooks](git-hooks.md) and [Setup Guide](setup.md).
+5. **New scripts and capabilities are additive.** `switch-install-hooks` (with `installGitHooks()`), `describe()`, `previewSwitch()`, structured message codes (`SwitchMessage`), and exception context (`ComposerSwitcherException::getContext()`) did not exist in 1.x. Nothing requires you to adopt them. See the [API Guide](api.md), [Git Hooks](git-hooks.md) and [Setup Guide](setup.md).
+
+   > `switch-verify-config`/`verify()` and `switch-reconcile`/`reconcile()` were also added in 2.0.0, but were removed in 3.0.0 once `composer-prod.json` became a transient DEV-session snapshot rather than a second committed baseline — there is no drift between two editable copies left to verify or reconcile. If you are migrating directly from 1.x to 3.0.0, do not wire either script. See [Migrating from 2.x](migrating-from-2x.md) for the full 3.0.0 migration steps.

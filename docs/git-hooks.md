@@ -5,7 +5,7 @@ The library ships with a pre-commit hook that prevents accidentally committing d
 1. `composer.json` or `composer.lock` is staged while in DEV mode (the `composer.json.DEV` marker file exists).
 2. `composer.json` is staged and contains a `"type": "path"` entry in its `repositories` key (a local symlink is active), in either list or keyed-object form. If the staged file is not valid JSON or `php` is unavailable, the check falls back to a file-wide match, so it never fails open.
 
-When a commit is blocked, the hook tells you to run `composer switch-prod` and then `composer install`.
+When a commit is blocked, the hook tells you to run `composer switch-prod` (Guard 1 — DEV mode). `composer switch-prod` now finishes in one command: it writes `composer.json`/`.lock` back to production and runs whatever Composer command the switch itself plans, so no separate `composer install` step is needed afterward.
 
 ## Installing the hook
 

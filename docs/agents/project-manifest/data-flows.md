@@ -2,55 +2,91 @@
 
 ## 1. Switch to Development Mode
 
+The v3 decision table replaces the old single linear flow with one post-dispatch planner,
+`switch_plan()`, which always runs legacy-artifact cleanup first and then dispatches on the
+current status × the target mode. Switching to DEV dispatches to one of two rows depending on
+whether a DEV session is already active.
+
 ```
 User calls ConfigSwitcher::switchToDevelopment(): SwitchOutcome
   → switchTo(MODE_DEV): SwitchOutcome
     → Validates mode string
-    → Checks main lock file exists (warns if not — does not abort)
-    → switch_copyLockFiles('dev')
-      → If initial state (no prior switch):
-        → switch_initProductionFiles(): copies composer.json → composer-prod.json (and lock)
-      → Backs up PROD lock file → prod lock location
-      → Restores DEV lock file if it exists, otherwise deletes lock to force `composer update`
-      → switch_adjustConfigForDev():
-        → Reads prod config as base
-        → Reads dev config (local-repositories list)
-        → For each local repo entry:
-          → Sets require version to '*' (or explicit version if specified)
-          → Preserves require-dev placement (does not move packages to require)
-          → Builds path repository entry (type: path, symlink: true)
-          → Scans all existing repository entries for URL matches via urlMatchesPackageName()
-            (stripos + boundary check: next char must be `.`, `/`, or end-of-string):
-            → First match: replaced in place with path entry (UPDATE)
-            → Subsequent matches: removed as stale duplicates (PRUNE)
-            → No match: path entry appended (ADD)
-          → Re-indexes repositories array after pruning
-        → Writes modified config → composer.json via ConfigFile::putData()
-    → StatusFile::saveState('dev', ...) — persists mode + timestamp + file paths as JSON
+    → switch_plan(MODE_DEV)
+      → switch_cleanLegacyArtifacts(): deletes a leftover local-repositories.lock (v2's
+        separate DEV lock, which no longer exists under v3); in PROD/INITIAL, also deletes a
+        committed-style composer-prod.json/.lock found outside an active DEV session
+        (MESSAGE_LEGACY_FILES_FOUND on either)
+      → Not already DEV (PROD or INITIAL) → switch_planProdToDev():
+        → If the main lock's LockFile::getLockStatus() is Stale: blocked
+          (MESSAGE_PROD_LOCK_OUTDATED) — no file effects, run `composer update`/`update --lock`
+          first
+        → Otherwise:
+          → Reads the current local-repositories list (switch_requireCurrentLocalRepositories(),
+            throws on a malformed list)
+          → Snapshots composer.json/.lock → composer-prod.json/.lock (ConfigFile::copyTo() /
+            LockFile::tryCopyTo()) — composer.lock itself stays the PROD lock throughout the
+            DEV session
+          → Delegates to Utils\DevConfigTransformer::apply($snapshotConfig, $repos, $mainLock):
+            DevTransformResult (a pure, static transform):
+            → Reads the snapshot config as base
+            → For each local repo entry, derives the alias version (explicit override, else
+              LockFile::getLockedVersion() against the just-snapshotted lock, else null),
+              keeps/overwrites the root require/require-dev constraint, preserves
+              require-dev placement, and builds/merges the path repository entry via the
+              (private, ported) urlMatchesPackageName() boundary check — see api-surface.md
+              for the full algorithm
+          → Writes DevTransformResult::getConfig() → composer.json; records version
+            derivations (MESSAGE_VERSION_DERIVED) and stores snapshotHash + appliedRepositories
+            in the plan result (persisted below)
+          → Plans the command: a Missing main lock plans a full `update`
+            (MESSAGE_NO_LOCK_FILE_FOUND); otherwise `update <local package names>` (or no
+            command when there are none)
+      → Already DEV (a refresh) → switch_planDevRefresh():
+        → If the snapshot's content no longer matches its recorded snapshotHash: blocked
+          (MESSAGE_SNAPSHOT_MODIFIED) — no file effects, switch to PROD and back to DEV to
+          retake it
+        → Otherwise: computes effective = DevConfigTransformer::revert(current, snapshot,
+          appliedRepos, prodLock) (see the carry-back description below), then
+          apply(effective, currentRepos, prodLock); composer.json is rewritten only when the
+          resulting ConfigDiff is non-empty — an unedited refresh leaves the file
+          byte-for-byte untouched, including non-canonical formatting
+        → Plans the command: a repository delta (added/path-changed/override-changed/removed
+          package) plans a partial `update` (with `--with <removed>:<prod-locked version>` per
+          removed package); with no delta, `install` unless InstalledState::Matches
+          (MESSAGE_ALREADY_INSTALLED)
+    → If not blocked: StatusFile::saveState('dev', ..., snapshotHash, appliedRepositories) —
+      persists mode + timestamp + file paths + the tamper-detection hash as JSON
     → Writes flag files: creates composer.json.DEV, deletes composer.json.PROD
     → Displays collected messages
-    → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations)
+    → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations, the planned
+      ComposerCommand (if any), isBlocked(), the ConfigChangeSet) — a blocked outcome carries
+      no file effects
 ```
 
 ## 2. Switch to Production Mode
+
+Switching to PROD also dispatches on whether a DEV session is active: a DEV→PROD switch carries
+DEV-time edits back into production via a three-way revert; a PROD/INITIAL→PROD switch has no
+file effects on the configs at all.
 
 ```
 User calls ConfigSwitcher::switchToProduction(): SwitchOutcome
   → switchTo(MODE_PROD): SwitchOutcome
     → Validates mode string
-    → Checks main lock file exists (warns if not — does not abort)
-    → switch_copyLockFiles('prod')
-      → If initial state: switch_initProductionFiles()
-      → If coming from DEV: switch_case_DEV_PROD()
-        → Backs up DEV lock file → dev lock location, if it exists
-        → Restores PROD config → composer.json (via ConfigFile::copyTo())
-        → If a composer-prod.lock backup exists: restores it → composer.lock
-        → Otherwise: deletes composer.lock and adds MESSAGE_PROD_LOCK_MISSING,
-          instead of the unconditional copy throwing ERROR_CANNOT_COPY_FILE
-    → StatusFile::saveState('prod', ...)
+    → switch_plan(MODE_PROD)
+      → switch_cleanLegacyArtifacts()  — same as §1
+      → Already DEV → switch_planDevToProd() — see §4 (DEV→PROD carry-back)
+      → PROD or INITIAL → switch_planProdToProd():
+        → No file effects beyond legacy cleanup/status/flags — composer.json/.lock and
+          composer-prod.* are left entirely alone
+        → Plans `install` unless InstalledState::fromInstalledPackages(MODE_PROD,
+          currentLocalPackageNames, installed) already reports Matches
+          (MESSAGE_ALREADY_INSTALLED, no command)
+    → If not blocked: StatusFile::saveState('prod', ...)
     → Writes flag files: creates composer.json.PROD, deletes composer.json.DEV
     → Displays collected messages
-    → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations)
+    → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations, planned
+      ComposerCommand, isBlocked(), ConfigChangeSet)
 ```
 
 ## 3. Update Current Configuration
@@ -58,78 +94,47 @@ User calls ConfigSwitcher::switchToProduction(): SwitchOutcome
 ```
 User calls ConfigSwitcher::switchUpdate(): SwitchOutcome
   → Reads StatusFile to determine current mode
-  → If DEV: calls switchToDevelopment() (refreshes DEV config from current local-repositories.json)
-  → If PROD: calls switchToProduction() (reconciles content-first, using
-    modified dates only to pick a direction — see §4)
-  → If INITIAL (no prior switch): no file-system effect, but still returns
-    an explicit SwitchOutcome (mode: MODE_INITIAL, no operations) rather
-    than a silent no-op with no return value
+  → If DEV: calls switchToDevelopment() (the DEV→DEV refresh row of §1)
+  → If PROD or INITIAL: calls switchToProduction() (the PROD/INITIAL→PROD row of §2 — INITIAL
+    no longer returns a bespoke MODE_INITIAL no-op outcome; it runs the same row as an
+    established PROD state, which has no file effects to begin with)
 ```
 
-## 4. PROD-to-PROD Reconciliation (via switchUpdate, re-switch, or a direct reconcile() call)
+## 4. DEV→PROD Carry-Back
+
+`switch_planDevToProd()` is the DEV→PROD row of the v3 decision table (dispatched from §2 above).
+It replaces the old restore-from-backup flow with a three-way revert that carries DEV-time edits
+back into production instead of discarding them, and the production snapshot is consumed
+(deleted) rather than kept as a committed baseline. The standalone `reconcile()`/`verify()`
+entry points that previously appeared in this section (and the `composer switch-reconcile`/
+`switch-verify-config` commands that drove them) have been removed entirely: they existed only to
+reconcile two committed, editable copies of the production config, a state the transient-snapshot
+model described above no longer has.
 
 ```
-switchToProduction() when already in PROD mode
-  → switch_case_PROD_PROD()
-    → Adds MESSAGE_USING_PROD_CONFIG
-    → Delegates into the shared reconciliation core (reconcileCore(null)),
-      the same core the public reconcile() method calls — guaranteeing
-      identical file effects between a PROD→PROD switch and a direct
-      reconcile() call from the same starting state. No dry-run flag of
-      its own is passed: the nested call simply inherits whatever flag
-      the enclosing switchTo() already set, so a PROD-mode preview can
-      never let this nested reconcile perform a real write.
-
-ConfigSwitcher::reconcile(?string $direction = null, bool $dryRun = false): SwitchOutcome
-  → Validates $direction (throws ERROR_INVALID_RECONCILE_DIRECTION for a
-    non-null, non-constant value — in every state, INITIAL included)
-  → Sets the dry-run flag and clears the file-operation log
-    → If $dryRun: adds MESSAGE_DRY_RUN_ACTIVE
-  → Calls the private reconcileCore($direction) inside a try/finally that
-    always restores the facade's previous dry-run flag afterward, even
-    if reconcileCore() throws (e.g. a malformed composer.json)
-  → reconcileCore() first calls reconcile_detectBlocker($direction), in order:
-    → If DEV mode: blocked — composer.json has been rewritten for local
-      repositories and is not meaningful to reconcile
-    → If INITIAL state (no switch has ever been run): blocked,
-      regardless of $direction — there is no baseline yet to reconcile
-      against
-    → If composer-prod.json does not exist and $direction is not
-      RECONCILE_TO_PROD: blocked — reconciling against a file that does
-      not exist would otherwise reach requireModifiedDate() and throw;
-      naming RECONCILE_TO_PROD explicitly is the one direction that
-      recovers instead (see below)
-    → A blocker, if any, records its message (MESSAGE_DEV_MODE_NOT_RECONCILABLE
-      / MESSAGE_INITIAL_NOT_RECONCILABLE / MESSAGE_PROD_CONFIG_MISSING) and
-      returns (no-op) immediately — verify() is never called
-  → Otherwise calls verify() (content-first: decides *whether* to act)
-    → If in sync: adds MESSAGE_ALREADY_IN_SYNC, returns (no-op), even
-      when composer.json and composer-prod.json have different
-      modification times
-  → Resolves a direction (decides *which way* to copy):
-    → $direction explicit argument, if given (RECONCILE_TO_MAIN or
-      RECONCILE_TO_PROD) — also used to resolve the ambiguous case
-      below, and to recover a missing composer-prod.json when it is
-      RECONCILE_TO_PROD
-    → Otherwise, compares modification times of composer.json vs
-      composer-prod.json:
-      → If main is newer: direction = RECONCILE_TO_PROD (user edited
-        composer.json directly)
-      → If prod is newer: direction = RECONCILE_TO_MAIN (user edited
-        composer-prod.json)
-      → If equal (and content differs, since verify() already ruled
-        out the in-sync case): adds MESSAGE_RECONCILE_AMBIGUOUS,
-        returns (no-op) — the two files disagree but there is no
-        modification-time signal to pick a direction automatically
-  → Applies the resolved direction, if any:
-    → RECONCILE_TO_PROD: adds MESSAGE_BACKED_UP_MAIN_TO_PROD, copies
-      composer.json → composer-prod.json plus its lock file (this is
-      also how a missing composer-prod.json is recreated)
-    → RECONCILE_TO_MAIN: adds MESSAGE_RESTORED_PROD_TO_MAIN, copies
-      composer-prod.json → composer.json plus its lock file
-  → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations)
-    — mode is MODE_INITIAL when the INITIAL blocker fired, otherwise the
-    current status mode
+switch_planDevToProd(): array{blocked, command, changes, snapshotHash, appliedRepositories}
+  → Adds MESSAGE_USING_PROD_CONFIG
+  → If the production snapshot (composer-prod.json) does not exist: blocked
+    (MESSAGE_SNAPSHOT_MISSING) — no file effects, cannot switch back to PROD safely
+  → If the snapshot's content no longer matches its recorded snapshotHash: blocked
+    (MESSAGE_SNAPSHOT_MODIFIED) — no file effects
+  → Otherwise:
+    → revertResult = DevConfigTransformer::revert($current, $snapshotConfig, $appliedRepos,
+      $prodLock) — base = apply($snapshotConfig, $appliedRepos, $prodLock), current = the live
+      DEV composer.json, target = $snapshotConfig; a managed (local) package entry always takes
+      the snapshot value (recording MESSAGE_MANAGED_ENTRY_OVERRIDDEN if the user edited it
+      anyway); every other key/package takes the current value, carrying `composer
+      require`/`remove`/config edits back
+    → Writes revertResult->getEffectiveConfig() → composer.json
+    → If a composer-prod.lock backup exists: restores it → composer.lock; otherwise
+      force-deletes composer.lock (a DEV-session lock cannot be trusted as a PROD lock) and
+      records MESSAGE_PROD_LOCK_MISSING
+    → Deletes the now-applied, transient composer-prod.json/.lock
+    → If the resulting ConfigChangeSet's prodConfig section is non-empty: adds
+      MESSAGE_DEV_CHANGES_CARRIED_BACK, listing the changed keys/packages
+    → Plans the command: no snapshot lock backup → full `update`; else a changed package list
+      → partial `update <packages>`; else a Stale resulting lock → `update --lock`; else
+      `install` unless InstalledState::Matches (MESSAGE_ALREADY_INSTALLED)
 ```
 
 ## 5a. Describe Current State
@@ -140,12 +145,27 @@ User calls ConfigSwitcher::describe(): SwitchDescription
   → Builds a per-file record (label, path, exists, modifiedDate) for:
     main/prod/dev configs, the status file, and all three lock files
   → Determines the active flag file (dev/prod/none)
-  → Calls verify() → VerificationResult
-  → Reads the dev config's local-repositories list
+  → Reads the dev config's local-repositories list via
+    LocalRepository::parseListLenient() (src/State/LocalRepository.php)
     → If the dev file is missing or malformed: returns an empty list
       and attaches a warning instead of throwing
+    → Each entry's derivedVersion is its versionOverride, or else the
+      reference lock's (the prod snapshot's lock in DEV, the main
+      lock otherwise) getLockedVersion() for that package
+  → Computes installedState: InstalledState::fromInstalledPackages(),
+    mode-aware (DEV: every local package must be path-installed;
+    PROD/INITIAL: none may be) against switch_installedPackages()
+  → Computes pendingProdChanges (DEV only): reuses the same
+    revert() + ConfigDiff + makeOriginClassifier() pipeline
+    switch_planDevToProd() uses (prodConfig section only) —
+    degrades to null plus a warning (never throws) when the
+    snapshot is missing, modified, or unreadable
+  → Surfaces legacy v2 artifacts (a leftover local-repositories.lock,
+    or a composer-prod.json found outside an active DEV session) as
+    warnings — read-only, describe() never cleans them up itself
   → Returns a new SwitchDescription(mode, lastSwitchDate, files,
-    activeFlag, verification, localRepositories, warnings)
+    activeFlag, lockStatus, installedState, pendingProdChanges,
+    localRepositories, warnings)
   → No files are modified (read-only), never throws
 
 SwitchDescription::toJSON(): string
@@ -165,27 +185,13 @@ User calls ConfigSwitcher::previewSwitch(string $mode): SwitchOutcome
       actually copied/written/deleted
     → Restores the previous dry-run flag in a finally block, even if
       an exception is thrown mid-switch
-  → Returns a SwitchOutcome whose getOperations() lists every planned
-    FileOperation (isApplied(): false), matching exactly what a real
-    switch from the same starting state would perform — including
-    from the INITIAL state, where composer-prod.json does not yet exist,
-    and from a drifted PROD state, where switch_case_PROD_PROD()'s nested
-    reconcile inherits this call's dry-run flag rather than performing a
-    real reconcile copy (see §4)
-```
-
-## 5c. Verify Configuration
-
-```
-User calls ConfigSwitcher::verify()
-  → If StatusFile::isDEV(): returns early with new VerificationResult(devMode: true, inSync: false, differences: [])
-  → Reads mainFile->getData() and prodFile->getData()
-  → Recursively ksort() both arrays (key-order normalization)
-  → Collects union of all top-level keys
-  → For each key: compares normalized values (strict equality)
-  → differences[] = keys whose values differ
-  → Returns new VerificationResult(devMode: false, inSync: empty($differences), differences: $differences)
-  → No files are modified (read-only)
+  → Returns a SwitchOutcome whose getOperations()/getComposerCommand()/getConfigChanges()
+    match exactly what a real switch from the same starting state would perform (every
+    FileOperation reports isApplied(): false) — including from the INITIAL state, where
+    composer-prod.json does not yet exist. A `previewSwitch(MODE_PROD)` preview in PROD mode
+    runs switch_planProdToProd(), which has no file effects of its own beyond legacy
+    cleanup/status/flags (composer-prod.json/.lock are a transient DEV-session snapshot, not a
+    committed baseline to compare against — see §4), so it only ever plans (or skips) an `install`
 ```
 
 ## 6. Install Git Hooks
@@ -203,27 +209,90 @@ User calls ConfigSwitcher::installGitHooks($projectRoot)
 
 ```
 Consumer wires a built-in entry point in composer.json scripts
-  → Composer invokes e.g. ConfigSwitcher::composerSwitchDev()
-    → Calls fromProjectRoot(getcwd())
-      → Constructs ConfigSwitcher with:
-        - getcwd()/composer.json
-        - getcwd()/composer/composer-prod.json
-        - getcwd()/composer/local-repositories.json
-    → Delegates to the corresponding method (switchToDevelopment, verify, etc.)
+  → Composer invokes e.g. ConfigSwitcher::composerSwitchDev(?object $event = null)
+    → ConfigSwitcher::buildRunner($event):
+      → EventContext::fromEvent($event) — the only place the library duck-types
+        Composer's event/IO (see §7a)
+      → fromProjectRoot(getcwd()) — a ConfigSwitcher for the standard three-path layout
+      → new ComposerProcess() — the real process runner
+      → new OutcomeRenderer($context)
+      → Returns a Utils\SwitchCommandRunner wired from all four
+    → Delegates to the runner: runSwitch($mode) / runUpdate() / runPreview($mode)
 ```
 
-Available entry points: `composerSwitchDev`, `composerSwitchProd`, `composerSwitchUpdate`, `composerVerifyConfig`, `composerInstallHooks`, `composerSwitchDescribe`, `composerSwitchDescribeJson`, `composerSwitchReconcile`, `composerSwitchPreviewDev`, `composerSwitchPreviewProd`. The last four delegate to `describe()`, `reconcile()`, and `previewSwitch()` respectively (see §5a/§4/§5b) instead of `switchToDevelopment()`/`switchToProduction()`/`verify()`.
+Available entry points: `composerSwitchDev`, `composerSwitchProd`, `composerSwitchUpdate`, `composerInstallHooks`, `composerSwitchDescribe`, `composerSwitchDescribeJson`, `composerSwitchPreviewDev`, `composerSwitchPreviewProd`. Every one of these (other than `composerInstallHooks`, which just calls `installGitHooks()` directly) now takes `?object $event = null` and is a one-line delegation — either to `buildRunner($event)->runSwitch()/runUpdate()/runPreview()`, or, for the two describe statics, to an `EventContext`-backed `OutcomeRenderer::renderDescription()`/`EventContext::write(describe()->toJSON())`. `ConfigSwitcher` itself never executes Composer or prompts the user — `Utils\SwitchCommandRunner` (see §7a) is the only place that does. `composerVerifyConfig`/`composerSwitchReconcile` were removed along with `verify()`/`reconcile()`.
+
+## 7a. Confirmation Sequence (`Utils\SwitchCommandRunner`)
+
+Every switch/update entry point above delegates to `SwitchCommandRunner::runSwitch($mode)` (or
+`runUpdate()`, which resolves the current mode and calls `runSwitch()`), the only place in the
+library that executes Composer or prompts the user. A preview entry point
+(`composerSwitchPreviewDev`/`Prod`) calls `runPreview($mode)` instead, which only previews and
+renders — no nested-run guard, no confirmation, no command execution.
+
+```
+SwitchCommandRunner::runSwitch(string $mode): void
+  → If COMPOSER_SWITCHER_NESTED is set (this process was itself launched by the switcher,
+    e.g. a leftover post-update-cmd hook firing during the switcher's own `composer update`):
+    writes MESSAGE_NESTED_RUN_SKIPPED and returns — no preview, no file effects
+  → first = $switcher->previewSwitch($mode)
+  → OutcomeRenderer::render($first) — always, with or without --yes: the ConfigChangeSet
+    ([version]/[permanent]/[discarded] markers), the planned command, file operations, messages
+  → If $first->isBlocked(): throws ERROR_SWITCH_BLOCKED — stops here, nothing written
+  → If $first->requiresConfirmation() (composer.json itself would change):
+    → confirmSwitch($first):
+      → --yes flag present: confirmed, no prompt
+      → Context is interactive: EventContext::confirm($question, $default), $default = "no"
+        when the change set has a [permanent]/[discarded] entry (CarriedBack/Discarded origin,
+        or ConfigChangeSet::hasPermanentChanges()), "yes" otherwise
+      → Context is non-interactive without --yes: writes MESSAGE_CONFIRMATION_REQUIRED,
+        throws ERROR_CONFIRMATION_REQUIRED — nothing written
+      → Declined: writes MESSAGE_SWITCH_CANCELLED, returns false — runSwitch() returns
+        normally (exit 0), nothing written
+    → If declined: return
+  → second = $switcher->previewSwitch($mode) — a second, independent preview
+  → If !$second->hasSameEffectsAs($first): throws ERROR_INPUTS_CHANGED — the shown-vs-applied
+    guard; nothing written even though $first was already rendered
+  → outcome = $switcher->switchTo($mode) — the real switch, now writes to disk
+  → runCommand($outcome):
+    → No planned command: return
+    → --no-install flag: writes MESSAGE_COMPOSER_SKIPPED (prints the command instead of
+      running it) and returns
+    → --with-dependencies flag, and the command is a partial `update <packages>` (not a full
+      `update` or `install`): appends --with-dependencies
+    → Parent context is non-interactive: appends --no-interaction, so the child process never
+      blocks on a prompt the parent couldn't have answered either
+    → Writes MESSAGE_COMPOSER_COMMAND, then ComposerProcess::run() spawns the real `composer`
+      child process (COMPOSER_SWITCHER_NESTED=1 in its environment — see §6/§7)
+    → Non-zero exit code: throws ERROR_COMPOSER_COMMAND_FAILED (context: command, exitCode)
+```
+
+`EventContext::fromEvent(?object $event)` is the sole duck-typing site for Composer's
+event/IO (`getArguments()`/`getIO()`/`isInteractive()`/`askConfirmation()`/`write()`, each
+probed once via `method_exists()`); everything above consumes the typed `EventContext` instead.
+`hasFlag('--yes'|'--no-install'|'--with-dependencies')` reads `$event->getArguments()`
+(string-filtered), so these flags are passed after Composer's own `--` separator (e.g.
+`composer switch-dev -- --yes`).
 
 ## File Relationships
 
 ```
-composer.json            ← mutable working copy (switched between DEV/PROD content)
-composer.lock            ← follows the active configuration
-composer-prod.json       ← immutable production baseline
-composer-prod.lock       ← production lock file backup
-local-repositories.json  ← local-repositories list (input only, never modified)
-local-repositories.lock  ← development lock file backup
-local-repositories.status ← JSON status file (mode, date, file paths)
-composer.json.DEV        ← flag file (exists only in DEV mode)
-composer.json.PROD       ← flag file (exists only in PROD mode)
+composer.json              ← mutable working copy — the PROD source of truth; rewritten to
+                              DEV content for the duration of a DEV session
+composer.lock               ← follows the active configuration (stays the PROD lock
+                              throughout a DEV session — never a separate DEV lock)
+composer-prod.json          ← transient production snapshot — exists ONLY during an active
+                              DEV session; created by switch_planProdToDev(), consumed and
+                              deleted by switch_planDevToProd() (not committed to git)
+composer-prod.lock          ← the snapshot's lock file backup, same transient lifetime
+local-repositories.json     ← local-repositories list (input only, never modified)
+local-repositories.status   ← JSON status file (mode, date, file paths, snapshotHash,
+                              appliedRepositories)
+composer.json.DEV           ← flag file (exists only in DEV mode)
+composer.json.PROD          ← flag file (exists only in PROD mode)
 ```
+
+A committed-style `composer-prod.json`/`.lock` found outside an active DEV session, or a
+leftover `local-repositories.lock` (v2's separate DEV lock, which has no v3 equivalent — see
+§1/§2), are v2-era legacy artifacts: `switch_cleanLegacyArtifacts()` removes them at the start
+of every switch, regardless of direction, recording `MESSAGE_LEGACY_FILES_FOUND`.

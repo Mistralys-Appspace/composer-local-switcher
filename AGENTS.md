@@ -68,9 +68,10 @@ When you change code, update the corresponding manifest documents **in the same 
 | Missing documentation | Flag gap, do not invent facts | MUST |
 | Untested code path | Proceed with caution, add test recommendation | SHOULD |
 | New error code needed | Follow `1821xx` numbering; exceptions use `182101`–`1821xx`, switcher uses `1822xx` | MUST |
-| `composer.json` edit requested | Edit `composer-prod.json` instead — the switcher overwrites `composer.json` | MUST |
+| `composer.json` edit requested | Edit it directly — in PROD mode it is the source of truth. In DEV mode, edits are carried back on `switch-prod` (check `composer switch-describe` for pending carry-back). Never edit `composer/composer-prod.*`, a transient snapshot | MUST |
 | Flag/lock/status file path logic unclear | Paths are derived by string replacement on `.json` — see `constraints.md` | SHOULD |
-| Unsure what a switch/reconcile/preview call will do from the current state | Check `switching-decision-table.md` before reading `ConfigSwitcher.php` | SHOULD |
+| Unsure what a switch/update/preview call will do from the current state | Check `switching-decision-table.md` before reading `ConfigSwitcher.php` | SHOULD |
+| Running a switch as an agent (`composer switch-dev`/`-prod`/`-update`) | Non-interactive runs need `-- --yes` to apply (e.g. `composer switch-dev -- --yes`); read the printed `composer.json` change set before passing it | MUST |
 
 ---
 

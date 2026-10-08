@@ -1,5 +1,46 @@
 # Changelog
 
+## v3.0.0 - A single source of truth (Breaking-M)
+
+**`composer.json` is now the only committed, hand-editable configuration.** `composer-prod.json`/
+`.lock` become a transient snapshot of a DEV session instead of a second committed baseline, so there
+is no longer anything to drift or to reconcile. Switch commands finish in one step: they show you the
+`composer.json` changes, ask for confirmation, and then run Composer themselves. DEV-time edits -
+including `composer require`/`remove` - are carried back into production automatically on `switch-prod`.
+
+- Switching: `composer-prod.json`/`.lock` are now created and deleted automatically as a transient
+  DEV-session snapshot; they are no longer a second committed baseline you maintain by hand.
+- Switching: A three-way revert carries DEV-time edits (`composer require`/`remove`, script/autoload
+  changes, added repositories) back into production on `switch-prod`, restoring only the managed
+  (local package) entries to their production snapshot value.
+- Switching: Each path package is now aliased to the version your production lock file has already
+  resolved for it; the `version` override in `local-repositories.json` is optional, used only to pin
+  a different version or to cover a package production has not locked yet.
+- Switching: `switch-dev`/`switch-prod`/`switch-update` now run the Composer command the switch itself
+  planned (`install`/`update`), so there is no separate `composer update` step to remember; pass
+  `-- --no-install` to print the planned command instead of running it.
+- Switching: Every switch that would change `composer.json` now shows the change set and asks for
+  confirmation before writing anything; pass `-- --yes` to apply without prompting (required for
+  agents, scripts and CI).
+- Switching: A retained `post-update-cmd: @composer switch-update` hook no longer causes a recursive
+  Composer invocation - a nested-run guard detects it and no-ops.
+
+### Breaking Changes
+
+`composer/composer-prod.json` and `composer/composer-prod.lock` must no longer be committed; they are
+created and deleted automatically and should be untracked (`git rm --cached`) and added to
+`.gitignore`. The `verify()`/`reconcile()` methods, the `switch-verify-config`/`switch-reconcile`
+scripts, and the `VerificationResult`/`RECONCILE_*` types are removed entirely - there is no second
+editable copy left to verify or reconcile against. `switch-dev`/`switch-prod`/`switch-update` now run
+Composer themselves and require confirmation (or `--yes`) whenever `composer.json` would change, so
+consumer scripts and agent instructions that assumed a silent, single-call switch need `-- --yes`
+added. The `version` key in `local-repositories.json` is now optional and derived from the production
+lock file when omitted, rather than required. A block of message codes (182202, 182205-182208,
+182210-182212, 182215-182216) and the exception code `182111`/`ERROR_INVALID_RECONCILE_DIRECTION` are
+retired and never reused. `SwitchDescription` is reshaped: it reports `pendingProdChanges` (a
+`ConfigChangeSet`-shaped payload, DEV only) instead of the old reconcile-direction/ambiguity fields.
+See [Migrating from 2.x](docs/migrating-from-2x.md) for the full consumer migration steps.
+
 ## v2.0.0 - Observable switching and PHP 8.4 (Breaking-M)
 
 **Switching can now be previewed, inspected and reconciled without touching any files.**

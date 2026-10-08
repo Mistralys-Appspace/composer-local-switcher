@@ -12,12 +12,12 @@ When you work on a library and the project that uses it at the same time, you wa
 
 ## Features
 
-- Switch between a production and a local development configuration with `composer switch-dev` and `composer switch-prod`.
+- Switch between a production and a local development configuration with a single command, `composer switch-dev` or `composer switch-prod` - it shows you the changes, confirms, and runs Composer itself.
 - Work on local package clones through symlinked path repositories, so changes in a library are visible in the project that uses it.
 - Keep a separate lock file for each configuration, so you can run Composer commands in either mode.
 - Preview any switch before it happens; the preview lists the planned file changes and writes nothing.
 - Inspect the current mode and the state of every managed file, as a readable report or as JSON.
-- Detect when `composer.json` and your production configuration have drifted apart, and bring them back in line.
+- Carry edits made while in development mode - including `composer require`/`remove` - back into production instead of overwriting them.
 - Spot the active mode at a glance in your file browser through DEV/PROD flag files.
 - Block commits of the development configuration with a bundled git pre-commit hook.
 - Drive the switcher from PHP code or tooling: results and errors come back as structured objects, so you never need to parse console output.
@@ -40,7 +40,6 @@ composer config scripts.switch-prod "Mistralys\\ComposerSwitcher\\ConfigSwitcher
 composer config scripts.switch-preview-dev "Mistralys\\ComposerSwitcher\\ConfigSwitcher::composerSwitchPreviewDev"
 
 mkdir -p composer
-cp composer.json composer/composer-prod.json
 echo '{"local-repositories": []}' > composer/local-repositories.json
 
 composer switch-preview-dev
@@ -58,19 +57,31 @@ Rebuilt a fresh DEV `composer.json`.
 From here:
 
 1. List the packages you want to work on locally in `composer/local-repositories.json`, with the path to each clone. The [Setup Guide](docs/setup.md) shows the format.
-2. Run `composer switch-dev`, then `composer update`.
-3. When you are done, run `composer switch-prod`, then `composer update`.
+2. Run `composer switch-dev`. It prints the `composer.json` changes it's about to make and the Composer command it's about to run, asks you to confirm, then runs that command itself - one command, nothing left to run by hand.
+3. When you are done, run `composer switch-prod` the same way.
 
-> **Note:** After the setup above, edit `composer/composer-prod.json` rather than `composer.json`. The switcher rewrites `composer.json` whenever you switch.
+A real switch shows you what it's about to do before it does it:
+
+```text
+composer.json changes:
+  require › vendor/package-name: changed "^2.0" -> "*" [version]
+Planned command: composer update vendor/package-name (local repository added)
+Apply these changes and run `composer update vendor/package-name`? [yes]
+```
+
+Running non-interactively (scripts, CI, agents)? Add `-- --yes` to apply without being asked:
+`composer switch-dev -- --yes`. See [Usage Guide](docs/usage.md#what-you-will-be-asked-to-confirm)
+for the full behavior.
 
 ## Learn More
 
 | Resource | Description |
 |----------|-------------|
 | [Setup Guide](docs/setup.md) | How it works, the configuration files, script wiring, custom file layouts, pinned package versions, and what to commit. |
-| [Usage Guide](docs/usage.md) | Switching, previewing, verifying, reconciling drift, and inspecting state from the command line. |
+| [Usage Guide](docs/usage.md) | Switching, previewing, and inspecting state from the command line. |
 | [API Guide](docs/api.md) | Using the switcher from PHP: outcomes, options, and exception handling. |
 | [Git Hooks](docs/git-hooks.md) | Installing the pre-commit hook that guards against committing the development configuration. |
+| [Migrating from 2.x](docs/migrating-from-2x.md) | Consumer migration steps to the single-source-of-truth model: untracking `composer-prod.*`, the optional `version` override, and removed APIs. |
 | [Migrating from 1.x](docs/migrating-from-1x.md) | The PHP 8.4 requirement and the PHP API changes that affect code calling the library directly. |
 | [Changelog](changelog.md) | Release history. |
 | [Issues](https://github.com/Mistralys/composer-local-switcher/issues) | Report a bug or request a feature. |
