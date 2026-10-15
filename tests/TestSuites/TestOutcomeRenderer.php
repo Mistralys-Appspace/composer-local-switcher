@@ -12,70 +12,155 @@ use Mistralys\ComposerSwitcher\State\ConfigChangeSet;
 use Mistralys\ComposerSwitcher\State\FileOperation;
 use Mistralys\ComposerSwitcher\State\InstalledState;
 use Mistralys\ComposerSwitcher\State\LockStatus;
+use Mistralys\ComposerSwitcher\State\MessageLevel;
 use Mistralys\ComposerSwitcher\State\SwitchDescription;
+use Mistralys\ComposerSwitcher\State\SwitchMessage;
 use Mistralys\ComposerSwitcher\State\SwitchOutcome;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\ScriptedEventContext;
+use Mistralys\ComposerSwitcher\Utils\ConfigChangeFormatter;
 use Mistralys\ComposerSwitcher\Utils\OutcomeRenderer;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Verifies {@see OutcomeRenderer} in isolation: the `[version]`/
- * `[permanent]`/`[discarded]` change-set markers, the planned-command
- * line's dry-run-aware label, file operation formatting, and the
- * `describe()` report layout — all through a {@see ScriptedEventContext}
- * capturing every written line, with no filesystem or switcher
- * involved.
+ * Verifies {@see OutcomeRenderer} in isolation: the header convention
+ * shared by every lifecycle moment, the `[permanent]`/`[discarded]`
+ * change-set markers (with `[version]` folded into the description),
+ * message-level filtering (`Detail` hidden unless verbose, each with
+ * its own prefix), file operation formatting, and the `describe()`
+ * report layout — all through a {@see ScriptedEventContext} capturing
+ * every written line, with no filesystem or switcher involved.
  */
 final class TestOutcomeRenderer extends TestCase
 {
+    private const PROJECT_ROOT = '/project';
+
     // region: _Tests
 
-    public function test_rendersSectionsAndMarkers() : void
+    public function test_renderPlanWritesHeaderNamingTheTransition() : void
+    {
+        $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, array(), array());
+
+        $context = new ScriptedEventContext();
+        $this->createRenderer($context)->renderPlan($outcome, false);
+
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — switch to DEV'));
+    }
+
+    public function test_renderPlanPreviewStatesNothingWillChange() : void
+    {
+        $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, true, array(), array());
+
+        $context = new ScriptedEventContext();
+        $this->createRenderer($context)->renderPlan($outcome, true);
+
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — preview of switch to DEV'));
+        $this->assertTrue($context->hasWrittenLineContaining('nothing will be changed'));
+    }
+
+    public function test_renderBlockedCommandStartDoneFailureShareTheHeaderPrefix() : void
+    {
+        $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, array(), array(), null, true);
+        $command = new ComposerCommand(array('update', 'acme/one'), 'Installing the switched local packages.');
+
+        foreach(array(
+            fn(OutcomeRenderer $renderer) => $renderer->renderBlocked($outcome),
+            fn(OutcomeRenderer $renderer) => $renderer->renderCommandStart($command),
+            fn(OutcomeRenderer $renderer) => $renderer->renderDone('DEV'),
+            fn(OutcomeRenderer $renderer) => $renderer->renderFailure($command, 1),
+        ) as $call)
+        {
+            $context = new ScriptedEventContext();
+            $call($this->createRenderer($context));
+
+            $this->assertTrue(
+                $context->hasWrittenLineContaining('Composer Local Switcher — '),
+                'Expected the header prefix to be written.'
+            );
+        }
+    }
+
+    public function test_rendersChangeSetWithMarkersAndNoJsonObject() : void
     {
         $versionChange = new ConfigChange(array('require', 'acme/one'), '^1.0', '^1.1', ConfigChange::KIND_CHANGED, ConfigChangeOrigin::LocalSwitch);
         $permanentChange = new ConfigChange(array('require', 'acme/two'), '^2.0', null, ConfigChange::KIND_REMOVED, ConfigChangeOrigin::CarriedBack);
-        $discardedChange = new ConfigChange(array('repositories', 'local'), array('type' => 'path'), array('type' => 'vcs'), ConfigChange::KIND_CHANGED, ConfigChangeOrigin::Discarded);
+        $discardedChange = new ConfigChange(array('repositories', '0'), array('type' => 'path', 'url' => '/project/packages/foo'), array('type' => 'vcs', 'url' => 'https://example.test/foo.git'), ConfigChange::KIND_CHANGED, ConfigChangeOrigin::Discarded);
 
         $changes = new ConfigChangeSet(array($versionChange, $discardedChange), array($permanentChange));
 
         $context = new ScriptedEventContext();
-        $renderer = new OutcomeRenderer($context);
+        $this->createRenderer($context)->renderChangeSet($changes);
 
-        $renderer->renderChangeSet($changes);
-
-        $this->assertTrue($context->hasWrittenLineContaining('composer.json changes:'));
-        $this->assertTrue($context->hasWrittenLineContaining('[version]'));
+        $this->assertTrue($context->hasWrittenLineContaining('composer.json changes (2):'));
+        $this->assertTrue($context->hasWrittenLineContaining('require › acme/one'));
+        $this->assertFalse($context->hasWrittenLineContaining('[version]'), 'The [version] marker is folded into the description.');
         $this->assertTrue($context->hasWrittenLineContaining('[discarded]'));
-        $this->assertTrue($context->hasWrittenLineContaining('Permanent production changes:'));
+        $this->assertTrue($context->hasWrittenLineContaining('Permanent production changes (1):'));
         $this->assertTrue($context->hasWrittenLineContaining('[permanent]'));
+
+        foreach($context->getWrittenLines() as $line)
+        {
+            $this->assertStringNotContainsString('{', $line, 'No raw JSON object should reach the console.');
+        }
     }
 
-    public function test_rendersPlannedCommandAndOperations() : void
+    public function test_renderPlanHidesFileOperationsAndDetailMessagesByDefault() : void
+    {
+        $operation = new FileOperation(FileOperation::TYPE_WRITE, self::PROJECT_ROOT . '/composer.json', null, 'Rewriting DEV config.', true);
+        $messages = array(
+            new SwitchMessage(182201, 'Using Composer DEV configuration.', MessageLevel::Detail),
+            new SwitchMessage(0, 'Switched to DEV mode.', MessageLevel::Info),
+        );
+
+        $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, $messages, array($operation));
+
+        $context = new ScriptedEventContext();
+        $this->createRenderer($context)->renderPlan($outcome, false);
+
+        $this->assertFalse($context->hasWrittenLineContaining('[182201]'));
+        $this->assertFalse($context->hasWrittenLineContaining('Using Composer DEV configuration.'));
+        $this->assertFalse($context->hasWrittenLineContaining('would write'));
+        $this->assertTrue($context->hasWrittenLineContaining('Switched to DEV mode.'));
+    }
+
+    public function test_renderPlanShowsFileOperationsAndCodedDetailMessagesWhenVerbose() : void
+    {
+        $operation = new FileOperation(FileOperation::TYPE_WRITE, self::PROJECT_ROOT . '/composer.json', null, 'Rewriting DEV config.', true);
+        $messages = array(
+            new SwitchMessage(182201, 'Using Composer DEV configuration.', MessageLevel::Detail),
+        );
+
+        $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, $messages, array($operation));
+
+        $context = new ScriptedEventContext(array(), true, array(), true);
+        $this->createRenderer($context)->renderPlan($outcome, false);
+
+        $this->assertTrue($context->hasWrittenLineContaining('[182201] Using Composer DEV configuration.'));
+        $this->assertTrue($context->hasWrittenLineContaining('would write'));
+        $this->assertTrue($context->hasWrittenLineContaining('./composer.json'), 'The file operation path should be project-relative.');
+    }
+
+    public function test_rendersPlannedCommandLabels() : void
     {
         $command = new ComposerCommand(array('update', 'acme/one'), 'Installing the switched local packages.');
-        $operation = new FileOperation(FileOperation::TYPE_WRITE, '/path/composer.json', null, 'Rewriting DEV config.', true);
 
-        $realOutcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, array(), array($operation), $command);
-        $previewOutcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, true, array(), array($operation), $command);
+        $realOutcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, array(), array(), $command);
+        $previewOutcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, true, array(), array(), $command);
 
         $realContext = new ScriptedEventContext();
-        (new OutcomeRenderer($realContext))->render($realOutcome);
+        $this->createRenderer($realContext)->render($realOutcome);
 
-        $this->assertTrue($realContext->hasWrittenLineContaining('Planned command: composer'));
-        $this->assertTrue($realContext->hasWrittenLineContaining('would write'));
+        $this->assertTrue($realContext->hasWrittenLineContaining('Next: composer'));
 
         $previewContext = new ScriptedEventContext();
-        (new OutcomeRenderer($previewContext))->render($previewOutcome);
+        $this->createRenderer($previewContext)->render($previewOutcome);
 
         $this->assertTrue($previewContext->hasWrittenLineContaining('Would run: composer'));
     }
 
-    public function test_emptyChangeSetRendersNoConfigSection() : void
+    public function test_emptyChangeSetRendersNothing() : void
     {
         $context = new ScriptedEventContext();
-        $renderer = new OutcomeRenderer($context);
-
-        $renderer->renderChangeSet(new ConfigChangeSet(array(), array()));
+        $this->createRenderer($context)->renderChangeSet(new ConfigChangeSet(array(), array()));
 
         $this->assertSame(array(), $context->getWrittenLines());
     }
@@ -95,11 +180,17 @@ final class TestOutcomeRenderer extends TestCase
         );
 
         $context = new ScriptedEventContext();
-        (new OutcomeRenderer($context))->renderDescription($description);
+        $this->createRenderer($context)->renderDescription($description);
 
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — status'));
         $this->assertTrue($context->hasWrittenLineContaining('Mode: '));
         $this->assertTrue($context->hasWrittenLineContaining('(none)'));
     }
 
     // endregion
+
+    private function createRenderer(ScriptedEventContext $context) : OutcomeRenderer
+    {
+        return new OutcomeRenderer($context, new ConfigChangeFormatter(self::PROJECT_ROOT));
+    }
 }

@@ -57,10 +57,9 @@ final class TestNestedRun extends IntegrationTestCase
             $result->getErrorOutput()
         ));
 
-        $this->assertStringContainsString(
-            '182224',
-            $result->getOutput(),
-            'Expected the nested-run guard\'s MESSAGE_NESTED_RUN_SKIPPED code to appear in the output.'
+        $this->assertTrue(
+            $result->containsOutput('COMPOSER_SWITCHER_NESTED'),
+            'Expected the nested-run guard\'s message (stable wording, independent of the [code] prefix\'s verbosity gating) to appear in the output.'
         );
 
         $this->assertFileExists($this->testTarget . '/composer.json.DEV');
@@ -79,9 +78,10 @@ final class TestNestedRun extends IntegrationTestCase
      * section is empty, so it never prompts and needs no `--yes` even
      * non-interactively — so the user's own `composer require` command
      * exits `0`, `composer.json` carries exactly Composer's own edit,
-     * and no `MESSAGE_CONFIRMATION_REQUIRED` (182228) appears anywhere
-     * in the command's output. The carried-back package then survives
-     * a subsequent `switch-prod` — AC-12, AC-14.
+     * and no `MESSAGE_CONFIRMATION_REQUIRED`'s "Confirmation required"
+     * wording appears anywhere in the command's output. The
+     * carried-back package then survives a subsequent `switch-prod` —
+     * AC-12, AC-14.
      */
     public function test_userRunRequireWithHookRetainedIsHarmless() : void
     {
@@ -97,8 +97,8 @@ final class TestNestedRun extends IntegrationTestCase
         ));
 
         $this->assertFalse(
-            $requireResult->containsOutput('182228'),
-            'Expected no MESSAGE_CONFIRMATION_REQUIRED to appear in the output of the user-run composer require.'
+            $requireResult->containsOutput('Confirmation required'),
+            'Expected no confirmation-required message to appear in the output of the user-run composer require (the raw 182228 substring is vacuous now that the [code] prefix is gated behind verbosity).'
         );
 
         $afterRequire = $this->decodeJsonFile($this->testTarget . '/composer.json');

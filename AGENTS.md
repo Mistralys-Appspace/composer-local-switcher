@@ -71,7 +71,7 @@ When you change code, update the corresponding manifest documents **in the same 
 | `composer.json` edit requested | Edit it directly — in PROD mode it is the source of truth. In DEV mode, edits are carried back on `switch-prod` (check `composer switch-describe` for pending carry-back). Never edit `composer/composer-prod.*`, a transient snapshot | MUST |
 | Flag/lock/status file path logic unclear | Paths are derived by string replacement on `.json` — see `constraints.md` | SHOULD |
 | Unsure what a switch/update/preview call will do from the current state | Check `switching-decision-table.md` before reading `ConfigSwitcher.php` | SHOULD |
-| Running a switch as an agent (`composer switch-dev`/`-prod`/`-update`) | Non-interactive runs need `-- --yes` to apply (e.g. `composer switch-dev -- --yes`); read the printed `composer.json` change set before passing it | MUST |
+| Running a switch as an agent (`composer switch-dev`/`-prod`/`-update`) | Non-interactive runs need `-- --yes` to apply (e.g. `composer switch-dev -- --yes`); read the printed `composer.json` change set before passing it. A blocked switch (e.g. a `version` pin that does not satisfy its `composer.json` constraint, code 182230) or a failed Composer command exits non-zero with the reason printed (no stack trace); fix the cause and re-run. Add Composer's `-v` (`composer -v switch-dev -- --yes`) to also see file operations, bookkeeping messages and `[code]` prefixes | MUST |
 
 ---
 

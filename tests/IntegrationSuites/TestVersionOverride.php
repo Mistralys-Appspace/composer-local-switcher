@@ -80,9 +80,9 @@ final class TestVersionOverride extends IntegrationTestCase
      * still satisfy the PROD `require` constraint (`^2.0`), which
      * `DevConfigTransformer::apply()` keeps unchanged for an
      * already-root-required package — a value outside that range (e.g.
-     * `9.9.9`) would make the switch's own planned `composer update`
-     * fail with a constraint conflict, which is not what this test is
-     * about — AC-08.
+     * `9.9.9`) would now block the switch outright before any write
+     * (see {@see self::test_conflictingVersionBlocksSwitch()}), which
+     * is not what this test is about — AC-08.
      */
     public function test_explicitVersionPinsResolvedPackage() : void
     {
@@ -135,29 +135,25 @@ final class TestVersionOverride extends IntegrationTestCase
     }
 
     /**
-     * With `"version": "not-a-version"` configured — a value Composer
-     * cannot parse as a constraint — `switch-dev` still rewrites
-     * `composer.json` (the switcher writes the override into the
-     * generated repository entry without validating it, and the file
-     * write happens before the planned command runs — "plan in the
-     * core, execute at the edge"), but the single command `switch-dev`
-     * then runs itself (`composer update <package>`) fails with a
-     * non-zero exit, and the entry point's own exit code surfaces that
-     * failure directly — there is no separate `composer update` step
-     * under v3 to fail independently. Recovery from this failure —
-     * switching back to PROD afterwards — is covered by
-     * {@see self::test_switchProdRecoversAfterRejectedVersion()}, so
-     * this test deliberately stops at the failed switch rather than
-     * asserting further — AC-08.
+     * With `"version": "not-a-version"` configured — a value Composer's
+     * own semver engine cannot parse — `switch-dev` is now blocked by
+     * the core planner's pre-write guard ({@see ConfigSwitcher::MESSAGE_VERSION_OVERRIDE_CONFLICT})
+     * before any file is written: `composer.json` stays byte-identical
+     * to its pre-switch content, and no `composer/composer-prod.json`
+     * snapshot is taken. This replaces the pre-v3-guard behavior where
+     * the malformed value was written verbatim and only then made the
+     * planned `composer update` fail mid-switch — AC-08.
      */
-    public function test_malformedVersionFailsComposerUpdate() : void
+    public function test_malformedVersionBlocksSwitch() : void
     {
         $this->setLocalRepositoryVersionOverride('not-a-version');
         $this->bootstrapProd();
 
+        $mainContentBefore = $this->readFile($this->testTarget . '/composer.json');
+
         $switchResult = $this->runSwitch('switch-dev');
 
-        $this->assertNotSame(0, $switchResult->getExitCode(), 'Expected switch-dev to fail with a malformed version override.');
+        $this->assertNotSame(0, $switchResult->getExitCode(), 'Expected switch-dev to be blocked by a malformed version override.');
         $this->assertTrue(
             $switchResult->containsOutput('not-a-version'),
             sprintf(
@@ -166,77 +162,94 @@ final class TestVersionOverride extends IntegrationTestCase
                 $switchResult->getErrorOutput()
             )
         );
+        $this->assertSame(
+            $mainContentBefore,
+            $this->readFile($this->testTarget . '/composer.json'),
+            'Expected composer.json to be untouched by the blocked switch-dev.'
+        );
+        $this->assertFileDoesNotExist(
+            $this->testTarget . '/composer/composer-prod.json',
+            'Expected no PROD snapshot to be taken by a blocked switch.'
+        );
     }
 
     /**
-     * A malformed `version` override makes `switch-dev`'s own planned
-     * `composer update` fail (see
-     * {@see self::test_malformedVersionFailsComposerUpdate()}) — but
-     * under v3 `composer.lock` always stays the PROD lock throughout a
-     * DEV session (it is never deleted or rewritten by the switch
-     * itself), so the failed update simply leaves it exactly as
-     * {@see self::bootstrapProd()} produced it; there is no "missing
-     * DEV lock" state to recover from the way there was in pre-v3
-     * releases. What recovery still needs to undo is `composer.json`'s
-     * rewrite (which did happen, before the failing command ran) —
-     * `switch-prod` restores both `composer.json` and `composer.lock`
-     * from the transient PROD snapshot taken when `switch-dev` first
-     * ran — AC-13.
-     *
-     * The recovery step is driven through {@see ConfigSwitcher} directly
-     * rather than a real `composer switch-prod` invocation: the malformed
-     * `version` override was written verbatim into `composer.json`'s
-     * `require` section by the preceding DEV switch (by design — see
-     * {@see self::test_malformedVersionIsWrittenVerbatim()} in
-     * `TestSwitching.php`), and Composer's own root-package loader
-     * eagerly parses every `require` entry as a version constraint
-     * before running *any* command or script — including a custom one
-     * like `switch-prod` — so the Composer binary itself refuses to run
-     * at all while that value is in place. That eager validation is a
-     * property of the Composer CLI, not of this library, so it would
-     * make every command fail identically; exercising the switcher's own
-     * recovery logic directly is what actually isolates the behavior
-     * under test.
+     * With `"version": "9.9.9"` configured — a value Composer's semver
+     * engine parses fine but which does not satisfy the package's root
+     * constraint (`^2.0`) — `switch-dev` is blocked the same way as a
+     * malformed override: no file is written, and no PROD snapshot is
+     * taken — AC-08.
      */
-    public function test_switchProdRecoversAfterRejectedVersion() : void
+    public function test_conflictingVersionBlocksSwitch() : void
+    {
+        $this->setLocalRepositoryVersionOverride('9.9.9');
+        $this->bootstrapProd();
+
+        $mainContentBefore = $this->readFile($this->testTarget . '/composer.json');
+
+        $switchResult = $this->runSwitch('switch-dev');
+
+        $this->assertNotSame(0, $switchResult->getExitCode(), 'Expected switch-dev to be blocked by a conflicting version override.');
+        $this->assertTrue(
+            $switchResult->containsOutput('9.9.9'),
+            sprintf(
+                "Expected the conflicting version to be named in the command output.\nOutput:\n%s\nError output:\n%s",
+                $switchResult->getOutput(),
+                $switchResult->getErrorOutput()
+            )
+        );
+        $this->assertSame(
+            $mainContentBefore,
+            $this->readFile($this->testTarget . '/composer.json'),
+            'Expected composer.json to be untouched by the blocked switch-dev.'
+        );
+        $this->assertFileDoesNotExist(
+            $this->testTarget . '/composer/composer-prod.json',
+            'Expected no PROD snapshot to be taken by a blocked switch.'
+        );
+    }
+
+    /**
+     * A blocked `switch-dev` (see {@see self::test_malformedVersionBlocksSwitch()})
+     * leaves nothing to recover from — `composer.json` was never
+     * touched, so there is no PROD snapshot to restore from and no
+     * need to switch back to PROD first. Once the rejected pin is
+     * removed from `local-repositories.json`, a plain `switch-dev`
+     * retry succeeds normally — AC-13.
+     */
+    public function test_switchDevSucceedsAfterRemovingRejectedPin() : void
     {
         $this->setLocalRepositoryVersionOverride('not-a-version');
         $this->bootstrapProd();
 
-        $originalLockContent = $this->readFile($this->testTarget . '/composer.lock');
+        $mainContentBefore = $this->readFile($this->testTarget . '/composer.json');
 
-        $switchResult = $this->runSwitch('switch-dev');
-        $this->assertNotSame(0, $switchResult->getExitCode(), 'Expected switch-dev to fail with a malformed version override.');
+        $blockedResult = $this->runSwitch('switch-dev');
+        $this->assertNotSame(0, $blockedResult->getExitCode(), 'Expected switch-dev to be blocked by a malformed version override.');
+
+        $this->assertSame(
+            $mainContentBefore,
+            $this->readFile($this->testTarget . '/composer.json'),
+            'Expected composer.json to be untouched by the blocked switch-dev.'
+        );
+        $this->assertFileDoesNotExist(
+            $this->testTarget . '/composer/composer-prod.json',
+            'Expected no PROD snapshot to be taken by a blocked switch.'
+        );
+
+        $this->setLocalRepositoryVersionOverride(null);
+
+        $devSwitch = $this->runSwitch('switch-dev');
+
+        $this->assertTrue($devSwitch->isSuccess(), sprintf(
+            "Expected switch-dev to succeed once the rejected pin was removed.\nOutput:\n%s\nError output:\n%s",
+            $devSwitch->getOutput(),
+            $devSwitch->getErrorOutput()
+        ));
 
         $this->assertFileExists(
-            $this->testTarget . '/composer.lock',
-            'Expected composer.lock to still exist — it stays the PROD lock throughout a DEV session under v3, even when the planned command fails.'
-        );
-        $this->assertSame(
-            $originalLockContent,
-            $this->readFile($this->testTarget . '/composer.lock'),
-            'Expected composer.lock to be untouched by the failed switch-dev command.'
-        );
-
-        $prodData = $this->decodeJsonFile($this->testTarget . '/composer/composer-prod.json');
-        $prodLockContent = $this->readFile($this->testTarget . '/composer/composer-prod.lock');
-
-        $switcher = $this->createSwitcher();
-        $switcher->switchToProduction();
-
-        $mainData = $this->decodeJsonFile($this->testTarget . '/composer.json');
-
-        // assertEquals rather than assertSame: the restore rebuilds the
-        // config structurally (via the three-way revert), which does not
-        // guarantee the original key order — only that every key/value
-        // pair matches the PROD baseline.
-        $this->assertEquals($prodData, $mainData, 'Expected composer.json to be restored to the PROD baseline.');
-
-        $this->assertFileExists($this->testTarget . '/composer.lock', 'Expected switch-prod to restore the PROD composer.lock backup.');
-        $this->assertSame(
-            $prodLockContent,
-            $this->readFile($this->testTarget . '/composer.lock'),
-            'Expected the restored composer.lock to match the PROD lock backup.'
+            $this->testTarget . '/composer/composer-prod.json',
+            'Expected the successful switch-dev to take its usual PROD snapshot.'
         );
     }
 

@@ -18,6 +18,7 @@ When you work on a library and the project that uses it at the same time, you wa
 - Preview any switch before it happens; the preview lists the planned file changes and writes nothing.
 - Inspect the current mode and the state of every managed file, as a readable report or as JSON.
 - Carry edits made while in development mode - including `composer require`/`remove` - back into production instead of overwriting them.
+- Block a switch before any file is written when a local package's pinned `version` override cannot satisfy the project's own dependency constraint, instead of letting `composer update` fail partway through.
 - Spot the active mode at a glance in your file browser through DEV/PROD flag files.
 - Block commits of the development configuration with a bundled git pre-commit hook.
 - Drive the switcher from PHP code or tooling: results and errors come back as structured objects, so you never need to parse console output.
@@ -45,14 +46,13 @@ echo '{"local-repositories": []}' > composer/local-repositories.json
 composer switch-preview-dev
 ```
 
-The preview prints each file operation it would perform as `would <type>: <source> -> <target> (<reason>)`, followed by the messages a real switch would show:
+The preview prints a header naming it as a preview, followed by any `composer.json` changes it would make - with nothing yet to change for an empty `local-repositories.json`, that header is the whole output:
 
 ```text
-Dry run: no files will actually be changed.
-Using Composer DEV configuration.
-Run `composer update` to create a DEV lock file.
-Rebuilt a fresh DEV `composer.json`.
+Composer Local Switcher — preview of switch to DEV (nothing will be changed)
 ```
+
+Run with `-v` to also see each planned file operation (`would <type>: <source> -> <target> (<reason>)`) and the switcher's internal bookkeeping messages, both hidden at default verbosity.
 
 From here:
 
@@ -60,14 +60,39 @@ From here:
 2. Run `composer switch-dev`. It prints the `composer.json` changes it's about to make and the Composer command it's about to run, asks you to confirm, then runs that command itself - one command, nothing left to run by hand.
 3. When you are done, run `composer switch-prod` the same way.
 
-A real switch shows you what it's about to do before it does it:
+A real switch shows you what it's about to do before it does it, then frames the Composer run it
+executes for you. The first block is the dry-run preview of the plan, which is why its header says
+nothing will be changed yet:
 
 ```text
-composer.json changes:
-  require › vendor/package-name: changed "^2.0" -> "*" [version]
-Planned command: composer update vendor/package-name (local repository added)
+Composer Local Switcher — preview of switch to DEV (nothing will be changed)
+composer.json changes (1):
+  local path `../package-name` for `vendor/package-name` (symlinked, as version `1.4.2` from `options.versions`)
+Would run: composer update vendor/package-name (Installing the switched local packages at their aliased versions.)
 Apply these changes and run `composer update vendor/package-name`? [yes]
+Composer Local Switcher — running `composer update vendor/package-name`
+  Installing the switched local packages at their aliased versions.
+...Composer's own output...
+Composer Local Switcher — switch to DEV done
 ```
+
+Add `-v` (`composer -v switch-dev`) to also see each file operation and the switcher's bookkeeping
+messages, which carry their numeric `[code]` prefix. Both are hidden by default.
+
+If a package's pinned `version` in `local-repositories.json` cannot satisfy its constraint in your
+`composer.json` (for example a leftover `1.0.4` pin against `^3.0.0`), the switch stops before it
+writes anything, names the package, the pinned version, the constraint and the PROD-locked version,
+and exits non-zero:
+
+```text
+Composer Local Switcher — preview of switch to DEV (nothing will be changed)
+  ! WARNING: The version override [1.0.4] for [vendor/package-name] does not satisfy its root require constraint [^3.0.0] (PROD-locked version: 3.0.0). Fix: edit the override in `local-repositories.json`, or adjust the root constraint, so the override satisfies it.
+ERROR: The switch is blocked by a precondition (see the messages above).
+```
+
+If the Composer command a switch runs fails, the switcher prints how to recover (fix the cause and
+run `composer switch-update`, or run `composer switch-prod` to fall back) and exits non-zero. The
+switch is not rolled back automatically. See the [Usage Guide](docs/usage.md) for details.
 
 Running non-interactively (scripts, CI, agents)? Add `-- --yes` to apply without being asked:
 `composer switch-dev -- --yes`. See [Usage Guide](docs/usage.md#what-you-will-be-asked-to-confirm)

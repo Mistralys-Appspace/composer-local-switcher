@@ -23,11 +23,9 @@ User calls ConfigSwitcher::switchToDevelopment(): SwitchOutcome
         → Otherwise:
           → Reads the current local-repositories list (switch_requireCurrentLocalRepositories(),
             throws on a malformed list)
-          → Snapshots composer.json/.lock → composer-prod.json/.lock (ConfigFile::copyTo() /
-            LockFile::tryCopyTo()) — composer.lock itself stays the PROD lock throughout the
-            DEV session
-          → Delegates to Utils\DevConfigTransformer::apply($snapshotConfig, $repos, $mainLock):
-            DevTransformResult (a pure, static transform):
+          → Delegates to Utils\DevConfigTransformer::apply($mainConfig, $repos, $mainLock):
+            DevTransformResult (a pure, static transform) — run BEFORE any snapshot copy or
+            write, so a block records no file operations:
             → Reads the snapshot config as base
             → For each local repo entry, derives the alias version (explicit override, else
               LockFile::getLockedVersion() against the just-snapshotted lock, else null),
@@ -35,9 +33,21 @@ User calls ConfigSwitcher::switchToDevelopment(): SwitchOutcome
               require-dev placement, and builds/merges the path repository entry via the
               (private, ported) urlMatchesPackageName() boundary check — see api-surface.md
               for the full algorithm
+            → Alias validation: every SOURCE_OVERRIDE alias (an explicit `version` in
+              local-repositories.json) is checked by Utils\VersionConstraintChecker against the
+              package's root require/require-dev constraint; a Violated or Invalid result is
+              recorded in DevTransformResult::getVersionConflicts() (a SOURCE_LOCKED alias is
+              never checked; Unverifiable — no semver engine loaded, or an unprovable dev alias —
+              never conflicts)
+          → switch_reportVersionConflicts(): any conflict adds one MESSAGE_VERSION_OVERRIDE_CONFLICT
+            (182230, Warning) per package and BLOCKS the switch (switch_blockedPlan()) — nothing
+            has been written, no operation recorded
+          → Snapshots composer.json/.lock → composer-prod.json/.lock (ConfigFile::copyTo() /
+            LockFile::tryCopyTo()) — composer.lock itself stays the PROD lock throughout the
+            DEV session
           → Writes DevTransformResult::getConfig() → composer.json; records version
-            derivations (MESSAGE_VERSION_DERIVED) and stores snapshotHash + appliedRepositories
-            in the plan result (persisted below)
+            derivations (MESSAGE_VERSION_DERIVED, Detail level) and stores snapshotHash +
+            appliedRepositories in the plan result (persisted below)
           → Plans the command: a Missing main lock plans a full `update`
             (MESSAGE_NO_LOCK_FILE_FOUND); otherwise `update <local package names>` (or no
             command when there are none)
@@ -47,7 +57,9 @@ User calls ConfigSwitcher::switchToDevelopment(): SwitchOutcome
           retake it
         → Otherwise: computes effective = DevConfigTransformer::revert(current, snapshot,
           appliedRepos, prodLock) (see the carry-back description below), then
-          apply(effective, currentRepos, prodLock); composer.json is rewritten only when the
+          apply(effective, currentRepos, prodLock) — the same alias validation as above, run
+          before composer.json is rewritten, blocking with MESSAGE_VERSION_OVERRIDE_CONFLICT
+          (182230) on a conflict; composer.json is rewritten only when the
           resulting ConfigDiff is non-empty — an unedited refresh leaves the file
           byte-for-byte untouched, including non-canonical formatting
         → Plans the command: a repository delta (added/path-changed/override-changed/removed
@@ -57,7 +69,8 @@ User calls ConfigSwitcher::switchToDevelopment(): SwitchOutcome
     → If not blocked: StatusFile::saveState('dev', ..., snapshotHash, appliedRepositories) —
       persists mode + timestamp + file paths + the tamper-detection hash as JSON
     → Writes flag files: creates composer.json.DEV, deletes composer.json.PROD
-    → Displays collected messages
+    → Displays collected messages (ConfigSwitcher's legacy echo channel, via
+      autoDisplayMessages(); SwitchCommandRunner turns it off around its own real switchTo(), see §7a)
     → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations, the planned
       ComposerCommand (if any), isBlocked(), the ConfigChangeSet) — a blocked outcome carries
       no file effects
@@ -210,17 +223,20 @@ User calls ConfigSwitcher::installGitHooks($projectRoot)
 ```
 Consumer wires a built-in entry point in composer.json scripts
   → Composer invokes e.g. ConfigSwitcher::composerSwitchDev(?object $event = null)
-    → ConfigSwitcher::buildRunner($event):
+    → ConfigSwitcher::guardEntryPoint($event, $action) (switch/update) or buildRunner($event)
+      (preview), both ending in buildRunnerFromContext($context):
       → EventContext::fromEvent($event) — the only place the library duck-types
         Composer's event/IO (see §7a)
       → fromProjectRoot(getcwd()) — a ConfigSwitcher for the standard three-path layout
       → new ComposerProcess() — the real process runner
-      → new OutcomeRenderer($context)
+      → new OutcomeRenderer($context, new ConfigChangeFormatter(<project root>))
       → Returns a Utils\SwitchCommandRunner wired from all four
     → Delegates to the runner: runSwitch($mode) / runUpdate() / runPreview($mode)
 ```
 
-Available entry points: `composerSwitchDev`, `composerSwitchProd`, `composerSwitchUpdate`, `composerInstallHooks`, `composerSwitchDescribe`, `composerSwitchDescribeJson`, `composerSwitchPreviewDev`, `composerSwitchPreviewProd`. Every one of these (other than `composerInstallHooks`, which just calls `installGitHooks()` directly) now takes `?object $event = null` and is a one-line delegation — either to `buildRunner($event)->runSwitch()/runUpdate()/runPreview()`, or, for the two describe statics, to an `EventContext`-backed `OutcomeRenderer::renderDescription()`/`EventContext::write(describe()->toJSON())`. `ConfigSwitcher` itself never executes Composer or prompts the user — `Utils\SwitchCommandRunner` (see §7a) is the only place that does. `composerVerifyConfig`/`composerSwitchReconcile` were removed along with `verify()`/`reconcile()`.
+`composerSwitchDev`/`Prod`/`Update` route through `guardEntryPoint()`, which catches `ComposerSwitcherException` codes `ERROR_SWITCH_BLOCKED`, `ERROR_CONFIRMATION_REQUIRED`, `ERROR_INPUTS_CHANGED` and `ERROR_COMPOSER_COMMAND_FAILED`, writes the message as a styled line and returns `false` (Composer then exits non-zero without a stack box); success returns `true`, and any other exception propagates.
+
+Available entry points: `composerSwitchDev`, `composerSwitchProd`, `composerSwitchUpdate`, `composerInstallHooks`, `composerSwitchDescribe`, `composerSwitchDescribeJson`, `composerSwitchPreviewDev`, `composerSwitchPreviewProd`. The switch/update entry points return `bool` (see above); the describe/preview ones return `void`. Every one of these (other than `composerInstallHooks`, which just calls `installGitHooks()` directly) now takes `?object $event = null` and is a one-line delegation — either to `buildRunner($event)->runSwitch()/runUpdate()/runPreview()`, or, for the two describe statics, to an `EventContext`-backed `OutcomeRenderer::renderDescription()`/`EventContext::write(describe()->toJSON())`. `ConfigSwitcher` itself never executes Composer or prompts the user — `Utils\SwitchCommandRunner` (see §7a) is the only place that does. `composerVerifyConfig`/`composerSwitchReconcile` were removed along with `verify()`/`reconcile()`.
 
 ## 7a. Confirmation Sequence (`Utils\SwitchCommandRunner`)
 
@@ -236,9 +252,15 @@ SwitchCommandRunner::runSwitch(string $mode): void
     e.g. a leftover post-update-cmd hook firing during the switcher's own `composer update`):
     writes MESSAGE_NESTED_RUN_SKIPPED and returns — no preview, no file effects
   → first = $switcher->previewSwitch($mode)
-  → OutcomeRenderer::render($first) — always, with or without --yes: the ConfigChangeSet
-    ([version]/[permanent]/[discarded] markers), the planned command, file operations, messages
-  → If $first->isBlocked(): throws ERROR_SWITCH_BLOCKED — stops here, nothing written
+  → OutcomeRenderer::render($first) → renderPlan($first, $first->isDryRun()) — always, with or
+    without --yes. $first is a dry-run preview outcome, so this block's header reads
+    "Composer Local Switcher — preview of switch to DEV (nothing will be changed)" and the
+    command line is labelled "Would run:". It shows: the ConfigChangeSet (one readable line per
+    change via ConfigChangeFormatter, [permanent]/[discarded] markers), Info/Warning messages
+    (Warning prefixed "!"), the planned command via ComposerCommand::toDisplayString(), and — at
+    -v only — the file operations and Detail messages (the latter with their [code] prefix)
+  → If $first->isBlocked(): throws ERROR_SWITCH_BLOCKED — stops here, nothing written (e.g. a
+    182230 version-override conflict, 182217 stale lock, 182218/182219 snapshot problems)
   → If $first->requiresConfirmation() (composer.json itself would change):
     → confirmSwitch($first):
       → --yes flag present: confirmed, no prompt
@@ -253,7 +275,10 @@ SwitchCommandRunner::runSwitch(string $mode): void
   → second = $switcher->previewSwitch($mode) — a second, independent preview
   → If !$second->hasSameEffectsAs($first): throws ERROR_INPUTS_CHANGED — the shown-vs-applied
     guard; nothing written even though $first was already rendered
-  → outcome = $switcher->switchTo($mode) — the real switch, now writes to disk
+  → previous = $switcher->isDisplayMessagesEnabled(); $switcher->setDisplayMessages(false)
+    — so the legacy echo channel does not print every message a second time
+  → outcome = $switcher->switchTo($mode) — the real switch, now writes to disk; `finally`
+    restores setDisplayMessages(previous), also when switchTo() throws
   → runCommand($outcome):
     → No planned command: return
     → --no-install flag: writes MESSAGE_COMPOSER_SKIPPED (prints the command instead of
@@ -262,13 +287,28 @@ SwitchCommandRunner::runSwitch(string $mode): void
       `update` or `install`): appends --with-dependencies
     → Parent context is non-interactive: appends --no-interaction, so the child process never
       blocks on a prompt the parent couldn't have answered either
-    → Writes MESSAGE_COMPOSER_COMMAND, then ComposerProcess::run() spawns the real `composer`
-      child process (COMPOSER_SWITCHER_NESTED=1 in its environment — see §6/§7)
-    → Non-zero exit code: throws ERROR_COMPOSER_COMMAND_FAILED (context: command, exitCode)
+    → OutcomeRenderer::renderCommandStart() ("Composer Local Switcher — running `composer …`"),
+      MESSAGE_COMPOSER_COMMAND, then ComposerProcess::run() spawns the real `composer` child
+      process (COMPOSER_SWITCHER_NESTED=1 in its environment — see §6/§7)
+    → Exit code 0: OutcomeRenderer::renderDone() ("… switch to DEV done")
+    → Non-zero exit code (failure/recovery flow): OutcomeRenderer::renderFailure() ("… composer
+      command failed (exit code N)" plus a command/reason recap), then MESSAGE_COMPOSER_RECOVERY
+      (182231, Warning) naming the mode now active and the two ways forward — fix the cause and
+      run `composer switch-update`, or `composer switch-prod` to fall back — then throws
+      ERROR_COMPOSER_COMMAND_FAILED (context: command, exitCode). No rollback is attempted:
+      Composer may already have written a new lock, and an automatic restore would be an
+      unconfirmed second transition
 ```
 
+At the entry point, `guardEntryPoint()` catches ERROR_SWITCH_BLOCKED, ERROR_CONFIRMATION_REQUIRED,
+ERROR_INPUTS_CHANGED and ERROR_COMPOSER_COMMAND_FAILED — the runner has already printed the
+reason — writes the exception message as one styled line and returns `false`, so Composer exits
+non-zero without a PHP stack box. The OutcomeRenderer output moments, in order of a successful
+real switch, are therefore: plan block (preview header) → confirmation prompt → command start
+→ Composer's own output → done footer.
+
 `EventContext::fromEvent(?object $event)` is the sole duck-typing site for Composer's
-event/IO (`getArguments()`/`getIO()`/`isInteractive()`/`askConfirmation()`/`write()`, each
+event/IO (`getArguments()`/`getIO()`/`isInteractive()`/`isVerbose()`/`askConfirmation()`/`write()`, each
 probed once via `method_exists()`); everything above consumes the typed `EventContext` instead.
 `hasFlag('--yes'|'--no-install'|'--with-dependencies')` reads `$event->getArguments()`
 (string-filtered), so these flags are passed after Composer's own `--` separator (e.g.

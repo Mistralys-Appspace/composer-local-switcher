@@ -73,4 +73,36 @@ final class ComposerCommand
     {
         return implode(' ', array_map('escapeshellarg', $this->arguments));
     }
+
+    /**
+     * Renders the argument list as a human-readable string, e.g.
+     * `update vendor/pkg` for a console line meant to be read, not
+     * copy-pasted into a shell — unlike {@see self::toShellString()},
+     * a plain argument is left bare; only an argument containing
+     * whitespace or a shell metacharacter is wrapped in single quotes,
+     * so the common case (`update acme/local-one`) stays free of the
+     * visual noise `escapeshellarg()` would add to every argument.
+     */
+    public function toDisplayString() : string
+    {
+        return implode(' ', array_map(
+            function(string $argument) : string
+            {
+                return self::needsQuoting($argument) ? "'" . $argument . "'" : $argument;
+            },
+            $this->arguments
+        ));
+    }
+
+    /**
+     * Whether `$argument` contains whitespace or a shell metacharacter
+     * and therefore needs quoting in {@see self::toDisplayString()} to
+     * read unambiguously as a single token. An empty string also needs
+     * quoting, since a bare empty argument would otherwise be invisible
+     * in the joined output.
+     */
+    private static function needsQuoting(string $argument) : bool
+    {
+        return $argument === '' || preg_match('/[\s;&|<>()$`"\'\\\\*?\[\]{}~#!]/', $argument) === 1;
+    }
 }

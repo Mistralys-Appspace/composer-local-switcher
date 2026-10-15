@@ -149,17 +149,62 @@ After a switch completes, a summary of what happened is printed automatically. T
 $switcher->setDisplayMessages(false);
 ```
 
+The built-in `composer switch-*` commands render every message themselves, once, so `Utils\SwitchCommandRunner` turns this summary off for the duration of its own real switch and restores the previous setting afterward, whether the switch succeeds or throws. A switcher you share with a runner is therefore left exactly as you set it.
+
 ### Messages
 
-`getMessages()` returns the switch messages as `SwitchMessage` objects, each pairing a human-readable text with a numeric `ConfigSwitcher::MESSAGE_*` code:
+`getMessages()` returns the switch messages as `SwitchMessage` objects, each pairing a human-readable text with a numeric `ConfigSwitcher::MESSAGE_*` code and a `MessageLevel`:
 
 ```php
+use Mistralys\ComposerSwitcher\State\MessageLevel;
+
 foreach($switcher->getMessages() as $message) {
-    echo $message->getCode() . ': ' . $message->getText();
+    echo $message->getCode() . ' (' . $message->getLevel()->value . '): ' . $message->getText();
 }
 ```
 
 `getMessageTexts()` returns the same messages as a plain `string[]`.
+
+`SwitchMessage::getLevel()` returns a `MessageLevel` enum, so a consumer can filter or style by severity without parsing the text. `toArray()` includes it as `'level'`:
+
+| Level | Meaning |
+|---|---|
+| `MessageLevel::Detail` | Bookkeeping, e.g. "Using Composer DEV configuration." or the dry-run notice. The console only shows these at `-v`. |
+| `MessageLevel::Info` | Ordinary information about what the switch did. This is the default for `new SwitchMessage($code, $text)`. |
+| `MessageLevel::Warning` | A non-fatal condition worth attention, such as a missing lock file or a conflicting version override. The message text still starts with `WARNING:` for compatibility. |
+
+`ConfigSwitcher::isDisplayMessagesEnabled()` returns whether the automatic post-switch summary (see
+[Console logging](#console-logging)) is currently on, the getter counterpart to `setDisplayMessages()`.
+
+### Version override conflicts
+
+Before a switch to DEV (or a DEV refresh) writes anything, each package's explicit `version` override in
+`local-repositories.json` is checked against the constraint `composer.json` declares for it. A conflict
+blocks the switch (`SwitchOutcome::isBlocked()`, message `ConfigSwitcher::MESSAGE_VERSION_OVERRIDE_CONFLICT`,
+code `182230`) with no file operations recorded. For custom tooling, the same check is available on the
+transformer:
+
+```php
+use Mistralys\ComposerSwitcher\Utils\DevConfigTransformer;
+
+$result = DevConfigTransformer::apply($prodConfig, $repos, $prodLock); // DevTransformResult
+
+$result->hasVersionConflicts();  // bool
+$result->getVersionConflicts();  // array<int,array{packageName,version,constraint,section,check,lockedVersion}>
+```
+
+Each conflict names the `packageName`, the pinned `version`, the root `constraint` and its `section`
+(`require` or `require-dev`), the `lockedVersion` (the PROD-locked version, or `null`), and the
+`ConstraintCheck` outcome (`Violated` or `Invalid`). A `Satisfied` or `Unverifiable` check - the latter when
+Composer's semver library is not loaded - never produces a conflict. `apply()` takes an optional fourth
+argument, a `Utils\VersionConstraintChecker`, to substitute the semver engine.
+
+### Composer commands
+
+`ComposerCommand::toDisplayString()` renders a planned command's arguments for people to read: each argument
+is left bare unless it contains whitespace or a shell metacharacter, in which case it is single-quoted
+(`update vendor/package-name`). `toShellString()` is unchanged and remains the shell-escaped form to use when
+executing or copy-pasting the command.
 
 ## Handling exceptions
 
@@ -185,6 +230,16 @@ Common context keys:
 - `command` / `exitCode` - the shell-rendered Composer command and its exit code, on `ERROR_COMPOSER_COMMAND_FAILED`.
 
 See the `KEY_*` constants on `ComposerSwitcherException` for the full list.
+
+### Entry points and exit codes
+
+The static Composer script entry points `ConfigSwitcher::composerSwitchDev()`, `composerSwitchProd()` and
+`composerSwitchUpdate()` return `bool`. They return `true` on success. For the four explained failures
+listed below - blocked, confirmation required, inputs changed, command failed - the runner has already
+printed the reason, so the entry point prints the exception message as one error line and returns `false`
+instead of throwing; Composer then reports the script as failed and exits non-zero, without a PHP stack
+trace. Any other exception still propagates unchanged. Calling `SwitchCommandRunner` directly still throws
+the typed exception.
 
 Errors specific to running the planned command (thrown by `Utils\SwitchCommandRunner`/`Utils\ComposerProcess`,
 i.e. by the built-in `composer switch-*` commands, not by `switchTo()` itself):

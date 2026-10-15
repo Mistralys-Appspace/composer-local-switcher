@@ -9,6 +9,7 @@ use Mistralys\ComposerSwitcher\ConfigSwitcher;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\ComposerSwitcherTestCase;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\ScriptedEventContext;
 use Mistralys\ComposerSwitcher\Utils\ComposerProcess;
+use Mistralys\ComposerSwitcher\Utils\ConfigChangeFormatter;
 use Mistralys\ComposerSwitcher\Utils\OutcomeRenderer;
 use Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner;
 
@@ -64,7 +65,7 @@ final class TestConfirmation extends ComposerSwitcherTestCase
 
         $this->assertTrue($context->wasConfirmCalled());
         $this->assertTrue($diskUnchangedAtPrompt);
-        $this->assertTrue($context->hasWrittenLineContaining('composer.json changes:'));
+        $this->assertTrue($context->hasWrittenLineContaining('composer.json changes ('));
     }
 
     public function test_interactiveYesAppliesAndRuns() : void
@@ -85,7 +86,7 @@ final class TestConfirmation extends ComposerSwitcherTestCase
 
         $this->assertFalse($this->createSwitcher()->getStatus()->exists());
         $this->assertFileDoesNotExist($this->recordFile);
-        $this->assertTrue($context->hasWrittenLineContaining('[182229]'));
+        $this->assertTrue($context->hasWrittenMessageCode(ConfigSwitcher::MESSAGE_SWITCH_CANCELLED));
     }
 
     /**
@@ -114,19 +115,21 @@ final class TestConfirmation extends ComposerSwitcherTestCase
     /**
      * A first PROD/INITIAL->DEV switch also prunes the old VCS
      * repository entries it replaces, which {@see \Mistralys\ComposerSwitcher\Utils\DevConfigTransformer::makeOriginClassifier()}
-     * classifies as {@see \Mistralys\ComposerSwitcher\State\ConfigChangeOrigin::CarriedBack}
-     * (that classifier's managed/non-managed split is built for the
-     * revert direction; a replaced VCS entry is neither a managed
-     * `require` constraint nor a managed path entry, so it falls to
-     * the non-managed branch even on this direction) — so it is not a
-     * "routine changes only" switch for this test's purposes. A DEV->DEV
-     * refresh after only a version-override edit is: the require
-     * section change for the edited package is the only composerJson
-     * change, and it is {@see \Mistralys\ComposerSwitcher\State\ConfigChangeOrigin::LocalSwitch}.
+     * classifies as {@see \Mistralys\ComposerSwitcher\State\ConfigChangeOrigin::LocalSwitch}
+     * (the same URL match the pruning itself uses) — so the first
+     * switch is a routine one and the prompt defaults to "yes". A
+     * DEV->DEV refresh after only a version-override edit is routine
+     * as well: the require section change for the edited package is
+     * {@see \Mistralys\ComposerSwitcher\State\ConfigChangeOrigin::LocalSwitch}.
      */
     public function test_defaultYesForRoutineChanges() : void
     {
-        $this->createSwitcher()->switchToDevelopment();
+        [$firstRunner, $firstContext] = $this->createRunnerWithContext(array(), true, array(true));
+        $firstRunner->runSwitch(ConfigSwitcher::MODE_DEV);
+
+        $firstCalls = $firstContext->getConfirmCalls();
+        $this->assertNotEmpty($firstCalls);
+        $this->assertTrue($firstCalls[0]['default']);
 
         $devFilePath = $this->testTarget . '/composer/local-repositories.json';
         $devConfig = json_decode((string)file_get_contents($devFilePath), true);
@@ -200,7 +203,7 @@ final class TestConfirmation extends ComposerSwitcherTestCase
         $runner->runSwitch(ConfigSwitcher::MODE_DEV);
 
         $this->assertFalse($context->wasConfirmCalled());
-        $this->assertTrue($context->hasWrittenLineContaining('composer.json changes:'));
+        $this->assertTrue($context->hasWrittenLineContaining('composer.json changes ('));
         // The first (pre-confirmation) render is of the dry-run preview
         // outcome, so OutcomeRenderer labels its command line "Would
         // run:"; the real execution is announced separately via
@@ -285,6 +288,105 @@ final class TestConfirmation extends ComposerSwitcherTestCase
         );
     }
 
+    /**
+     * A real switch's messages reach the console exactly once, through
+     * the runner's injected context — never also via the switcher's
+     * own legacy echo channel ({@see ConfigSwitcher::displayMessages()}),
+     * which {@see SwitchCommandRunner::runSwitch()} disables for the
+     * duration of its own real `switchTo()` call. A verbose context is
+     * used so the (otherwise `-v`-only) `Detail`-level bookkeeping
+     * messages this fixture's DEV switch produces are actually
+     * rendered, making "printed exactly once" a meaningful check rather
+     * than "printed nowhere".
+     */
+    public function test_realSwitchMessagesPrintedOnce() : void
+    {
+        $switcher = $this->createSwitcher()->setWriteToConsole(false);
+        $context = new ScriptedEventContext(array('--yes'), true, array(), true);
+        $process = new ComposerProcess(__DIR__ . '/../assets/fake-composer/composer.php');
+        $renderer = new OutcomeRenderer($context, new ConfigChangeFormatter($this->testTarget));
+        $runner = new SwitchCommandRunner($context, $switcher, $process, $renderer);
+
+        ob_start();
+        $runner->runSwitch(ConfigSwitcher::MODE_DEV);
+        $output = ob_get_clean();
+
+        $this->assertSame(
+            '',
+            $output,
+            'The switcher\'s legacy echo channel must print nothing during a runner-driven switch.'
+        );
+
+        $messages = $switcher->getMessages();
+        $this->assertNotEmpty($messages, 'The DEV switch is expected to record at least one message.');
+
+        foreach($messages as $message)
+        {
+            $occurrences = 0;
+
+            foreach($context->getWrittenLines() as $line)
+            {
+                if(str_contains($line, $message->getText()))
+                {
+                    $occurrences++;
+                }
+            }
+
+            $this->assertSame(
+                1,
+                $occurrences,
+                sprintf('Message "%s" must be written through the context exactly once.', $message->getText())
+            );
+        }
+
+        $this->assertTrue($switcher->isDisplayMessagesEnabled());
+    }
+
+    /**
+     * {@see SwitchCommandRunner::runSwitch()} restores the switcher's
+     * display-messages setting in a `finally` block, so it ends up
+     * unchanged even when the Composer command it runs afterward fails
+     * and the method exits via an exception.
+     */
+    public function test_runSwitchRestoresDisplayMessagesSetting() : void
+    {
+        putenv('FAKE_COMPOSER_EXIT_CODE=5');
+
+        $switcher = $this->createSwitcher()->setWriteToConsole(false);
+        $this->assertTrue($switcher->isDisplayMessagesEnabled());
+
+        $context = new ScriptedEventContext(array('--yes'), true, array());
+        $process = new ComposerProcess(__DIR__ . '/../assets/fake-composer/composer.php');
+        $renderer = new OutcomeRenderer($context, new ConfigChangeFormatter($this->testTarget));
+        $runner = new SwitchCommandRunner($context, $switcher, $process, $renderer);
+
+        try {
+            $runner->runSwitch(ConfigSwitcher::MODE_DEV);
+            $this->fail('Expected a ComposerSwitcherException to be thrown.');
+        } catch (ComposerSwitcherException $e) {
+            $this->assertSame(ComposerSwitcherException::ERROR_COMPOSER_COMMAND_FAILED, $e->getCode());
+        }
+
+        $this->assertTrue($switcher->isDisplayMessagesEnabled());
+    }
+
+    /**
+     * The first preview's {@see ConfigSwitcher::MESSAGE_DRY_RUN_ACTIVE}
+     * message ("Dry run: no files will actually be changed.") is never
+     * shown by a runner-driven switch — at default verbosity it is
+     * already a {@see \Mistralys\ComposerSwitcher\State\MessageLevel::Detail}
+     * message, and the preview header itself already says "(nothing
+     * will be changed)", so the notice would only be redundant noise.
+     */
+    public function test_runnerHidesDryRunMessage() : void
+    {
+        [$runner, $context] = $this->createRunnerWithContext(array('--yes'), true, array());
+
+        $runner->runSwitch(ConfigSwitcher::MODE_DEV);
+
+        $this->assertFalse($context->hasWrittenLineContaining('Dry run: no files will actually be changed.'));
+    }
+
     public function test_noInstallStillConfirms() : void
     {
         [$runner, $context] = $this->createRunnerWithContext(array('--no-install'), true, array(true));
@@ -341,7 +443,7 @@ final class TestConfirmation extends ComposerSwitcherTestCase
         $context = new ScriptedEventContext($arguments, $interactive, $queuedAnswers);
         $switcher = $this->createSwitcher();
         $process = new ComposerProcess(__DIR__ . '/../assets/fake-composer/composer.php');
-        $renderer = new OutcomeRenderer($context);
+        $renderer = new OutcomeRenderer($context, new ConfigChangeFormatter($this->testTarget));
 
         return array(new SwitchCommandRunner($context, $switcher, $process, $renderer), $context);
     }

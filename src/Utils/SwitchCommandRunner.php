@@ -13,6 +13,7 @@ use Mistralys\ComposerSwitcher\ConfigSwitcher;
 use Mistralys\ComposerSwitcher\State\ComposerCommand;
 use Mistralys\ComposerSwitcher\State\ConfigChangeOrigin;
 use Mistralys\ComposerSwitcher\State\ConfigChangeSet;
+use Mistralys\ComposerSwitcher\State\MessageLevel;
 use Mistralys\ComposerSwitcher\State\SwitchOutcome;
 
 /**
@@ -27,6 +28,23 @@ use Mistralys\ComposerSwitcher\State\SwitchOutcome;
  * consumer can inspect a {@see SwitchOutcome} and decide for itself,
  * while this class is what `composer switch-dev`/`-prod`/`-update`
  * actually run.
+ *
+ * Two output-related responsibilities belong here, not in
+ * {@see ConfigSwitcher}: first, {@see self::runSwitch()} disables the
+ * switcher's own legacy echo channel (see {@see ConfigSwitcher::setDisplayMessages()})
+ * for the duration of its own real {@see ConfigSwitcher::switchTo()}
+ * call only — restored in a `finally` block immediately after that
+ * single call returns or throws — so the switcher (an injected
+ * collaborator the caller owns) is never left permanently mutated;
+ * every message instead reaches the console exactly once, through the
+ * injected {@see OutcomeRenderer}. Second, {@see self::runCommand()}
+ * frames the Composer invocation it executes with
+ * {@see OutcomeRenderer::renderCommandStart()} and either
+ * {@see OutcomeRenderer::renderDone()} or {@see OutcomeRenderer::renderFailure()},
+ * and — on a non-zero exit — prints {@see ConfigSwitcher::MESSAGE_COMPOSER_RECOVERY}
+ * naming the current mode and the two recovery commands before
+ * throwing; this is guidance only, not an automatic rollback (see that
+ * method's docblock for why).
  *
  * @package Composer Switcher
  * @subpackage Utils
@@ -61,6 +79,14 @@ final class SwitchCommandRunner
      *
      * A nested run (`COMPOSER_SWITCHER_NESTED` set — this process was
      * itself launched by the switcher) no-ops before step 1.
+     *
+     * Step 6's real {@see ConfigSwitcher::switchTo()} call is wrapped
+     * with the switcher's own auto-display temporarily disabled (see
+     * {@see ConfigSwitcher::setDisplayMessages()}/{@see ConfigSwitcher::isDisplayMessagesEnabled()}),
+     * restored in a `finally` immediately afterward — the switcher's
+     * legacy echo channel would otherwise print every message a second
+     * time, duplicating what this method's own {@see OutcomeRenderer}
+     * already renders.
      */
     public function runSwitch(string $mode) : void
     {
@@ -97,7 +123,17 @@ final class SwitchCommandRunner
             );
         }
 
-        $outcome = $this->switcher->switchTo($mode);
+        $previousDisplayMessages = $this->switcher->isDisplayMessagesEnabled();
+        $this->switcher->setDisplayMessages(false);
+
+        try
+        {
+            $outcome = $this->switcher->switchTo($mode);
+        }
+        finally
+        {
+            $this->switcher->setDisplayMessages($previousDisplayMessages);
+        }
 
         $this->runCommand($outcome);
     }
@@ -163,7 +199,7 @@ final class SwitchCommandRunner
         $command = $outcome->getComposerCommand();
 
         $question = $command !== null
-            ? sprintf('Apply these changes and run `composer %s`?', $command->toShellString())
+            ? sprintf('Apply these changes and run `composer %s`?', $command->toDisplayString())
             : 'Apply these changes?';
 
         $default = !$this->hasPermanentOrDiscardedChanges($outcome->getConfigChanges());
@@ -187,6 +223,32 @@ final class SwitchCommandRunner
      * non-interactive, so the child process never blocks on a prompt
      * the parent could not have answered either.
      *
+     * Every human-facing command line (the `--no-install` notice, the
+     * "Running" announcement, the exception message) renders the
+     * command via {@see ComposerCommand::toDisplayString()} — unquoted
+     * unless an argument actually needs it — while the exception's
+     * {@see ComposerSwitcherException::KEY_COMMAND} context value keeps
+     * {@see ComposerCommand::toShellString()}'s shell-escaped form, for
+     * a programmatic consumer that might copy-paste or re-run it.
+     *
+     * The real invocation is framed by {@see OutcomeRenderer::renderCommandStart()}
+     * and either {@see OutcomeRenderer::renderDone()} (exit code `0`)
+     * or {@see OutcomeRenderer::renderFailure()}. The pre-existing
+     * {@see ConfigSwitcher::MESSAGE_COMPOSER_COMMAND} announcement
+     * ("Running `composer ...`: reason") is still written immediately
+     * after `renderCommandStart()`, even though the two lines now carry
+     * near-identical information — it is kept, not dead code, because
+     * {@see \Mistralys\ComposerSwitcher\TestSuites\TestConfirmation::test_yesStillPrintsChanges}
+     * (out of this method's scope) asserts on its literal "Running
+     * `composer" substring. On a non-zero exit,
+     * {@see ConfigSwitcher::MESSAGE_COMPOSER_RECOVERY} is printed next,
+     * naming the current mode and the two recovery commands (`composer
+     * switch-update`, `composer switch-prod`) — guidance only: the
+     * switch itself is deliberately *not* rolled back, since Composer
+     * may already have written a new lock file by the time it fails,
+     * and an automatic restore would be a second, unconfirmed state
+     * transition (see the plan's "Rejected Approaches").
+     *
      * @throws ComposerSwitcherException {@see ComposerSwitcherException::ERROR_COMPOSER_COMMAND_FAILED}
      */
     private function runCommand(SwitchOutcome $outcome) : void
@@ -202,7 +264,7 @@ final class SwitchCommandRunner
         {
             $this->context->writeMessage(ConfigSwitcher::MESSAGE_COMPOSER_SKIPPED, sprintf(
                 'Run `composer %s` to finish: %s',
-                $command->toShellString(),
+                $command->toDisplayString(),
                 $command->getReason()
             ));
 
@@ -223,9 +285,11 @@ final class SwitchCommandRunner
 
         $finalCommand = new ComposerCommand($arguments, $command->getReason());
 
+        $this->renderer->renderCommandStart($finalCommand);
+
         $this->context->writeMessage(ConfigSwitcher::MESSAGE_COMPOSER_COMMAND, sprintf(
             'Running `composer %s`: %s',
-            $finalCommand->toShellString(),
+            $finalCommand->toDisplayString(),
             $finalCommand->getReason()
         ));
 
@@ -233,8 +297,19 @@ final class SwitchCommandRunner
 
         if($exitCode !== 0)
         {
+            $this->renderer->renderFailure($finalCommand, $exitCode);
+
+            $this->context->writeMessage(
+                ConfigSwitcher::MESSAGE_COMPOSER_RECOVERY,
+                sprintf(
+                    'WARNING: The switch to %s did not finish — the Composer command above failed, so `composer.json` may not match what is installed. Fix the underlying issue, then run `composer switch-update` to retry, or `composer switch-prod` to fall back to production.',
+                    strtoupper($outcome->getMode())
+                ),
+                MessageLevel::Warning
+            );
+
             throw (new ComposerSwitcherException(
-                sprintf('ERROR: `composer %s` failed with exit code %d.', $finalCommand->toShellString(), $exitCode),
+                sprintf('ERROR: `composer %s` failed with exit code %d.', $finalCommand->toDisplayString(), $exitCode),
                 ComposerSwitcherException::ERROR_COMPOSER_COMMAND_FAILED
             ))
                 ->setContext(array(
@@ -242,6 +317,8 @@ final class SwitchCommandRunner
                     ComposerSwitcherException::KEY_EXIT_CODE => $exitCode
                 ));
         }
+
+        $this->renderer->renderDone(strtoupper($outcome->getMode()));
     }
 
     /**

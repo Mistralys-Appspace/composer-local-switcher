@@ -186,7 +186,7 @@ final class SwitchOutcome
      * @return array{
      *     mode: string,
      *     dryRun: bool,
-     *     messages: array<int,array{code:int,text:string}>,
+     *     messages: array<int,array{code:int,text:string,level:string}>,
      *     operations: array<int,array{type:string,target:string,source:string|null,reason:string,applied:bool}>,
      *     composerCommand: array{arguments:string[],reason:string}|null,
      *     blocked: bool,

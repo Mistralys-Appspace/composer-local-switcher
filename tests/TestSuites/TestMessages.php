@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Mistralys\ComposerSwitcher\TestSuites;
 
 use Mistralys\ComposerSwitcher\ConfigSwitcher;
+use Mistralys\ComposerSwitcher\State\MessageLevel;
 use Mistralys\ComposerSwitcher\State\SwitchMessage;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\ComposerSwitcherTestCase;
 
@@ -77,6 +78,65 @@ final class TestMessages extends ComposerSwitcherTestCase
         $this->assertAllCodesNonZero($prodToProd->getMessages());
     }
 
+    /**
+     * {@see ConfigSwitcher::MESSAGE_USING_DEV_CONFIG} is a bookkeeping
+     * message, so this plan assigns it {@see MessageLevel::Detail}.
+     */
+    public function test_bookkeepingMessageHasDetailLevel() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $this->assertSame(
+            MessageLevel::Detail,
+            $this->getMessageByCode($switcher, ConfigSwitcher::MESSAGE_USING_DEV_CONFIG)->getLevel()
+        );
+    }
+
+    /**
+     * {@see ConfigSwitcher::MESSAGE_NO_LOCK_FILE_FOUND} previously
+     * carried the free-form `WARNING:` text prefix; this plan assigns
+     * it {@see MessageLevel::Warning} as data, while leaving its
+     * `getText()` value exactly as it was (API compatibility).
+     */
+    public function test_previouslyWarningPrefixedMessageHasWarningLevel() : void
+    {
+        $switcher = $this->createSwitcher();
+        unlink($switcher->getMainFile()->getLockFile()->getPath());
+
+        $switcher->switchToDevelopment();
+
+        $message = $this->getMessageByCode($switcher, ConfigSwitcher::MESSAGE_NO_LOCK_FILE_FOUND);
+
+        $this->assertSame(MessageLevel::Warning, $message->getLevel());
+        $this->assertSame(
+            'WARNING: No lock file found. Please run `composer update` after switching the config.',
+            $message->getText()
+        );
+    }
+
+    /**
+     * Every ordinary message not covered by the bookkeeping (`Detail`)
+     * or previously-`WARNING:`-prefixed (`Warning`) rules defaults to
+     * {@see MessageLevel::Info} — {@see ConfigSwitcher::MESSAGE_LEGACY_FILES_FOUND}
+     * is one such case.
+     */
+    public function test_ordinaryMessageHasInfoLevel() : void
+    {
+        $switcher = $this->createSwitcher();
+
+        // A leftover v2-era `local-repositories.lock` file, cleaned up
+        // on any switch — see TestSwitching::test_legacyDevLockFileIsCleanedUpOnAnySwitch().
+        file_put_contents($switcher->getDevFile()->getLockFile()->getPath(), 'legacy dev lock content');
+
+        $switcher->switchToProduction();
+
+        $this->assertSame(
+            MessageLevel::Info,
+            $this->getMessageByCode($switcher, ConfigSwitcher::MESSAGE_LEGACY_FILES_FOUND)->getLevel()
+        );
+    }
+
     public function test_messageTextsMatchLegacyStrings() : void
     {
         $switcher = $this->createSwitcher();
@@ -134,6 +194,26 @@ final class TestMessages extends ComposerSwitcherTestCase
 
         $this->assertSame('', $output);
         $this->assertNotEmpty($switcher->getMessages());
+    }
+
+    /**
+     * {@see ConfigSwitcher::isDisplayMessagesEnabled()} defaults to
+     * `true` (the switcher's own display setting), and reflects
+     * whatever {@see ConfigSwitcher::setDisplayMessages()} was last
+     * called with — the getter this plan adds to match the
+     * pre-existing setter.
+     */
+    public function test_displayMessagesGetterReflectsSetter() : void
+    {
+        $switcher = $this->createSwitcher();
+
+        $this->assertTrue($switcher->isDisplayMessagesEnabled());
+
+        $switcher->setDisplayMessages(false);
+        $this->assertFalse($switcher->isDisplayMessagesEnabled());
+
+        $switcher->setDisplayMessages(true);
+        $this->assertTrue($switcher->isDisplayMessagesEnabled());
     }
 
     /**
@@ -220,6 +300,23 @@ final class TestMessages extends ComposerSwitcherTestCase
             static fn(SwitchMessage $message) : int => $message->getCode(),
             $switcher->getMessages()
         );
+    }
+
+    /**
+     * The first recorded message carrying the given code. Fails the
+     * test (rather than returning `null`) when no such message exists,
+     * since every caller uses this to assert on that message's level.
+     */
+    private function getMessageByCode(ConfigSwitcher $switcher, int $code) : SwitchMessage
+    {
+        foreach($switcher->getMessages() as $message)
+        {
+            if($message->getCode() === $code) {
+                return $message;
+            }
+        }
+
+        $this->fail(sprintf('No message with code [%d] was recorded.', $code));
     }
 
     // endregion

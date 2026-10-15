@@ -9,6 +9,7 @@ use Mistralys\ComposerSwitcher\State\InstalledState;
 use Mistralys\ComposerSwitcher\State\LockStatus;
 use Mistralys\ComposerSwitcher\State\SwitchDescription;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\ComposerSwitcherTestCase;
+use Mistralys\ComposerSwitcher\Utils\ConfigFile;
 
 /**
  * Verifies {@see ConfigSwitcher::describe()}: it assembles the full
@@ -212,6 +213,44 @@ final class TestDescribe extends ComposerSwitcherTestCase
         $this->assertTrue($pendingProdChanges->hasPermanentChanges());
         $this->assertTrue($description->hasPendingProdChanges());
         $this->assertContains('acme/newly-required', $pendingProdChanges->getProdChangedPackages());
+    }
+
+    /**
+     * A `version` override that does not satisfy its package's root
+     * constraint surfaces as a `describe()` warning naming the package
+     * and the constraint — the same conflict a real switch would block
+     * on, reported here non-blockingly since `describe()` never writes
+     * anything.
+     */
+    public function test_conflictingOverrideWarning() : void
+    {
+        $devFile = new ConfigFile($this->testTarget . '/composer/local-repositories.json');
+        $devConfig = $devFile->getData();
+
+        foreach($devConfig['local-repositories'] as &$repo) {
+            if($repo['package-name'] === 'mistralys/application-utils') {
+                $repo['version'] = '2.0.0';
+            }
+        }
+        unset($repo);
+
+        $devFile->putData($devConfig);
+
+        $switcher = $this->createSwitcher();
+
+        $description = $switcher->describe();
+
+        $this->assertTrue($description->hasWarnings());
+
+        $found = false;
+        foreach($description->getWarnings() as $warning) {
+            if(str_contains($warning, 'mistralys/application-utils') && str_contains($warning, '>=3.1.9')) {
+                $found = true;
+                break;
+            }
+        }
+
+        $this->assertTrue($found, 'Expected a warning naming the conflicting package and its violated constraint.');
     }
 
     /**

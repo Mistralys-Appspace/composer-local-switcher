@@ -58,7 +58,7 @@ transient-snapshot model, recording `MESSAGE_LEGACY_FILES_FOUND` (182225) if any
 |---|---|
 | **Command** | `composer switch-dev` |
 | **PHP call** | `switchToDevelopment()` → `switchTo(MODE_DEV)` → `switch_planProdToDev()` |
-| **Blocked when** | The main lock's `LockFile::getLockStatus()` is `LockStatus::Stale` — the committed PROD state is already inconsistent, so a partial update would silently update the wrong things. No file effects; `MESSAGE_PROD_LOCK_OUTDATED` (182217) |
+| **Blocked when** | The main lock's `LockFile::getLockStatus()` is `LockStatus::Stale` — the committed PROD state is already inconsistent, so a partial update would silently update the wrong things. No file effects; `MESSAGE_PROD_LOCK_OUTDATED` (182217). **Or:** a `version` override in `local-repositories.json` violates (or cannot be parsed against) its package's root `require`/`require-dev` constraint — checked via `DevConfigTransformer::apply()`'s `DevTransformResult::getVersionConflicts()` before any write (the first `apply()` call here is purely a validation pass; its result is reused for the write below). No file effects; `MESSAGE_VERSION_OVERRIDE_CONFLICT` (182230, one warning-level message per conflicting override, naming the package, pinned version, constraint, PROD-locked version, and the file/fix) |
 | **File effects (unblocked)** | Snapshots `composer.json`/`.lock` → `composer-prod.json`/`.lock` (`ConfigFile::copyTo()` / `LockFile::tryCopyTo()`) — `composer.lock` itself is **not** overwritten and stays the PROD lock throughout the DEV session. Reads the current `local-repositories.json` list (`switch_requireCurrentLocalRepositories()`, throws `ERROR_INVALID_JSON_STRUCTURE` on a malformed list). Writes `DevConfigTransformer::apply($snapshotConfig, $repos, $mainLock)` → `composer.json`. Computes and stores `snapshotHash` (hash of the just-taken snapshot's config+lock content) and `appliedRepositories` in the status file |
 | **Command planned** | Main lock `Missing` → full `update` (`MESSAGE_NO_LOCK_FILE_FOUND`, 182201). Otherwise → `update <local package names>` (partial), or no command when there are no local packages |
 | **Other messages** | `MESSAGE_USING_DEV_CONFIG` (182203); `MESSAGE_REBUILT_DEV_CONFIG` (182209); `MESSAGE_VERSION_DERIVED` (182226) per package whose alias version was derived from an override or the PROD lock |
@@ -69,7 +69,7 @@ transient-snapshot model, recording `MESSAGE_LEGACY_FILES_FOUND` (182225) if any
 |---|---|
 | **Command** | `composer switch-dev` or `composer switch-update` while already in DEV |
 | **PHP call** | `switchToDevelopment()` → `switchTo(MODE_DEV)` → `switch_planDevRefresh()` |
-| **Blocked when** | The production snapshot's current content no longer matches its recorded `snapshotHash` — it was edited outside the switcher's own control since it was taken. No file effects; `MESSAGE_SNAPSHOT_MODIFIED` (182218). Remedy: switch to PROD and back to DEV to retake the snapshot |
+| **Blocked when** | The production snapshot's current content no longer matches its recorded `snapshotHash` — it was edited outside the switcher's own control since it was taken. No file effects; `MESSAGE_SNAPSHOT_MODIFIED` (182218). Remedy: switch to PROD and back to DEV to retake the snapshot. **Or:** same version-override conflict check as Row 1 (`MESSAGE_VERSION_OVERRIDE_CONFLICT`, 182230), run on the `apply($effective, $currentRepos, $prodLock)` call immediately below, before `composer.json` is rewritten |
 | **File effects (unblocked)** | Computes `effective = DevConfigTransformer::revert($current, $snapshotConfig, $appliedRepos, $prodLock)` (see Row 3 for the three-way revert semantics), then `apply($effective, $currentRepos, $prodLock)`. `composer.json` is rewritten **only when** the resulting `ConfigDiff` is non-empty — with no delta (nothing changed in `local-repositories.json` and no DEV edit to carry through), no write operation is recorded and the file stays byte-for-byte unchanged, including non-canonical formatting |
 | **Command planned** | A repository delta (added, path-changed, override-changed, or removed package by name) → partial `update <changed/added names>`, with `--with <removed>:<prod-locked version>` appended per removed package. No delta → `install` unless `InstalledState::fromInstalledPackages(MODE_DEV, ...)` already reports `Matches` (`MESSAGE_ALREADY_INSTALLED`, 182227, no command) |
 | **Other messages** | `MESSAGE_USING_DEV_CONFIG`; `MESSAGE_REBUILT_DEV_CONFIG` (only when the file was actually rewritten); `MESSAGE_MANAGED_ENTRY_OVERRIDDEN` (182221) per managed package the user edited directly in DEV (reset to its snapshot value); `MESSAGE_VERSION_DERIVED` |
@@ -117,15 +117,32 @@ rows above determine whether a given switch prompts:
 
 | Row | Prompts? | Default |
 |---|---|---|
-| Row 1 — PROD/INITIAL→DEV | Yes — writes `composer.json` (the DEV transform) | "no" if the resulting `ConfigChangeSet` has a `[permanent]`/`[discarded]` entry (rare on a fresh DEV switch), "yes" otherwise |
+| Row 1 — PROD/INITIAL→DEV | Yes — writes `composer.json` (the DEV transform) | "no" if the resulting `ConfigChangeSet` has a `[permanent]`/`[discarded]` entry (rare on a fresh DEV switch — a VCS entry pruned for a managed package is classified `LocalSwitch`, not `[permanent]`), "yes" otherwise |
 | Row 2 — DEV→DEV refresh | Only if the refresh's `ConfigDiff` is non-empty (an unedited refresh never prompts) | "no" if a managed entry was discarded (`MESSAGE_MANAGED_ENTRY_OVERRIDDEN`), "yes" otherwise |
 | Row 3 — DEV→PROD | Yes whenever `MESSAGE_DEV_CHANGES_CARRIED_BACK` would be recorded (the `prodConfig` section is non-empty) — **always "no"** by default, since a DEV→PROD switch is exactly the case `[permanent]`/`[discarded]` markers exist for | "no" |
 | Row 4 — PROD/INITIAL→PROD | Never — no `composer.json` change at all | n/a |
 
 A blocked row (see each row's "Blocked when") never reaches confirmation — `SwitchCommandRunner`
-renders the blocked outcome and throws `ERROR_SWITCH_BLOCKED` before the confirmation step. `--yes`
+renders the (preview) outcome, whose messages explain the block, and throws `ERROR_SWITCH_BLOCKED` before the confirmation step. `--yes`
 skips the prompt unconditionally; a non-interactive context without `--yes` throws
 `ERROR_CONFIRMATION_REQUIRED` instead of applying the default.
+The `composerSwitchDev`/`Prod`/`Update` entry points catch `ERROR_SWITCH_BLOCKED`, `ERROR_CONFIRMATION_REQUIRED`, `ERROR_INPUTS_CHANGED` and `ERROR_COMPOSER_COMMAND_FAILED`, print the message as a styled line and return `false` (non-zero Composer exit) rather than letting the exception escape; they return `true` on success.
+
+## Blocked version override and command-failure rows (entry-point edge)
+
+Two rows sit at the edge of the table above: the version-override block, which is a "Blocked when"
+branch of Row 1 and Row 2 (shown here as its own row for lookup), and the command-failure recovery,
+which only `Utils\SwitchCommandRunner` can produce (the planners never run Composer).
+
+| Starting State | Intended Action | Command | PHP Call | File Effects | Messages Emitted |
+|---|---|---|---|---|---|
+| PROD / INITIAL | Switch to DEV, a `version` override conflicts with its root constraint (`ConstraintCheck::Violated`) or is malformed (`Invalid`) | `composer switch-dev` | `switch_planProdToDev()` → `switch_blockedPlan()` | **None** — `apply()` runs before the snapshot copy, so no operation is recorded and `composer.json`, `composer-prod.*`, the status file and the flag files are untouched | `MESSAGE_VERSION_OVERRIDE_CONFLICT` (182230, `Warning`) per conflicting package: pinned version, root constraint and section, PROD-locked version, the file to fix. `SwitchCommandRunner` then throws `ERROR_SWITCH_BLOCKED`; the entry point returns `false` (non-zero exit) |
+| DEV | `switch-dev` / `switch-update`, a `version` override conflicts or is malformed | `composer switch-dev` / `composer switch-update` | `switch_planDevRefresh()` → `switch_blockedPlan()` | **None** — checked on the `apply($effective, $currentRepos, $prodLock)` call before `composer.json` is rewritten | Same as above (182230). `describe()` reports the same conflict as a non-blocking warning |
+| DEV or PROD (after a real switch) | The Composer command the switch ran exits non-zero | `composer switch-dev` / `switch-prod` / `switch-update` | `SwitchCommandRunner::runCommand()` | **None beyond the switch itself** — files stay switched, nothing is rolled back (Composer may already have written a new lock) | `MESSAGE_COMPOSER_RECOVERY` (182231, `Warning`): the switch to `<MODE>` did not finish; fix the cause and run `composer switch-update`, or `composer switch-prod` to fall back. Written after `renderFailure()` and before `ERROR_COMPOSER_COMMAND_FAILED` is thrown; the entry point returns `false` |
+
+A `Satisfied` check, an `Unverifiable` one (no semver engine loaded, or a `dev-*`/`*-dev` alias the
+checker cannot prove malformed) and a `SOURCE_LOCKED` alias never block. A package with no root
+`require`/`require-dev` constraint has nothing to check against and is skipped.
 
 ## Cross-cutting notes
 

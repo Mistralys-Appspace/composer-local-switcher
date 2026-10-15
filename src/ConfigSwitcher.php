@@ -14,6 +14,7 @@ use Mistralys\ComposerSwitcher\State\FileOperation;
 use Mistralys\ComposerSwitcher\State\InstalledState;
 use Mistralys\ComposerSwitcher\State\LocalRepository;
 use Mistralys\ComposerSwitcher\State\LockStatus;
+use Mistralys\ComposerSwitcher\State\MessageLevel;
 use Mistralys\ComposerSwitcher\State\SwitchDescription;
 use Mistralys\ComposerSwitcher\State\SwitchMessage;
 use Mistralys\ComposerSwitcher\State\SwitchOutcome;
@@ -21,6 +22,7 @@ use Mistralys\ComposerSwitcher\Utils\BaseFile;
 use Mistralys\ComposerSwitcher\Utils\ConfigDiff;
 use Mistralys\ComposerSwitcher\Utils\ConfigFile;
 use Mistralys\ComposerSwitcher\Utils\ComposerProcess;
+use Mistralys\ComposerSwitcher\Utils\ConfigChangeFormatter;
 use Mistralys\ComposerSwitcher\Utils\ConsoleWriter;
 use Mistralys\ComposerSwitcher\Utils\DevConfigTransformer;
 use Mistralys\ComposerSwitcher\Utils\EventContext;
@@ -33,6 +35,48 @@ use Mistralys\ComposerSwitcher\Utils\StatusFile;
 use Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner;
 
 /**
+ * The core orchestrator: plans and performs a switch between DEV and
+ * PROD Composer configurations ({@see self::switchTo()},
+ * {@see self::previewSwitch()}) and reports the current state
+ * ({@see self::describe()}). Follows "plan in the core, execute at the
+ * edge" — this class never prompts or executes Composer itself; that
+ * is {@see SwitchCommandRunner}'s job, built from one of this class's
+ * three `composerSwitch*` static entry points.
+ *
+ * Every accumulated {@see SwitchMessage} carries a {@see MessageLevel}
+ * (`Detail`/`Info`/`Warning`) via {@see self::addMessage()}'s required
+ * leading parameter — `Detail` messages (bookkeeping such as "Rebuilt a
+ * fresh DEV `composer.json`") are only ever shown at `-v`, through
+ * {@see OutcomeRenderer}; this class itself holds no verbosity logic.
+ *
+ * Before any snapshot is copied or `composer.json` is written,
+ * `switch_planProdToDev()`/`switch_planDevRefresh()` validate every
+ * local repository's `version` override against its root `require`/
+ * `require-dev` constraint (see {@see self::switch_reportVersionConflicts()}
+ * and {@see self::MESSAGE_VERSION_OVERRIDE_CONFLICT}) — a conflicting or
+ * malformed override blocks the switch with no file written, rather
+ * than being silently overridden or left to fail mid-`composer update`.
+ * {@see self::describe()} surfaces the same conflict as a non-blocking
+ * warning.
+ *
+ * {@see self::isDisplayMessagesEnabled()}/{@see self::setDisplayMessages()}
+ * gate this class's own legacy `echo` channel ({@see self::displayMessages()}),
+ * which {@see SwitchCommandRunner} disables for the duration of its own
+ * real {@see self::switchTo()} call and restores immediately afterward —
+ * every message otherwise reaches the console exactly once, through the
+ * runner's injected {@see OutcomeRenderer}, never through this class
+ * directly during a runner-driven switch.
+ *
+ * `composerSwitchDev()`, `composerSwitchProd()` and `composerSwitchUpdate()`
+ * return `bool` rather than `void`: a `ComposerSwitcherException` whose
+ * code is one of the four *explained* failures (blocked, confirmation
+ * required, inputs changed, failed command — see
+ * {@see self::isExplainedEntryPointFailure()}) is caught, its message
+ * written as a single styled error line, and `false` returned instead of
+ * letting it escape as a PHP exception box and usage dump; Composer
+ * treats a `false` script-callback return as a failed script. Any other
+ * exception still propagates unchanged.
+ *
  * @package Composer Switcher
  * @subpackage Core
  */
@@ -169,6 +213,28 @@ class ConfigSwitcher
      */
     public const MESSAGE_SWITCH_CANCELLED = 182229;
 
+    /**
+     * {@see self::switch_planProdToDev()} / {@see self::switch_planDevRefresh()} —
+     * a local package's explicit `version` override (per
+     * {@see \Mistralys\ComposerSwitcher\State\DevTransformResult::getVersionConflicts()})
+     * does not satisfy (or could not be parsed against) its root
+     * `require`/`require-dev` constraint, blocking the switch before
+     * any file is written. Also reported, non-blocking, by
+     * {@see self::describe()} as a warning.
+     */
+    public const MESSAGE_VERSION_OVERRIDE_CONFLICT = 182230;
+
+    /**
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner::runCommand()} —
+     * the Composer command it just ran exited non-zero. Names the
+     * current mode and the two recovery commands (`composer
+     * switch-update`, `composer switch-prod`), printed before
+     * {@see ComposerSwitcherException::ERROR_COMPOSER_COMMAND_FAILED}
+     * is thrown — the switch itself is not rolled back (see the
+     * runner's own docblock for why).
+     */
+    public const MESSAGE_COMPOSER_RECOVERY = 182231;
+
     public const KEY_LOCAL_REPOSITORIES = 'local-repositories';
     public const KEY_REPOSITORIES = 'repositories';
 
@@ -240,47 +306,156 @@ class ConfigSwitcher
      * `$event` — the only place `switch-dev` executes Composer or
      * prompts the user. See "Confirmation (transparency)" in the plan
      * for the full sequence.
+     *
+     * Returns `false` instead of throwing for the four *explained*
+     * failure codes ({@see ComposerSwitcherException::ERROR_SWITCH_BLOCKED},
+     * {@see ComposerSwitcherException::ERROR_CONFIRMATION_REQUIRED},
+     * {@see ComposerSwitcherException::ERROR_INPUTS_CHANGED},
+     * {@see ComposerSwitcherException::ERROR_COMPOSER_COMMAND_FAILED}) —
+     * see {@see self::guardEntryPoint()}. Composer treats a `false`
+     * script-callback return as a failed script (non-zero exit), with
+     * no PHP exception box or usage dump; any other exception still
+     * propagates unchanged.
      */
-    public static function composerSwitchDev(?object $event = null) : void
+    public static function composerSwitchDev(?object $event = null) : bool
     {
-        self::buildRunner($event)->runSwitch(self::MODE_DEV);
+        return self::runSwitchEntryPoint($event, self::MODE_DEV);
     }
 
     /**
      * Switches to PROD mode. See {@see self::composerSwitchDev()}.
      */
-    public static function composerSwitchProd(?object $event = null) : void
+    public static function composerSwitchProd(?object $event = null) : bool
     {
-        self::buildRunner($event)->runSwitch(self::MODE_PROD);
+        return self::runSwitchEntryPoint($event, self::MODE_PROD);
     }
 
     /**
      * Refreshes the current mode (DEV stays DEV, PROD/INITIAL stays
-     * PROD) — see {@see SwitchCommandRunner::runUpdate()}.
+     * PROD) — see {@see SwitchCommandRunner::runUpdate()}. Same
+     * explained-failure handling as {@see self::composerSwitchDev()}.
      */
-    public static function composerSwitchUpdate(?object $event = null) : void
+    public static function composerSwitchUpdate(?object $event = null) : bool
     {
-        self::buildRunner($event)->runUpdate();
+        return self::runUpdateEntryPoint($event);
+    }
+
+    /**
+     * Runs `switch-dev`/`switch-prod` for {@see self::composerSwitchDev()}/
+     * {@see self::composerSwitchProd()}, through {@see self::guardEntryPoint()}.
+     */
+    private static function runSwitchEntryPoint(?object $event, string $mode) : bool
+    {
+        return self::guardEntryPoint($event, static function(SwitchCommandRunner $runner) use ($mode) : void {
+            $runner->runSwitch($mode);
+        });
+    }
+
+    /**
+     * Runs `switch-update` for {@see self::composerSwitchUpdate()},
+     * through {@see self::guardEntryPoint()}.
+     */
+    private static function runUpdateEntryPoint(?object $event) : bool
+    {
+        return self::guardEntryPoint($event, static function(SwitchCommandRunner $runner) : void {
+            $runner->runUpdate();
+        });
+    }
+
+    /**
+     * The shared body of the three `composerSwitch*` entry points:
+     * builds the {@see EventContext}/{@see SwitchCommandRunner} pair via
+     * {@see self::buildRunnerFromContext()}, runs `$action` against the
+     * runner, and returns `true` on success.
+     *
+     * A {@see ComposerSwitcherException} whose code is one of the four
+     * *explained* failures — {@see ComposerSwitcherException::ERROR_SWITCH_BLOCKED},
+     * {@see ComposerSwitcherException::ERROR_CONFIRMATION_REQUIRED},
+     * {@see ComposerSwitcherException::ERROR_INPUTS_CHANGED},
+     * {@see ComposerSwitcherException::ERROR_COMPOSER_COMMAND_FAILED} —
+     * has already had its explanation printed by the runner/renderer
+     * before it was thrown; this method writes only the exception's own
+     * message, as a single styled error line via
+     * {@see EventContext::writeStyled()}, and returns `false` instead of
+     * letting it escape as a PHP stack box and usage dump. Every other
+     * exception (explained or not) propagates unchanged, since only
+     * those four codes are known to have already explained themselves
+     * to the user.
+     *
+     * Kept as a private helper (not inlined into the three entry
+     * points) so each entry point's own body stays a single-line
+     * delegation with no control flow — see
+     * {@see \Mistralys\ComposerSwitcher\TestSuites\TestEntryPointEdge::test_staticEntryPointsHoldNoControlFlow()}.
+     *
+     * @param callable(SwitchCommandRunner):void $action
+     */
+    private static function guardEntryPoint(?object $event, callable $action) : bool
+    {
+        $context = EventContext::fromEvent($event);
+        $runner = self::buildRunnerFromContext($context);
+
+        try
+        {
+            $action($runner);
+
+            return true;
+        }
+        catch(ComposerSwitcherException $e)
+        {
+            if(!self::isExplainedEntryPointFailure($e->getCode()))
+            {
+                throw $e;
+            }
+
+            $context->writeStyled('<warning>' . $e->getMessage() . '</warning>');
+
+            return false;
+        }
+    }
+
+    /**
+     * Whether `$code` is one of the four entry-point failure codes
+     * {@see self::guardEntryPoint()} converts into a `false` return
+     * instead of letting escape as an exception.
+     */
+    private static function isExplainedEntryPointFailure(int $code) : bool
+    {
+        return in_array($code, array(
+            ComposerSwitcherException::ERROR_SWITCH_BLOCKED,
+            ComposerSwitcherException::ERROR_CONFIRMATION_REQUIRED,
+            ComposerSwitcherException::ERROR_INPUTS_CHANGED,
+            ComposerSwitcherException::ERROR_COMPOSER_COMMAND_FAILED,
+        ), true);
     }
 
     /**
      * Builds the {@see SwitchCommandRunner} every switch/update/preview
-     * entry point delegates to: an {@see EventContext} from `$event`
-     * (the only place this library duck-types Composer's event/IO), a
-     * switcher rooted at the current working directory, a real
-     * {@see ComposerProcess}, and an {@see OutcomeRenderer} writing
-     * through that same context.
+     * entry point delegates to: a switcher rooted at the current
+     * working directory, a real {@see ComposerProcess}, and an
+     * {@see OutcomeRenderer} writing through `$context`.
      */
-    private static function buildRunner(?object $event) : SwitchCommandRunner
+    private static function buildRunnerFromContext(EventContext $context) : SwitchCommandRunner
     {
-        $context = EventContext::fromEvent($event);
+        $switcher = self::fromProjectRoot(getcwd());
 
         return new SwitchCommandRunner(
             $context,
-            self::fromProjectRoot(getcwd()),
+            $switcher,
             new ComposerProcess(),
-            new OutcomeRenderer($context)
+            new OutcomeRenderer($context, new ConfigChangeFormatter(dirname($switcher->getMainFile()->getPath())))
         );
+    }
+
+    /**
+     * Builds the {@see SwitchCommandRunner} for the preview entry
+     * points ({@see self::composerSwitchPreviewDev()}/
+     * {@see self::composerSwitchPreviewProd()}), which have no
+     * explained-failure handling to guard — a preview never throws one
+     * of {@see self::isExplainedEntryPointFailure()}'s codes.
+     */
+    private static function buildRunner(?object $event) : SwitchCommandRunner
+    {
+        return self::buildRunnerFromContext(EventContext::fromEvent($event));
     }
 
     public static function composerInstallHooks() : void
@@ -304,8 +479,10 @@ class ConfigSwitcher
     public static function composerSwitchDescribe(?object $event = null) : void
     {
         $context = EventContext::fromEvent($event);
+        $switcher = self::fromProjectRoot(getcwd());
+        $renderer = new OutcomeRenderer($context, new ConfigChangeFormatter(dirname($switcher->getMainFile()->getPath())));
 
-        (new OutcomeRenderer($context))->renderDescription(self::fromProjectRoot(getcwd())->describe());
+        $renderer->renderDescription($switcher->describe());
     }
 
     /**
@@ -469,7 +646,61 @@ class ConfigSwitcher
             $installedState,
             $pendingProdChanges,
             $localRepositories,
-            array_merge($warnings, $pendingWarnings, $this->describe_legacyArtifactWarnings($mode))
+            array_merge(
+                $warnings,
+                $pendingWarnings,
+                $this->describe_legacyArtifactWarnings($mode),
+                $this->describe_versionConflictWarnings($repos, $mode)
+            )
+        );
+    }
+
+    /**
+     * Reports every {@see DevConfigTransformer::apply()} version
+     * conflict for `$repos` as a non-blocking warning — the
+     * `describe()`-only counterpart to {@see self::switch_reportVersionConflicts()},
+     * which blocks a real switch instead. Checks against the root
+     * config a real switch would check against: the production
+     * snapshot in DEV mode (skipped, with no warning of its own, when
+     * that snapshot is missing, modified or unreadable — those
+     * conditions already surface their own warnings elsewhere in
+     * {@see self::describe()}), or the main `composer.json` directly
+     * otherwise.
+     *
+     * @param LocalRepository[] $repos
+     * @return string[]
+     */
+    private function describe_versionConflictWarnings(array $repos, string $mode) : array
+    {
+        if($mode === self::MODE_DEV) {
+            if(!$this->prodFile->exists() || $this->switch_isSnapshotModified()) {
+                return array();
+            }
+
+            $rootFile = $this->prodFile;
+        } else {
+            $rootFile = $this->mainFile;
+        }
+
+        try {
+            $rootConfig = $rootFile->getData();
+        } catch(ComposerSwitcherException) {
+            return array();
+        }
+
+        $conflicts = DevConfigTransformer::apply($rootConfig, $repos, $rootFile->getLockFile())->getVersionConflicts();
+
+        return array_map(
+            static function(array $conflict) : string {
+                return sprintf(
+                    'Version override conflict: [%s] for [%s] does not satisfy its root %s constraint [%s].',
+                    $conflict['version'],
+                    $conflict['packageName'],
+                    $conflict['section'],
+                    $conflict['constraint']
+                );
+            },
+            $conflicts
         );
     }
 
@@ -711,7 +942,7 @@ class ConfigSwitcher
 
             if($dryRun)
             {
-                $this->addMessage(self::MESSAGE_DRY_RUN_ACTIVE, 'Dry run: no files will actually be changed.');
+                $this->addMessage(MessageLevel::Detail, self::MESSAGE_DRY_RUN_ACTIVE, 'Dry run: no files will actually be changed.');
             }
 
             $plan = $this->switch_plan($mode);
@@ -901,29 +1132,32 @@ class ConfigSwitcher
 
         if($legacyFound)
         {
-            $this->addMessage(self::MESSAGE_LEGACY_FILES_FOUND, 'Found and cleaned up legacy v2 switcher files.');
+            $this->addMessage(MessageLevel::Info, self::MESSAGE_LEGACY_FILES_FOUND, 'Found and cleaned up legacy v2 switcher files.');
         }
     }
 
     /**
-     * PROD/INITIAL→DEV: blocked on a `Stale` main lock; otherwise
-     * snapshots the main config and lock into `composer-prod.*`,
-     * writes `apply(snapshot, repos, mainLock)` into `composer.json`,
-     * and plans `update <local names>` (a full `update` when the main
-     * lock is `Missing`).
+     * PROD/INITIAL→DEV: blocked on a `Stale` main lock, or on a
+     * conflicting/malformed `version` override (checked before any
+     * write — see {@see self::switch_reportVersionConflicts()});
+     * otherwise snapshots the main config and lock into
+     * `composer-prod.*`, writes `apply(snapshot, repos, mainLock)` into
+     * `composer.json`, and plans `update <local names>` (a full
+     * `update` when the main lock is `Missing`).
      *
      * @return array{blocked:bool,command:?ComposerCommand,changes:ConfigChangeSet,snapshotHash:?string,appliedRepositories:?array<int,array<string,mixed>>}
      */
     private function switch_planProdToDev() : array
     {
         $this->console->line1('Switching from PROD to DEV...');
-        $this->addMessage(self::MESSAGE_USING_DEV_CONFIG, 'Using Composer DEV configuration.');
+        $this->addMessage(MessageLevel::Detail, self::MESSAGE_USING_DEV_CONFIG, 'Using Composer DEV configuration.');
 
         $lockStatus = $this->mainFile->getLockFile()->getLockStatus();
 
         if($lockStatus === LockStatus::Stale)
         {
             $this->addMessage(
+                MessageLevel::Warning,
                 self::MESSAGE_PROD_LOCK_OUTDATED,
                 'WARNING: The production lock file is outdated. Run `composer update` (or `update --lock`) before switching to DEV.'
             );
@@ -937,19 +1171,24 @@ class ConfigSwitcher
         $lockExists = $this->mainFile->getLockFile()->exists();
         $lockContent = $lockExists ? $this->mainFile->getLockFile()->getContent() : '';
 
+        $applyResult = DevConfigTransformer::apply($snapshotConfig, $repos, $this->mainFile->getLockFile());
+
+        if($this->switch_reportVersionConflicts($applyResult->getVersionConflicts()))
+        {
+            return $this->switch_blockedPlan();
+        }
+
         // Snapshot the main config and lock into composer-prod.* before
         // rewriting composer.json — composer.lock itself stays the PROD
         // lock throughout the DEV session.
         $this->mainFile->copyTo($this->prodFile);
         $this->mainFile->getLockFile()->tryCopyTo($this->prodFile->getLockFile());
 
-        $applyResult = DevConfigTransformer::apply($snapshotConfig, $repos, $this->mainFile->getLockFile());
-
         $this->mainFile->putData($applyResult->getConfig());
 
         $this->switch_recordVersionDerivations($applyResult->getVersionDerivations());
 
-        $this->addMessage(self::MESSAGE_REBUILT_DEV_CONFIG, 'Rebuilt a fresh DEV `composer.json`.');
+        $this->addMessage(MessageLevel::Detail, self::MESSAGE_REBUILT_DEV_CONFIG, 'Rebuilt a fresh DEV `composer.json`.');
 
         $classifier = DevConfigTransformer::makeOriginClassifier($repos);
         $composerJsonChanges = ConfigDiff::between($snapshotConfig, $applyResult->getConfig(), $classifier);
@@ -957,6 +1196,7 @@ class ConfigSwitcher
         if(!$lockExists)
         {
             $this->addMessage(
+                MessageLevel::Warning,
                 self::MESSAGE_NO_LOCK_FILE_FOUND,
                 'WARNING: No lock file found. Please run `composer update` after switching the config.'
             );
@@ -983,7 +1223,9 @@ class ConfigSwitcher
 
     /**
      * DEV→DEV refresh (`switch-dev`/`switch-update` while already in
-     * DEV): blocked on a modified snapshot; otherwise computes
+     * DEV): blocked on a modified snapshot, or on a conflicting/malformed
+     * `version` override (checked before any write — see
+     * {@see self::switch_reportVersionConflicts()}); otherwise computes
      * `effective = revert(current, snapshot, appliedRepos)` and writes
      * `apply(effective, currentRepos)` only when it differs from the
      * current `composer.json` — no write operation is recorded, and
@@ -994,11 +1236,12 @@ class ConfigSwitcher
     private function switch_planDevRefresh() : array
     {
         $this->console->line1('Already in DEV mode, refreshing config...');
-        $this->addMessage(self::MESSAGE_USING_DEV_CONFIG, 'Using Composer DEV configuration.');
+        $this->addMessage(MessageLevel::Detail, self::MESSAGE_USING_DEV_CONFIG, 'Using Composer DEV configuration.');
 
         if($this->switch_isSnapshotModified())
         {
             $this->addMessage(
+                MessageLevel::Warning,
                 self::MESSAGE_SNAPSHOT_MODIFIED,
                 'WARNING: The production snapshot (`%s`) has been modified since it was taken; switch to PROD and back to DEV to retake it.',
                 $this->prodFile->getBaseName()
@@ -1022,13 +1265,18 @@ class ConfigSwitcher
         $applyResult = DevConfigTransformer::apply($revertResult->getEffectiveConfig(), $currentRepos, $prodLock);
         $newConfig = $applyResult->getConfig();
 
+        if($this->switch_reportVersionConflicts($applyResult->getVersionConflicts()))
+        {
+            return $this->switch_blockedPlan();
+        }
+
         $classifier = DevConfigTransformer::makeOriginClassifier($currentRepos, $revertResult);
         $composerJsonChanges = ConfigDiff::between($current, $newConfig, $classifier);
 
         if(count($composerJsonChanges) > 0)
         {
             $this->mainFile->putData($newConfig);
-            $this->addMessage(self::MESSAGE_REBUILT_DEV_CONFIG, 'Rebuilt a fresh DEV `composer.json`.');
+            $this->addMessage(MessageLevel::Detail, self::MESSAGE_REBUILT_DEV_CONFIG, 'Rebuilt a fresh DEV `composer.json`.');
         }
 
         $this->switch_recordVersionDerivations($applyResult->getVersionDerivations());
@@ -1102,7 +1350,7 @@ class ConfigSwitcher
 
         if($installedState === InstalledState::Matches)
         {
-            $this->addMessage(self::MESSAGE_ALREADY_INSTALLED, 'The switched packages are already installed; nothing to do.');
+            $this->addMessage(MessageLevel::Info, self::MESSAGE_ALREADY_INSTALLED, 'The switched packages are already installed; nothing to do.');
 
             return null;
         }
@@ -1122,11 +1370,12 @@ class ConfigSwitcher
     private function switch_planDevToProd() : array
     {
         $this->console->line1('Switching from DEV to PROD...');
-        $this->addMessage(self::MESSAGE_USING_PROD_CONFIG, 'Using Composer PROD configuration.');
+        $this->addMessage(MessageLevel::Detail, self::MESSAGE_USING_PROD_CONFIG, 'Using Composer PROD configuration.');
 
         if(!$this->prodFile->exists())
         {
             $this->addMessage(
+                MessageLevel::Warning,
                 self::MESSAGE_SNAPSHOT_MISSING,
                 'WARNING: The production snapshot (`%s`) is missing; cannot switch back to PROD safely.',
                 $this->prodFile->getBaseName()
@@ -1138,6 +1387,7 @@ class ConfigSwitcher
         if($this->switch_isSnapshotModified())
         {
             $this->addMessage(
+                MessageLevel::Warning,
                 self::MESSAGE_SNAPSHOT_MODIFIED,
                 'WARNING: The production snapshot (`%s`) has been modified since it was taken.',
                 $this->prodFile->getBaseName()
@@ -1180,6 +1430,7 @@ class ConfigSwitcher
         if($changes->hasPermanentChanges())
         {
             $this->addMessage(
+                MessageLevel::Info,
                 self::MESSAGE_DEV_CHANGES_CARRIED_BACK,
                 'DEV-time edits were carried back into production — keys: [%s], packages: [%s].',
                 implode(', ', $changes->getProdChangedKeys()),
@@ -1195,6 +1446,7 @@ class ConfigSwitcher
             $this->mainFile->getLockFile()->delete();
 
             $this->addMessage(
+                MessageLevel::Warning,
                 self::MESSAGE_PROD_LOCK_MISSING,
                 'WARNING: No production lock backup found. Please run `composer update` after switching the config.'
             );
@@ -1227,7 +1479,7 @@ class ConfigSwitcher
             );
 
             if($installedState === InstalledState::Matches) {
-                $this->addMessage(self::MESSAGE_ALREADY_INSTALLED, 'The production dependencies are already installed; nothing to do.');
+                $this->addMessage(MessageLevel::Info, self::MESSAGE_ALREADY_INSTALLED, 'The production dependencies are already installed; nothing to do.');
                 $command = null;
             } else {
                 $command = new ComposerCommand(array('install'), 'Installing the production dependencies.');
@@ -1253,7 +1505,7 @@ class ConfigSwitcher
     private function switch_planProdToProd() : array
     {
         $this->console->line1('Already in PROD mode.');
-        $this->addMessage(self::MESSAGE_USING_PROD_CONFIG, 'Using Composer PROD configuration.');
+        $this->addMessage(MessageLevel::Detail, self::MESSAGE_USING_PROD_CONFIG, 'Using Composer PROD configuration.');
 
         $installed = $this->switch_installedPackages();
 
@@ -1276,7 +1528,7 @@ class ConfigSwitcher
 
             if($installedState === InstalledState::Matches)
             {
-                $this->addMessage(self::MESSAGE_ALREADY_INSTALLED, 'The production dependencies are already installed; nothing to do.');
+                $this->addMessage(MessageLevel::Info, self::MESSAGE_ALREADY_INSTALLED, 'The production dependencies are already installed; nothing to do.');
                 $command = null;
             }
             else
@@ -1422,6 +1674,7 @@ class ConfigSwitcher
             }
 
             $this->addMessage(
+                MessageLevel::Detail,
                 self::MESSAGE_VERSION_DERIVED,
                 'Package [%s] aliased to version [%s] (source: %s).',
                 $derivation['packageName'],
@@ -1432,12 +1685,43 @@ class ConfigSwitcher
     }
 
     /**
+     * Records a {@see self::MESSAGE_VERSION_OVERRIDE_CONFLICT} warning
+     * for every entry in `$conflicts` (each naming the package, its
+     * pinned override, the constraint it violates, the PROD-locked
+     * version for comparison, the file to fix, and the fix itself),
+     * and reports whether any conflict was found — the caller uses the
+     * return value to block the switch via {@see self::switch_blockedPlan()}
+     * before any file is written.
+     *
+     * @param array<int,array{packageName:string,version:string,constraint:string,section:string,check:\Mistralys\ComposerSwitcher\State\ConstraintCheck,lockedVersion:string|null}> $conflicts
+     */
+    private function switch_reportVersionConflicts(array $conflicts) : bool
+    {
+        foreach($conflicts as $conflict) {
+            $this->addMessage(
+                MessageLevel::Warning,
+                self::MESSAGE_VERSION_OVERRIDE_CONFLICT,
+                'WARNING: The version override [%s] for [%s] does not satisfy its root %s constraint [%s] (PROD-locked version: %s). Fix: edit the override in `%s`, or adjust the root constraint, so the override satisfies it.',
+                $conflict['version'],
+                $conflict['packageName'],
+                $conflict['section'],
+                $conflict['constraint'],
+                $conflict['lockedVersion'] ?? 'unknown',
+                $this->devFile->getBaseName()
+            );
+        }
+
+        return count($conflicts) > 0;
+    }
+
+    /**
      * @param array<int,array{section:string,packageName:string,snapshotValue:mixed,currentValue:mixed}> $overrides
      */
     private function switch_recordOverriddenEntries(array $overrides) : void
     {
         foreach($overrides as $override) {
             $this->addMessage(
+                MessageLevel::Info,
                 self::MESSAGE_MANAGED_ENTRY_OVERRIDDEN,
                 'A manual edit to the managed [%s] entry for [%s] was discarded (restored to the production-aliased value).',
                 $override['section'],
@@ -1503,6 +1787,19 @@ class ConfigSwitcher
     }
 
     /**
+     * The getter matching {@see self::setDisplayMessages()}'s setter —
+     * whether automatic display of the switch messages on the console
+     * is currently enabled. Defaults to `true`. Used by
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner::runSwitch()}
+     * to save and restore this switcher's own setting around its
+     * scoped suppression of the legacy echo channel.
+     */
+    public function isDisplayMessagesEnabled() : bool
+    {
+        return $this->displayMessages;
+    }
+
+    /**
      * Clears the accumulated switch messages. Called at the start
      * of {@see self::switchTo()} so each switch starts with a clean slate.
      *
@@ -1514,13 +1811,16 @@ class ConfigSwitcher
     }
 
     /**
+     * @param MessageLevel $level The message's severity — leads the
+     *        argument list (rather than trailing with a default) because
+     *        `$args` is variadic and must stay last.
      * @param int $code One of the `self::MESSAGE_*` constants.
      * @param string $message
      * @param string|int|float ...$args
      */
-    private function addMessage(int $code, string $message, ...$args) : void
+    private function addMessage(MessageLevel $level, int $code, string $message, ...$args) : void
     {
-        $this->messages[] = new SwitchMessage($code, sprintf($message, ...$args));
+        $this->messages[] = new SwitchMessage($code, sprintf($message, ...$args), $level);
     }
 
     /**

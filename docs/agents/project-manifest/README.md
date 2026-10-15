@@ -1,7 +1,7 @@
 # Project Manifest — Composer Local Switcher
 
 > **Package:** `mistralys/composer-local-switcher`
-> **Version:** 3.0.0
+> **Version:** 3.1.0
 > **License:** MIT
 > **PHP:** >=8.4
 

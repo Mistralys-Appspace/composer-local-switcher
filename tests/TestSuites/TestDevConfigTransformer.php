@@ -4,12 +4,15 @@ declare(strict_types=1);
 
 namespace Mistralys\ComposerSwitcher\TestSuites;
 
+use Mistralys\ComposerSwitcher\State\ConfigChangeOrigin;
+use Mistralys\ComposerSwitcher\State\ConstraintCheck;
 use Mistralys\ComposerSwitcher\State\DevTransformResult;
 use Mistralys\ComposerSwitcher\State\LocalRepository;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\FixtureFileSystem;
 use Mistralys\ComposerSwitcher\Utils\ConfigFile;
 use Mistralys\ComposerSwitcher\Utils\DevConfigTransformer;
 use Mistralys\ComposerSwitcher\Utils\LockFile;
+use Mistralys\ComposerSwitcher\Utils\VersionConstraintChecker;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -195,6 +198,111 @@ final class TestDevConfigTransformer extends TestCase
 
     // endregion
 
+    // region: _Tests - apply() version conflicts
+
+    /**
+     * An explicit override that violates the package's root `require`
+     * constraint is reported in {@see DevTransformResult::getVersionConflicts()},
+     * naming the package, the pinned version, the constraint, the
+     * section it was read from, and the PROD-locked version alongside
+     * it — `apply()` itself does not block; it only reports.
+     */
+    public function test_conflictingOverrideIsReported() : void
+    {
+        $prodConfig = array('name' => 'acme/app', 'require' => array('acme/local-one' => '^2.0'));
+        $repos = array(new LocalRepository('acme/local-one', '../local-one', '1.0.0'));
+        $lock = $this->buildLockFile(array('acme/local-one' => '2.0.0'));
+
+        $result = DevConfigTransformer::apply($prodConfig, $repos, $lock);
+
+        $this->assertTrue($result->hasVersionConflicts());
+
+        $conflicts = $result->getVersionConflicts();
+        $this->assertCount(1, $conflicts);
+        $this->assertSame('acme/local-one', $conflicts[0]['packageName']);
+        $this->assertSame('1.0.0', $conflicts[0]['version']);
+        $this->assertSame('^2.0', $conflicts[0]['constraint']);
+        $this->assertSame('require', $conflicts[0]['section']);
+        $this->assertSame(ConstraintCheck::Violated, $conflicts[0]['check']);
+        $this->assertSame('2.0.0', $conflicts[0]['lockedVersion']);
+    }
+
+    /**
+     * The constraint is read from `require-dev` instead of `require`
+     * when that is where the package is root-required.
+     */
+    public function test_requireDevConstraintIsUsed() : void
+    {
+        $prodConfig = array('name' => 'acme/app', 'require-dev' => array('acme/local-dev' => '^1.0'));
+        $repos = array(new LocalRepository('acme/local-dev', '../local-dev', '9.9.9'));
+        $lock = $this->buildLockFile(array());
+
+        $conflicts = DevConfigTransformer::apply($prodConfig, $repos, $lock)->getVersionConflicts();
+
+        $this->assertCount(1, $conflicts);
+        $this->assertSame('require-dev', $conflicts[0]['section']);
+        $this->assertSame('^1.0', $conflicts[0]['constraint']);
+    }
+
+    /**
+     * A `SOURCE_LOCKED` alias (no explicit override; derived purely
+     * from the PROD lock) is never checked against the root constraint
+     * — it cannot conflict with the constraint that produced it, even
+     * when, hypothetically, it would not satisfy it.
+     */
+    public function test_lockedAliasIsNotChecked() : void
+    {
+        $prodConfig = array('name' => 'acme/app', 'require' => array('acme/local-one' => '^2.0'));
+        $repos = array(new LocalRepository('acme/local-one', '../local-one'));
+        $lock = $this->buildLockFile(array('acme/local-one' => '1.0.0'));
+
+        $result = DevConfigTransformer::apply($prodConfig, $repos, $lock);
+
+        $this->assertSame(DevTransformResult::SOURCE_LOCKED, $result->getVersionDerivations()[0]['source']);
+        $this->assertFalse($result->hasVersionConflicts());
+    }
+
+    /**
+     * With no semver engine available (a `VersionConstraintChecker`
+     * built against a nonexistent class name), every check yields
+     * {@see ConstraintCheck::Unverifiable} — a violating override is
+     * reported as no conflict at all, and `apply()` still applies the
+     * `SOURCE_OVERRIDE` alias as usual.
+     */
+    public function test_unverifiableCheckYieldsNoConflict() : void
+    {
+        $prodConfig = array('name' => 'acme/app', 'require' => array('acme/local-one' => '^2.0'));
+        $repos = array(new LocalRepository('acme/local-one', '../local-one', '1.0.0'));
+        $lock = $this->buildLockFile(array());
+        $checker = new VersionConstraintChecker(semverClass: 'Composer\\Semver\\DoesNotExist');
+
+        $result = DevConfigTransformer::apply($prodConfig, $repos, $lock, $checker);
+
+        $this->assertFalse($result->hasVersionConflicts());
+        $this->assertSame(
+            '1.0.0',
+            $this->findVersionsMap($result->getConfig(), 'acme/local-one')['acme/local-one'] ?? null
+        );
+    }
+
+    /**
+     * A package with no root constraint at all (not declared in
+     * `require`/`require-dev`) has nothing to check an override
+     * against, and is never reported as a conflict.
+     */
+    public function test_notRootRequiredOverrideIsNotChecked() : void
+    {
+        $prodConfig = array('name' => 'acme/app', 'require' => array('php' => '>=8.1'));
+        $repos = array(new LocalRepository('acme/local-one', '../local-one', 'not-a-version'));
+        $lock = $this->buildLockFile(array());
+
+        $result = DevConfigTransformer::apply($prodConfig, $repos, $lock);
+
+        $this->assertFalse($result->hasVersionConflicts());
+    }
+
+    // endregion
+
     // region: _Tests - revert()
 
     /**
@@ -363,6 +471,56 @@ final class TestDevConfigTransformer extends TestCase
         $this->assertCount(1, $withOverride->getOverriddenManagedEntries());
         $this->assertTrue($withOverride->hasOverriddenManagedEntries());
         $this->assertArrayHasKey('require', $withOverride->getEffectiveConfig());
+    }
+
+    public function test_prunedVcsEntryIsLocalSwitch() : void
+    {
+        $snapshotConfig = array(
+            'name' => 'acme/app',
+            'require' => array('acme/local-one' => '^2.0'),
+            'repositories' => array(
+                array('type' => 'vcs', 'url' => 'git@github.com:acme/local-one.git'),
+                array('type' => 'vcs', 'url' => 'git@github.com:acme/unrelated.git')
+            )
+        );
+        $repos = array(new LocalRepository('acme/local-one', '../local-one'));
+        $lock = $this->buildLockFile(array('acme/local-one' => '2.3.0'));
+
+        $devConfig = DevConfigTransformer::apply($snapshotConfig, $repos, $lock)->getConfig();
+        $classifier = DevConfigTransformer::makeOriginClassifier($repos);
+
+        $prunedVcs = $snapshotConfig['repositories'][0];
+        $unrelatedVcs = $snapshotConfig['repositories'][1];
+
+        $this->assertSame(
+            ConfigChangeOrigin::LocalSwitch,
+            $classifier(array('repositories', '0'), $prunedVcs, $devConfig['repositories'][0])
+        );
+        $this->assertSame(
+            ConfigChangeOrigin::LocalSwitch,
+            $classifier(array('repositories', '0'), $prunedVcs, null)
+        );
+        $this->assertSame(
+            ConfigChangeOrigin::CarriedBack,
+            $classifier(array('repositories', '1'), $unrelatedVcs, null)
+        );
+    }
+
+    public function test_movedPackageNotDuplicatedOnRevert() : void
+    {
+        [$snapshotConfig, $repos, $lock] = $this->buildBaselineOne();
+        $base = DevConfigTransformer::apply($snapshotConfig, $repos, $lock)->getConfig();
+
+        // Move the managed package from require to require-dev during DEV.
+        $current = $base;
+        $current['require-dev']['acme/local-one'] = $current['require']['acme/local-one'];
+        unset($current['require']['acme/local-one']);
+
+        $result = DevConfigTransformer::revert($current, $snapshotConfig, $repos, $lock);
+        $effective = $result->getEffectiveConfig();
+
+        $this->assertSame('^2.0', $effective['require']['acme/local-one'] ?? null);
+        $this->assertArrayNotHasKey('acme/local-one', $effective['require-dev']);
     }
 
     // endregion

@@ -10,6 +10,7 @@ use Mistralys\ComposerSwitcher\State\ComposerCommand;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\ComposerSwitcherTestCase;
 use Mistralys\ComposerSwitcher\Tests\TestClasses\ScriptedEventContext;
 use Mistralys\ComposerSwitcher\Utils\ComposerProcess;
+use Mistralys\ComposerSwitcher\Utils\ConfigChangeFormatter;
 use Mistralys\ComposerSwitcher\Utils\OutcomeRenderer;
 use Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner;
 
@@ -112,6 +113,70 @@ final class TestEntryPointEdge extends ComposerSwitcherTestCase
         }
     }
 
+    /**
+     * A failed Composer command prints {@see ConfigSwitcher::MESSAGE_COMPOSER_RECOVERY}
+     * (naming the current mode and both recovery commands) before
+     * {@see ComposerSwitcherException::ERROR_COMPOSER_COMMAND_FAILED}
+     * is thrown — reaching the `catch` block below already proves the
+     * message was written synchronously first, since
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner::runCommand()}
+     * writes it before constructing the exception it throws.
+     */
+    public function test_failedCommandPrintsRecovery() : void
+    {
+        putenv('FAKE_COMPOSER_EXIT_CODE=5');
+
+        [$runner, $context] = $this->createRunnerWithContext(array('--yes'));
+
+        try {
+            $runner->runSwitch(ConfigSwitcher::MODE_DEV);
+            $this->fail('Expected a ComposerSwitcherException to be thrown.');
+        } catch (ComposerSwitcherException $e) {
+            $this->assertSame(ComposerSwitcherException::ERROR_COMPOSER_COMMAND_FAILED, $e->getCode());
+        }
+
+        $this->assertTrue($context->hasWrittenMessageCode(ConfigSwitcher::MESSAGE_COMPOSER_RECOVERY));
+        $this->assertTrue($context->hasWrittenLineContaining('DEV'));
+        $this->assertTrue($context->hasWrittenLineContaining('composer switch-update'));
+        $this->assertTrue($context->hasWrittenLineContaining('composer switch-prod'));
+    }
+
+    /**
+     * The "Running `composer ...`" announcement renders the command via
+     * {@see \Mistralys\ComposerSwitcher\State\ComposerCommand::toDisplayString()} —
+     * plain package names like `mistralys/application_framework` need
+     * no quoting, unlike {@see \Mistralys\ComposerSwitcher\State\ComposerCommand::toShellString()}'s
+     * `escapeshellarg()`-wrapped form.
+     */
+    public function test_commandShownWithoutQuotes() : void
+    {
+        [$runner, $context] = $this->createRunnerWithContext(array('--yes'));
+
+        $runner->runSwitch(ConfigSwitcher::MODE_DEV);
+
+        $line = $this->findLineContaining($context, 'Running `composer');
+
+        $this->assertNotNull($line, 'Expected a "Running `composer ...`" line to have been written.');
+        $this->assertStringNotContainsString("'", $line);
+        $this->assertStringContainsString('composer update', $line);
+    }
+
+    /**
+     * A real, successful switch's executed Composer command is framed
+     * by {@see \Mistralys\ComposerSwitcher\Utils\OutcomeRenderer::renderCommandStart()}
+     * and {@see \Mistralys\ComposerSwitcher\Utils\OutcomeRenderer::renderDone()} —
+     * the latter is this test's "done" footer.
+     */
+    public function test_doneFooterAfterCommand() : void
+    {
+        [$runner, $context] = $this->createRunnerWithContext(array('--yes'));
+
+        $runner->runSwitch(ConfigSwitcher::MODE_DEV);
+
+        $this->assertTrue($context->hasWrittenLineContaining('running `composer'));
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — switch to DEV done'));
+    }
+
     public function test_blockedSwitchThrowsSwitchBlocked() : void
     {
         // Corrupt the main lock's content hash so the main lock is
@@ -139,7 +204,7 @@ final class TestEntryPointEdge extends ComposerSwitcherTestCase
         $runner->runSwitch(ConfigSwitcher::MODE_DEV);
 
         $this->assertFileDoesNotExist($this->recordFile);
-        $this->assertTrue($context->hasWrittenLineContaining('[182224]'));
+        $this->assertTrue($context->hasWrittenMessageCode(ConfigSwitcher::MESSAGE_NESTED_RUN_SKIPPED));
         $this->assertFalse($this->createSwitcher()->getStatus()->exists());
     }
 
@@ -206,6 +271,66 @@ final class TestEntryPointEdge extends ComposerSwitcherTestCase
             } else {
                 putenv('PATH');
             }
+        }
+    }
+
+    /**
+     * `ConfigSwitcher::composerSwitchDev()` (the real static entry
+     * point, not a directly constructed {@see SwitchCommandRunner})
+     * returns `false` — rather than letting a
+     * {@see ComposerSwitcherException} escape — for an explained
+     * failure: here, a blocked switch ({@see ComposerSwitcherException::ERROR_SWITCH_BLOCKED})
+     * from a stale main lock, exactly as {@see self::test_blockedSwitchThrowsSwitchBlocked()}
+     * sets up against the lower-level runner. Covers AC-12.
+     */
+    public function test_entryPointReturnsFalseOnExplainedFailure() : void
+    {
+        $lockPath = $this->testTarget . '/composer.lock';
+        $lockData = json_decode((string)file_get_contents($lockPath), true);
+        $lockData['content-hash'] = 'not-a-real-hash';
+        file_put_contents($lockPath, json_encode($lockData));
+
+        $previousCwd = getcwd();
+        $this->assertNotFalse($previousCwd);
+        chdir($this->testTarget);
+
+        try {
+            ob_start();
+            $result = ConfigSwitcher::composerSwitchDev();
+            $output = (string)ob_get_clean();
+        } finally {
+            chdir($previousCwd);
+        }
+
+        $this->assertFalse($result);
+        $this->assertStringContainsString('ERROR', $output);
+    }
+
+    /**
+     * An exception whose code is not one of the four explained entry
+     * point failures ({@see ComposerSwitcherException::ERROR_DEV_FILE_MISSING},
+     * raised by `switch_requireCurrentLocalRepositories()` when the DEV
+     * config file is missing) still propagates unchanged out of
+     * `ConfigSwitcher::composerSwitchDev()`, proving
+     * {@see ConfigSwitcher::guardEntryPoint()}'s catch block is scoped
+     * to exactly the four codes it documents, not every
+     * `ComposerSwitcherException`. Covers AC-12.
+     */
+    public function test_entryPointPropagatesUnexpectedException() : void
+    {
+        unlink($this->testTarget . '/composer/local-repositories.json');
+
+        $previousCwd = getcwd();
+        $this->assertNotFalse($previousCwd);
+        chdir($this->testTarget);
+
+        try {
+            $this->expectException(ComposerSwitcherException::class);
+            $this->expectExceptionCode(ComposerSwitcherException::ERROR_DEV_FILE_MISSING);
+
+            ConfigSwitcher::composerSwitchDev();
+        } finally {
+            chdir($previousCwd);
         }
     }
 
@@ -315,7 +440,7 @@ final class TestEntryPointEdge extends ComposerSwitcherTestCase
         $context = new ScriptedEventContext($arguments, $interactive, $queuedAnswers);
         $switcher = $this->createSwitcher();
         $process = new ComposerProcess($this->fakeComposerPath());
-        $renderer = new OutcomeRenderer($context);
+        $renderer = new OutcomeRenderer($context, new ConfigChangeFormatter($this->testTarget));
 
         return array(new SwitchCommandRunner($context, $switcher, $process, $renderer), $context);
     }
@@ -323,6 +448,23 @@ final class TestEntryPointEdge extends ComposerSwitcherTestCase
     private function fakeComposerPath() : string
     {
         return __DIR__ . '/../assets/fake-composer/composer.php';
+    }
+
+    /**
+     * The first written line containing `$needle`, or `null` when none
+     * matches — used where a test needs the actual line text (e.g. to
+     * assert on its quoting), not just whether one exists.
+     */
+    private function findLineContaining(ScriptedEventContext $context, string $needle) : ?string
+    {
+        foreach($context->getWrittenLines() as $line)
+        {
+            if(str_contains($line, $needle)) {
+                return $line;
+            }
+        }
+
+        return null;
     }
 
     /**

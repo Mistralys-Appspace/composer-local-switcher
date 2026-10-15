@@ -205,6 +205,77 @@ final class TestEntryPoints extends IntegrationTestCase
         $this->assertSame($before, $after, 'switch-preview-dev must leave every file in the work copy untouched.');
     }
 
+    /**
+     * A real `composer switch-dev -- --yes` run is framed by the
+     * shared "Composer Local Switcher —" header and a "done" footer,
+     * and at default verbosity carries none of the bookkeeping `Detail`
+     * messages (e.g. "Rebuilt a fresh DEV") {@see OutcomeRenderer} only
+     * shows at `-v` — proving the readable-output contract end to end
+     * through the real CLI dispatch path, not only via
+     * {@see ScriptedEventContext} as Tier 1 already covers. Covers
+     * AC-05, AC-06, AC-08.
+     */
+    public function test_switchOutputIsFramedAndNotDuplicated() : void
+    {
+        $this->bootstrapProd();
+
+        $result = $this->runSwitch('switch-dev');
+
+        $this->assertTrue($result->isSuccess(), sprintf(
+            "switch-dev failed unexpectedly.\nOutput:\n%s\nError output:\n%s",
+            $result->getOutput(),
+            $result->getErrorOutput()
+        ));
+
+        $this->assertTrue(
+            $result->containsOutput('Composer Local Switcher — switch to DEV'),
+            "Expected the framed header to be present.\nOutput:\n" . $result->getOutput()
+        );
+
+        $this->assertTrue(
+            $result->containsOutput('Composer Local Switcher — switch to DEV done'),
+            "Expected the done footer to be present.\nOutput:\n" . $result->getOutput()
+        );
+
+        $this->assertFalse(
+            $result->containsOutput('Rebuilt a fresh DEV'),
+            "Expected bookkeeping text to be hidden at default verbosity.\nOutput:\n" . $result->getOutput()
+        );
+
+        $occurrences = substr_count($result->getOutput() . $result->getErrorOutput(), 'Composer Local Switcher — switch to DEV');
+        $this->assertSame(1, $occurrences, 'Expected the switch header to appear exactly once, not duplicated.');
+    }
+
+    /**
+     * The same real `switch-dev` run with `-v` reveals the bookkeeping
+     * `Detail` message ("Rebuilt a fresh DEV") and at least one file
+     * operation line, both suppressed at default verbosity — the `-v`
+     * counterpart to {@see self::test_switchOutputIsFramedAndNotDuplicated()}.
+     * Covers AC-06.
+     */
+    public function test_verboseSwitchShowsDetails() : void
+    {
+        $this->bootstrapProd();
+
+        $result = $this->runComposer('-v', 'switch-dev', '--', '--yes');
+
+        $this->assertTrue($result->isSuccess(), sprintf(
+            "switch-dev -v failed unexpectedly.\nOutput:\n%s\nError output:\n%s",
+            $result->getOutput(),
+            $result->getErrorOutput()
+        ));
+
+        $this->assertTrue(
+            $result->containsOutput('Rebuilt a fresh DEV'),
+            "Expected the bookkeeping Detail message to be shown at -v.\nOutput:\n" . $result->getOutput()
+        );
+
+        $this->assertTrue(
+            $result->containsOutput('would '),
+            "Expected at least one file operation line to be shown at -v.\nOutput:\n" . $result->getOutput()
+        );
+    }
+
     // endregion
 
     // region: Support methods

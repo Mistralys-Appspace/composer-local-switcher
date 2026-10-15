@@ -13,6 +13,7 @@ use Mistralys\ComposerSwitcher\State\ConfigChangeOrigin;
 use Mistralys\ComposerSwitcher\State\DevTransformResult;
 use Mistralys\ComposerSwitcher\State\LocalRepository;
 use Mistralys\ComposerSwitcher\State\RevertResult;
+use Mistralys\ComposerSwitcher\State\ConstraintCheck;
 
 /**
  * Pure transform between a PROD-style `composer.json` and its DEV
@@ -41,6 +42,20 @@ use Mistralys\ComposerSwitcher\State\RevertResult;
  * scratch. Invariant: `revert(apply(P, repos, lock), P, repos, lock)`
  * is value-equal to `P`.
  *
+ * {@see self::apply()} also validates every explicit `version` override
+ * against the package's root constraint via an injected
+ * {@see VersionConstraintChecker}, surfacing a violation in
+ * {@see DevTransformResult::getVersionConflicts()} rather than blocking
+ * here — this class only reports; the caller decides what to do about
+ * a conflict.
+ *
+ * {@see self::makeOriginClassifier()} labels every diff entry with its
+ * {@see \Mistralys\ComposerSwitcher\State\ConfigChangeOrigin}: a stale VCS
+ * repository entry pruned or replaced for a managed package counts as a
+ * LocalSwitch (matched exactly as the pruning does). {@see self::revert()}
+ * identifies a managed package across both `require` and `require-dev`, so
+ * a package moved between sections during DEV is never duplicated.
+ *
  * Arrays in, arrays out: the only I/O is the injected {@see LockFile},
  * used to read the PROD-locked version for the alias — this class
  * itself never touches the filesystem.
@@ -66,13 +81,29 @@ final class DevConfigTransformer
      * repository URL may use either), and is omitted entirely when no
      * alias could be derived.
      *
+     * Also validates every `SOURCE_OVERRIDE` alias against the
+     * package's root `require`/`require-dev` constraint (read from
+     * `$prodConfig` before this call's own rewrite of that same key),
+     * using `$checker` — a violating or unparseable alias is recorded
+     * in the result's {@see DevTransformResult::getVersionConflicts()}
+     * instead of blocking here; the caller decides what a conflict
+     * means (e.g. {@see \Mistralys\ComposerSwitcher\ConfigSwitcher}
+     * blocks the switch before any write). A `SOURCE_LOCKED` alias is
+     * never checked — it was derived from the same lock the constraint
+     * itself targets, so it cannot conflict with it. A package with no
+     * root constraint at all (not declared in `require`/`require-dev`)
+     * has nothing to check against and is also skipped.
+     *
      * @param array<string,mixed> $prodConfig The PROD-style `composer.json` data (the snapshot, or `composer-prod.json`'s data).
      * @param LocalRepository[] $repos
      */
-    public static function apply(array $prodConfig, array $repos, LockFile $prodLock) : DevTransformResult
+    public static function apply(array $prodConfig, array $repos, LockFile $prodLock, ?VersionConstraintChecker $checker = null) : DevTransformResult
     {
+        $checker ??= new VersionConstraintChecker();
+
         $config = $prodConfig;
         $versionDerivations = array();
+        $versionConflicts = array();
 
         foreach($repos as $repo) {
             $packageName = $repo->getPackageName();
@@ -87,6 +118,25 @@ final class DevConfigTransformer
 
             $requireKey = isset($config['require-dev'][$packageName]) ? 'require-dev' : 'require';
             $rootRequired = isset($config['require'][$packageName]) || isset($config['require-dev'][$packageName]);
+
+            if($source === DevTransformResult::SOURCE_OVERRIDE && $alias !== null && $rootRequired) {
+                $constraint = $config[$requireKey][$packageName];
+
+                if(is_string($constraint)) {
+                    $check = $checker->check($alias, $constraint);
+
+                    if($check->blocks()) {
+                        $versionConflicts[] = array(
+                            'packageName' => $packageName,
+                            'version' => $alias,
+                            'constraint' => $constraint,
+                            'section' => $requireKey,
+                            'check' => $check,
+                            'lockedVersion' => $prodLock->getLockedVersion($packageName)
+                        );
+                    }
+                }
+            }
 
             if(!($rootRequired && $alias !== null)) {
                 $config[$requireKey][$packageName] = '*';
@@ -105,7 +155,7 @@ final class DevConfigTransformer
             );
         }
 
-        return new DevTransformResult($config, $versionDerivations);
+        return new DevTransformResult($config, $versionDerivations, $versionConflicts);
     }
 
     /**
@@ -169,13 +219,22 @@ final class DevConfigTransformer
             }
         }
 
+        // A managed package is identified by its presence in the base of
+        // EITHER section, so one moved between require and require-dev
+        // during DEV is still recognised as managed in its new section.
+        $managedInBase = array_values(array_filter(
+            $managedPackageNames,
+            static fn(string $name) : bool => array_key_exists($name, self::sectionOf($base, 'require'))
+                || array_key_exists($name, self::sectionOf($base, 'require-dev'))
+        ));
+
         foreach(array('require', 'require-dev') as $section) {
             [$sectionResult, $sectionOverrides] = self::revertSection(
                 $section,
                 self::sectionOf($devConfig, $section),
                 self::sectionOf($base, $section),
                 self::sectionOf($snapshotConfig, $section),
-                $managedPackageNames
+                $managedInBase
             );
 
             if(count($sectionResult) > 0 || array_key_exists($section, $snapshotConfig)) {
@@ -250,7 +309,13 @@ final class DevConfigTransformer
             if(($path[0] ?? null) === ConfigSwitcher::KEY_REPOSITORIES) {
                 $entry = $after ?? $before;
 
-                if(is_array($entry) && self::isManagedRepositoryEntry($entry, $managedPaths)) {
+                if(
+                    is_array($entry)
+                    && (
+                        self::isManagedRepositoryEntry($entry, $managedPaths)
+                        || self::isPrunableRepositoryEntry($entry, $managedPackageNames)
+                    )
+                ) {
                     return ConfigChangeOrigin::LocalSwitch;
                 }
             }
@@ -334,13 +399,7 @@ final class DevConfigTransformer
                 continue;
             }
 
-            if(
-                !self::urlMatchesPackageName($repository['url'], $packageName)
-                &&
-                // GitHub repository URLs use hyphens instead of underscores.
-                // The package name may use either.
-                !self::urlMatchesPackageName($repository['url'], str_replace('_', '-', $packageName))
-            ) {
+            if(!self::repositoryUrlMatchesPackage($repository['url'], $packageName)) {
                 continue;
             }
 
@@ -359,6 +418,38 @@ final class DevConfigTransformer
         $repositories[] = $repoEntry;
 
         return $repositories;
+    }
+
+    /**
+     * Whether a repository URL refers to the package, accepting both
+     * the underscore and hyphen spellings (GitHub URLs use hyphens;
+     * the package name may use either).
+     */
+    private static function repositoryUrlMatchesPackage(string $url, string $packageName) : bool
+    {
+        return self::urlMatchesPackageName($url, $packageName)
+            || self::urlMatchesPackageName($url, str_replace('_', '-', $packageName));
+    }
+
+    /**
+     * Whether `$entry` is a repository entry `mergeRepositoryEntry()`
+     * would replace or prune for one of the managed packages.
+     *
+     * @param string[] $managedPackageNames
+     */
+    private static function isPrunableRepositoryEntry(mixed $entry, array $managedPackageNames) : bool
+    {
+        if(!is_array($entry) || !is_string($entry['url'] ?? null)) {
+            return false;
+        }
+
+        foreach($managedPackageNames as $packageName) {
+            if(self::repositoryUrlMatchesPackage($entry['url'], $packageName)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -396,7 +487,7 @@ final class DevConfigTransformer
      * @param array<string,mixed> $current
      * @param array<string,mixed> $base
      * @param array<string,mixed> $snapshot
-     * @param string[] $managedPackageNames
+     * @param string[] $managedPackageNames Managed packages present in the base of either section (see {@see self::revert()}), so a package moved between sections is never duplicated.
      * @return array{0:array<string,mixed>,1:array<int,array{section:string,packageName:string,snapshotValue:mixed,currentValue:mixed}>}
      */
     private static function revertSection(string $section, array $current, array $base, array $snapshot, array $managedPackageNames) : array
@@ -405,7 +496,7 @@ final class DevConfigTransformer
         $overridden = array();
 
         foreach(self::unionKeys($current, $base, $snapshot) as $packageName) {
-            $isManagedHere = in_array($packageName, $managedPackageNames, true) && array_key_exists($packageName, $base);
+            $isManagedHere = in_array($packageName, $managedPackageNames, true);
 
             if($isManagedHere) {
                 if(array_key_exists($packageName, $snapshot)) {

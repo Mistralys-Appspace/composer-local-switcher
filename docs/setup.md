@@ -186,6 +186,10 @@ To work around this, or to pin the package to a version other than what is locke
 
 The repository is still loaded as a path repository, but the specified version is used whenever Composer needs to resolve the package version, taking precedence over the locked-version alias.
 
+**An explicit pin must satisfy the constraint your `composer.json` declares for the package** (in `require`, or `require-dev`). Before a `switch-dev` or `switch-update` writes anything, the switcher checks every pin against that constraint. If a pin does not satisfy it (for example `1.0.4` against `^3.0.0`), or is not a version Composer can parse, the switch is blocked: nothing is written, the command exits non-zero, and the message names the package, the pin, the constraint, and the version your production lock holds. `composer switch-describe` lists the same conflict as a warning. To resolve it, remove the `version` key or set one that matches the constraint. A pin of the `dev-*` / `*-dev` form that the check cannot prove malformed is not blocked, and neither is a pin when Composer's semver library is unavailable (only the case when the library is used outside a Composer script).
+
+Prefer **no pin**: the derived, locked version always satisfies the constraints production already resolved, so it can never go stale. A pin left in place after the constraint moves on is exactly what this check exists to catch.
+
 ## Vendor dependencies in attached projects
 
 A drawback of attaching local packages using path repositories is that the vendor dependencies of the attached packages are included in the IDE's class index. This causes duplicate class messages, and clicking on a class may not open the file you expect.

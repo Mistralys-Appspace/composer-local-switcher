@@ -11,6 +11,7 @@ use Mistralys\ComposerSwitcher\State\ConfigChangeSet;
 use Mistralys\ComposerSwitcher\State\FileOperation;
 use Mistralys\ComposerSwitcher\State\InstalledState;
 use Mistralys\ComposerSwitcher\State\LockStatus;
+use Mistralys\ComposerSwitcher\State\MessageLevel;
 use Mistralys\ComposerSwitcher\State\SwitchDescription;
 use Mistralys\ComposerSwitcher\State\SwitchMessage;
 use Mistralys\ComposerSwitcher\State\SwitchOutcome;
@@ -33,7 +34,36 @@ final class TestStateValueObjects extends TestCase
         $this->assertSame('WARNING: No lock file found.', $message->getText());
         $this->assertSame('WARNING: No lock file found.', (string)$message);
         $this->assertSame(
-            array('code' => 182201, 'text' => 'WARNING: No lock file found.'),
+            array('code' => 182201, 'text' => 'WARNING: No lock file found.', 'level' => 'info'),
+            $message->toArray()
+        );
+    }
+
+    /**
+     * {@see SwitchMessage::getLevel()} defaults to {@see MessageLevel::Info}
+     * when the constructor's third argument is omitted — the behavior
+     * every pre-existing `new SwitchMessage(...)` call site in the
+     * codebase (and its own earlier two-argument tests) relies on.
+     */
+    public function test_switchMessage_levelDefaultsToInfo() : void
+    {
+        $message = new SwitchMessage(1, 'Has no explicit level');
+
+        $this->assertSame(MessageLevel::Info, $message->getLevel());
+    }
+
+    /**
+     * An explicit {@see MessageLevel} passed to the constructor is
+     * reported unchanged by both {@see SwitchMessage::getLevel()} and
+     * {@see SwitchMessage::toArray()}.
+     */
+    public function test_switchMessage_explicitLevelIsReported() : void
+    {
+        $message = new SwitchMessage(182201, 'WARNING: No lock file found.', MessageLevel::Warning);
+
+        $this->assertSame(MessageLevel::Warning, $message->getLevel());
+        $this->assertSame(
+            array('code' => 182201, 'text' => 'WARNING: No lock file found.', 'level' => 'warning'),
             $message->toArray()
         );
     }
@@ -458,6 +488,60 @@ final class TestStateValueObjects extends TestCase
         $command = new ComposerCommand(array(), 'Nothing to run.');
 
         $this->assertSame('', $command->toShellString());
+    }
+
+    /**
+     * Plain arguments (no whitespace, no shell metacharacters) are
+     * rendered bare — no quoting noise for the common case.
+     */
+    public function test_composerCommand_toDisplayStringRendersPlainArgumentsBare() : void
+    {
+        $command = new ComposerCommand(array('update', 'vendor/pkg'), 'Refreshing the lock file.');
+
+        $this->assertSame('update vendor/pkg', $command->toDisplayString());
+    }
+
+    /**
+     * An argument containing whitespace or a shell metacharacter is
+     * quoted; a plain argument alongside it is not — `toDisplayString()`
+     * quotes only where it is needed to read unambiguously.
+     */
+    public function test_composerCommand_toDisplayStringQuotesOnlyArgumentsThatNeedIt() : void
+    {
+        $command = new ComposerCommand(
+            array('update', 'vendor/with a space', '--with=foo/bar:1.0.0', 'foo;bar'),
+            'Partial update.'
+        );
+
+        $this->assertSame(
+            "update 'vendor/with a space' --with=foo/bar:1.0.0 'foo;bar'",
+            $command->toDisplayString()
+        );
+    }
+
+    /**
+     * `toDisplayString()`'s quoting is independent of {@see ComposerCommand::toShellString()}'s
+     * `escapeshellarg()`-based escaping — the same command renders
+     * differently through each, and `toShellString()`'s own behavior is
+     * unaffected by `toDisplayString()` existing alongside it.
+     */
+    public function test_composerCommand_toShellStringUnaffectedByToDisplayString() : void
+    {
+        $command = new ComposerCommand(array('update', 'vendor/with a space'), 'Partial update.');
+
+        $this->assertSame(
+            implode(' ', array(escapeshellarg('update'), escapeshellarg('vendor/with a space'))),
+            $command->toShellString()
+        );
+
+        $this->assertSame("update 'vendor/with a space'", $command->toDisplayString());
+    }
+
+    public function test_composerCommand_toDisplayStringWithNoArguments() : void
+    {
+        $command = new ComposerCommand(array(), 'Nothing to run.');
+
+        $this->assertSame('', $command->toDisplayString());
     }
 
     // endregion

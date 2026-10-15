@@ -10,7 +10,8 @@ namespace Mistralys\ComposerSwitcher\State;
 
 /**
  * Immutable value object representing a single switch message,
- * pairing free-form text with an optional numeric message code.
+ * pairing free-form text with an optional numeric message code and a
+ * {@see MessageLevel} severity.
  *
  * A code of `0` is treated as "no code" — see {@see self::hasCode()}.
  *
@@ -21,7 +22,8 @@ final class SwitchMessage
 {
     public function __construct(
         private readonly int $code,
-        private readonly string $text
+        private readonly string $text,
+        private readonly MessageLevel $level = MessageLevel::Info
     )
     {
     }
@@ -34,6 +36,11 @@ final class SwitchMessage
     public function getText() : string
     {
         return $this->text;
+    }
+
+    public function getLevel() : MessageLevel
+    {
+        return $this->level;
     }
 
     /**
@@ -51,13 +58,14 @@ final class SwitchMessage
     }
 
     /**
-     * @return array{code:int,text:string}
+     * @return array{code:int,text:string,level:string}
      */
     public function toArray() : array
     {
         return [
             'code' => $this->code,
-            'text' => $this->text
+            'text' => $this->text,
+            'level' => $this->level->value
         ];
     }
 }

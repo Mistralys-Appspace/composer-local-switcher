@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Mistralys\ComposerSwitcher\Tests\TestClasses;
 
+use Mistralys\ComposerSwitcher\State\MessageLevel;
 use Mistralys\ComposerSwitcher\Utils\EventContext;
 
 /**
@@ -15,8 +16,11 @@ use Mistralys\ComposerSwitcher\Utils\EventContext;
  * in-prompt callback (fired from inside `confirm()`, letting a test
  * edit a file "while the user is being asked" — the
  * applied-equals-confirmed property this plan's second preview
- * guards against), and every `write()`/`writeMessage()` line captured
- * in order instead of echoed.
+ * guards against), every `write()`/`writeMessage()` line captured in
+ * order instead of echoed, and every `writeMessage()` call's
+ * `(code, text, level)` captured separately as structured data — no
+ * recording hook was added to production {@see EventContext} for this;
+ * this double simply overrides the public, non-`final` `writeMessage()`.
  *
  * Extends {@see EventContext} (not final, exactly for this purpose)
  * rather than implementing a separate interface, so it can be passed
@@ -36,6 +40,11 @@ final class ScriptedEventContext extends EventContext
     private array $writtenLines = array();
 
     /**
+     * @var array<int,array{code:int,text:string,level:MessageLevel}>
+     */
+    private array $writtenMessages = array();
+
+    /**
      * @var bool[]
      */
     private array $queuedAnswers;
@@ -50,8 +59,16 @@ final class ScriptedEventContext extends EventContext
      * @param bool[] $queuedAnswers Answers returned by successive
      *        `confirm()` calls, in order. When exhausted, `confirm()`
      *        falls back to the `$default` it was called with.
+     * @param bool $verbose Overrides {@see EventContext::isVerbose()} —
+     *        lets a test drive the `[code]`-prefix gating in
+     *        {@see EventContext::writeMessage()} without a duck-typed IO.
      */
-    public function __construct(array $arguments = array(), private readonly bool $interactive = true, array $queuedAnswers = array())
+    public function __construct(
+        array $arguments = array(),
+        private readonly bool $interactive = true,
+        array $queuedAnswers = array(),
+        private readonly bool $verbose = false
+    )
     {
         parent::__construct($arguments, null);
 
@@ -61,6 +78,11 @@ final class ScriptedEventContext extends EventContext
     public function isInteractive() : bool
     {
         return $this->interactive;
+    }
+
+    public function isVerbose() : bool
+    {
+        return $this->verbose;
     }
 
     public function confirm(string $question, bool $default) : bool
@@ -84,6 +106,19 @@ final class ScriptedEventContext extends EventContext
     public function write(string $line) : void
     {
         $this->writtenLines[] = $line;
+    }
+
+    /**
+     * Records `(code, text, level)` as structured data, then delegates
+     * to {@see EventContext::writeMessage()} so the line still reaches
+     * {@see self::write()} (and therefore {@see self::getWrittenLines()})
+     * exactly as it would for a real IO.
+     */
+    public function writeMessage(int $code, string $text, MessageLevel $level = MessageLevel::Info) : void
+    {
+        $this->writtenMessages[] = array('code' => $code, 'text' => $text, 'level' => $level);
+
+        parent::writeMessage($code, $text, $level);
     }
 
     /**
@@ -133,5 +168,31 @@ final class ScriptedEventContext extends EventContext
         }
 
         return false;
+    }
+
+    /**
+     * Whether `writeMessage()` was called with `$code` at any point —
+     * a stable assertion channel that does not depend on the `[code]`
+     * prefix's verbosity gating, unlike inspecting written lines.
+     */
+    public function hasWrittenMessageCode(int $code) : bool
+    {
+        foreach($this->writtenMessages as $message)
+        {
+            if($message['code'] === $code)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @return array<int,array{code:int,text:string,level:MessageLevel}>
+     */
+    public function getWrittenMessages() : array
+    {
+        return $this->writtenMessages;
     }
 }

@@ -555,47 +555,84 @@ final class TestSwitching extends ComposerSwitcherTestCase
     }
 
     /**
-     * `DevConfigTransformer::apply()` writes the `version` field from
-     * a local repository entry into the path repository's
-     * `options.versions` alias verbatim — no validation of the version
-     * string happens there, so a malformed value is the caller's
-     * responsibility. The root `require` constraint, however, is no
-     * longer overwritten with that literal value: since the package
-     * is already root-required in the PROD baseline (`>=3.1.9`) and an
-     * alias was derived (the override), the constraint is kept from
-     * PROD — aliasing the symlinked package to the override is what
-     * satisfies it, rather than replacing it outright. This
-     * characterises that the switcher itself never rejects or
-     * silently corrects a malformed override, while also no longer
-     * needing to loosen the root constraint to accommodate one.
+     * A malformed `version` override ({@see \Mistralys\ComposerSwitcher\State\ConstraintCheck::Invalid})
+     * for `mistralys/application-utils` (root constraint `>=3.1.9`)
+     * blocks the PROD→DEV switch entirely, before any file is written:
+     * `composer.json` stays byte-identical to its pre-switch content,
+     * and no `composer-prod.*` snapshot is created — the switcher no
+     * longer silently writes a malformed override verbatim and lets
+     * `composer update` fail mid-switch on it.
      */
-    public function test_malformedVersionIsWrittenVerbatim() : void
+    public function test_malformedOverrideBlocks() : void
     {
-        $malformedVersion = 'not-a-version';
+        $this->setVersionOverride('mistralys/application-utils', 'not-a-version');
 
-        $devFile = new ConfigFile($this->testTarget . '/composer/local-repositories.json');
-        $devConfig = $devFile->getData();
+        $switcher = $this->createSwitcher();
+        $mainContentBefore = file_get_contents($switcher->getMainFile()->getPath());
 
-        foreach($devConfig['local-repositories'] as &$repo)
-        {
-            if($repo['package-name'] === 'mistralys/application-utils') {
-                $repo['version'] = $malformedVersion;
-            }
-        }
-        unset($repo);
+        $outcome = $switcher->switchToDevelopment();
 
-        $devFile->putData($devConfig);
+        $this->assertTrue($outcome->isBlocked());
+        $this->assertSame($mainContentBefore, file_get_contents($switcher->getMainFile()->getPath()));
+        $this->assertFalse($switcher->getProdFile()->exists());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_VERSION_OVERRIDE_CONFLICT,
+            $this->getMessageCodes($switcher)
+        );
+    }
 
+    /**
+     * A `version` override that parses fine but does not satisfy the
+     * package's root constraint ({@see \Mistralys\ComposerSwitcher\State\ConstraintCheck::Violated})
+     * blocks the PROD→DEV switch exactly like a malformed one — no
+     * file is written, no `composer-prod.*` snapshot is created, and
+     * the warning names the package, the pinned version and the
+     * constraint it violates.
+     */
+    public function test_conflictingOverrideBlocksProdToDev() : void
+    {
+        $this->setVersionOverride('mistralys/application-utils', '2.0.0');
+
+        $switcher = $this->createSwitcher();
+        $mainContentBefore = file_get_contents($switcher->getMainFile()->getPath());
+
+        $outcome = $switcher->switchToDevelopment();
+
+        $this->assertTrue($outcome->isBlocked());
+        $this->assertSame($mainContentBefore, file_get_contents($switcher->getMainFile()->getPath()));
+        $this->assertFalse($switcher->getProdFile()->exists());
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_VERSION_OVERRIDE_CONFLICT,
+            $this->getMessageCodes($switcher)
+        );
+    }
+
+    /**
+     * The same conflict, introduced only after a successful DEV switch
+     * (so the DEV→DEV refresh path — {@see ConfigSwitcher::switchUpdate()}
+     * while already in DEV — is what must block it, not the
+     * PROD→DEV path): editing `local-repositories.json` to pin a
+     * conflicting version and refreshing blocks the switch, with
+     * `composer.json` left exactly as the successful DEV switch wrote
+     * it.
+     */
+    public function test_conflictingOverrideBlocksDevRefresh() : void
+    {
         $switcher = $this->createSwitcher();
         $switcher->switchToDevelopment();
 
-        $config = $switcher->getMainFile()->getData();
+        $this->setVersionOverride('mistralys/application-utils', '2.0.0');
 
-        $this->assertSame('>=3.1.9', $config['require']['mistralys/application-utils'] ?? null);
+        $mainContentBefore = file_get_contents($switcher->getMainFile()->getPath());
 
-        $versions = $this->findVersionsForPackage($config, 'mistralys/application-utils');
+        $outcome = $switcher->switchUpdate();
 
-        $this->assertSame($malformedVersion, $versions['mistralys/application-utils'] ?? null);
+        $this->assertTrue($outcome->isBlocked());
+        $this->assertSame($mainContentBefore, file_get_contents($switcher->getMainFile()->getPath()));
+        $this->assertContains(
+            ConfigSwitcher::MESSAGE_VERSION_OVERRIDE_CONFLICT,
+            $this->getMessageCodes($switcher)
+        );
     }
 
     /**
@@ -794,6 +831,26 @@ final class TestSwitching extends ComposerSwitcherTestCase
     // endregion
 
     // region: Support methods
+
+    /**
+     * Sets (or replaces) the `version` override for `$packageName` in
+     * the fixture's `local-repositories.json`.
+     */
+    private function setVersionOverride(string $packageName, string $version) : void
+    {
+        $devFile = new ConfigFile($this->testTarget . '/composer/local-repositories.json');
+        $devConfig = $devFile->getData();
+
+        foreach($devConfig['local-repositories'] as &$repo)
+        {
+            if($repo['package-name'] === $packageName) {
+                $repo['version'] = $version;
+            }
+        }
+        unset($repo);
+
+        $devFile->putData($devConfig);
+    }
 
     /**
      * @return int[]

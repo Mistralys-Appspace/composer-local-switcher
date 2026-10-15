@@ -32,6 +32,10 @@ list of consumer repositories):
 5. **Drop the `version` override** from each entry in `local-repositories.json`, unless you deliberately
    want to pin a package to a version other than the one your production lock file already resolved for
    it. Under 3.0.0 the alias is derived automatically from `composer.lock`, so the override is optional.
+   A pin left over from 2.x (e.g. `1.0.4` while `composer.json` now requires `^3.0.0`) is detected: since
+   3.1.0 `switch-dev`/`switch-update` block before writing anything, name the package, the pin, the
+   constraint and the locked version, and exit non-zero. Remove the `version` key (or set one matching
+   the constraint) and run the switch again.
 6. **Raise the version constraint** on `mistralys/composer-local-switcher` in your `composer.json` to
    `^3.0`.
 7. **Re-run the hook installer** so the bundled pre-commit hook is reinstalled from the updated

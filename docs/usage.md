@@ -37,22 +37,57 @@ If `composer.json`'s lock file is missing (for example right after cloning the p
 
 ## What you will be asked to confirm
 
-Every entry point above prints the full set of `composer.json` changes it would make, and the
-Composer command it plans to run next, before writing anything:
+Every switch entry point above starts by showing what it plans to do. Every block the switcher
+prints begins with a header line starting with `Composer Local Switcher —`, so its output is easy to
+tell apart from Composer's own. The first block is the plan: a dry-run preview of the switch, which
+is why its header says nothing will be changed yet. It lists the full set of `composer.json`
+changes, any warnings, and the Composer command the switch plans to run next. Only then does it
+ask:
 
 ```text
-composer.json changes:
-  require › vendor/package-name: changed "^2.0" -> "*" [version]
-Permanent production changes:
-  require › vendor/other-package: removed "^1.0" [permanent]
-Planned command: composer update vendor/package-name (local repository added)
-Apply these changes and run `composer update vendor/package-name`? [no]
+Composer Local Switcher — preview of switch to DEV (nothing will be changed)
+composer.json changes (1):
+  local path `../package-name` for `vendor/package-name` (symlinked, as version `1.4.2` from `options.versions`)
+Would run: composer update vendor/package-name (Installing the switched local packages at their aliased versions.)
+Apply these changes and run `composer update vendor/package-name`? [yes]
 ```
 
-Each changed entry carries a marker: `[version]` for a require/require-dev constraint or a path
-repository's version alias, `[permanent]` for a DEV-time edit being carried back into production,
-and `[discarded]` for a DEV edit to a managed (local package) entry that is being reset instead of
-kept. A switch with no `composer.json` change at all (e.g. a PROD→PROD refresh) never prompts.
+Each change is one readable line, described by its shape:
+
+- a path repository reads as `local path <path> for <package> (symlinked, as version <alias> from <source>)`;
+- any other repository reads as `<type> repository <url>`;
+- a `require`/`require-dev` constraint reads as `<section> › <package>: <before> → <after>`;
+- a scalar setting reads as `<path>: <before> → <after>`;
+- anything else falls back to compact, truncated JSON.
+
+Paths inside or next to the project are shown relative to it (`./…`, `../…`). A path repository's
+version alias already reads as a version change, so there is no separate `[version]` marker. A
+`[permanent]` marker is added for a DEV-time edit being carried back into production, and
+`[discarded]` for a DEV edit to a managed (local package) entry that is being reset instead of kept.
+A switch with no `composer.json` change at all (e.g. a PROD→PROD refresh) never prompts.
+
+After you confirm, the switcher frames the Composer run it executes for you with a start line and
+either a `switch to DEV done` footer or a failure block:
+
+```text
+Composer Local Switcher — running `composer update vendor/package-name`
+  Installing the switched local packages at their aliased versions.
+...Composer's own output...
+Composer Local Switcher — switch to DEV done
+```
+
+### Verbose output
+
+By default, only the headers, the change set, warnings, and the planned command are shown. Run
+Composer with `-v` to also see each file operation (`would <type>: <source> -> <target> (<reason>)`)
+and the switcher's bookkeeping messages. At `-v`, a bookkeeping message carries its numeric `[code]`
+prefix; at default verbosity it is hidden entirely, and no machine code is printed anywhere.
+
+```bash
+composer -v switch-dev
+```
+
+### Confirmation defaults and non-interactive runs
 
 The confirmation defaults to **no** whenever a `[permanent]` or `[discarded]` marker is shown, and
 to **yes** otherwise. Declining writes nothing and exits `0`.
@@ -65,7 +100,8 @@ composer switch-dev -- --yes
 ```
 
 Without `--yes`, a non-interactive run prints the changes, then refuses with an error instead of
-guessing - nothing is written. Read the printed change set before passing `--yes`.
+guessing - nothing is written, and the command exits non-zero. Read the printed change set before
+passing `--yes`.
 
 Other flags accepted the same way:
 
@@ -78,6 +114,41 @@ Internally, the switch previews the change twice - once to show you, once right 
 and compares the two; if anything changed in between (e.g. a concurrent edit), it refuses to write
 and asks you to re-run the switch instead of applying something you never saw.
 
+### When a switch is blocked
+
+A switch can be blocked by a precondition, for example an outdated production lock file, a modified
+DEV snapshot, or a `version` override in `local-repositories.json` that cannot satisfy the
+package's constraint in `composer.json` (such as a pin left over from an older release). A blocked
+switch writes nothing, and the command exits non-zero with the reason printed. For a conflicting
+pin:
+
+```text
+Composer Local Switcher — preview of switch to DEV (nothing will be changed)
+  ! WARNING: The version override [1.0.4] for [vendor/package-name] does not satisfy its root require constraint [^3.0.0] (PROD-locked version: 3.0.0). Fix: edit the override in `local-repositories.json`, or adjust the root constraint, so the override satisfies it.
+ERROR: The switch is blocked by a precondition (see the messages above).
+```
+
+The remedy is the one the message names: remove the `version` key (the PROD-locked version is then
+used) or change it to a version that satisfies the constraint, then run the switch again. The same
+conflict is listed as a warning by `composer switch-describe`, so you can spot it before you switch.
+A malformed pin (one Composer's semver parser rejects) is blocked the same way. A `dev-*` or
+`*-dev` pin that the check cannot prove malformed is not blocked.
+
+### When the Composer command fails
+
+If the Composer command the switch runs exits non-zero, the config has already been switched, and
+is not rolled back automatically (Composer may already have written a new lock file). The switcher
+prints a failure block, then a recovery hint naming the mode the project is now in:
+
+```text
+Composer Local Switcher — composer command failed (exit code 2)
+  `composer update vendor/package-name`: Installing the switched local packages at their aliased versions.
+WARNING: The switch to DEV did not finish — the Composer command above failed, so `composer.json` may not match what is installed. Fix the underlying issue, then run `composer switch-update` to retry, or `composer switch-prod` to fall back to production.
+```
+
+Fix the cause, then run `composer switch-update` to retry, or `composer switch-prod` to return to
+production. The command exits non-zero, with no PHP stack trace.
+
 ## Previewing a switch
 
 ```bash
@@ -87,7 +158,7 @@ composer switch-preview-prod
 
 A preview runs the same code path as a real switch, but never touches disk: every file stays byte-identical and every modification time stays unchanged. The planned operations match what a real switch from the same starting state would perform, even from the `INITIAL` state where `composer-prod.json` does not exist yet.
 
-Each planned file operation is printed as `would <type>: <source> -> <target> (<reason>)`, followed by the same messages a real switch would display.
+A preview prints the same header, change set, and planned-command line a real switch's plan does (the command line is labelled `Would run:` in a preview), under the same `-v` gating described [above](#verbose-output): at default verbosity, each planned file operation (`would <type>: <source> -> <target> (<reason>)`) and the switcher's bookkeeping messages are hidden, visible only with `-v`.
 
 ## Inspecting switcher state
 

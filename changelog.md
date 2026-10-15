@@ -1,5 +1,26 @@
 # Changelog
 
+## v3.1.0 - Readable switching output (Minor)
+
+**Switch commands now print clear, framed console output and block unsafe version pins.**
+A switch is stopped before anything is written when a leftover `version` override, such as an
+old 2.x pin, cannot satisfy the package's root constraint. Failed switches now exit non-zero with
+the reason printed, plus a hint on how to recover.
+
+- Switching: Switch commands now print readable, framed console output.
+- Switching: Added a check that blocks a switch on an unsatisfiable version override (182230).
+- Switching: Added a recovery hint after a failed switch (182231).
+- Switching: Failures now exit non-zero and print the reason.
+- Switching: `-v` now shows file-operation details.
+- Switching: Fixed duplicate messages in the output.
+- Switching: Fixed a first DEV switch wrongly marking a pruned VCS repository as `[permanent]`.
+- Switching: Fixed a package moved between `require` and `require-dev` being duplicated on `switch-prod`.
+- API: Added message severity levels, readable on every switch message.
+- API: Dev transform results now report version conflicts.
+- API: Composer commands can now be rendered as display strings.
+- API: Switch entry points now return a success flag.
+- Composer: Added `composer/semver` as a dev dependency.
+
 ## v3.0.0 - A single source of truth (Breaking-M)
 
 **The production config no longer needs to be maintained by hand.**
