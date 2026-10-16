@@ -1,62 +1,26 @@
 # Changelog
 
-## v3.3.0 - Moved packages reported once (Minor)
-
-**A managed package moved between `require` and `require-dev` during a DEV session is now reported once, as a move.**
-Previously the same package could be reported as an override in both sections when reverting. A
-new value object makes this move explicit, and project-root handling has been consolidated.
-
-- Switching: A moved managed package is now reported once, as a move.
-- API: Added `State\ManagedEntryOverride` and `RevertResult::getOverrides()`; deprecated
-  `getOverriddenManagedEntries()`.
-- API: `RevertResult`'s constructor now takes `ManagedEntryOverride[]`. It is only produced by
-  `DevConfigTransformer::revert()`; code that reads a `RevertResult` is unaffected.
-- Internal: Consolidated project-root derivation.
-- Tests: Added Tier 1 and Tier 2 coverage.
-
-## v3.2.0 - Switch output matches the plan (Minor)
-
-**A real switch's console output now matches the layout the v3.1.0 release promised.**
-Real `switch-dev`/`switch-prod`/`switch-update` runs no longer show preview wording, name the
-transition in the header (`PROD → DEV`, `refresh DEV`), and always close with a framed footer,
-even when no Composer command needs to run. The legacy duplicate command line is gone.
-
-- Switching: Real switches no longer print preview/"would" wording; the header names the
-  transition being made (`PROD → DEV`, `refresh DEV`).
-- Switching: A blocked real switch now renders through the dedicated blocked layout instead of
-  the preview-flavored one.
-- Switching: Every real switch now closes with a framed "done" footer, including switches that
-  need no Composer command or run with `--no-install`.
-- Switching: Removed the legacy duplicate "Running `composer …`" line; the command and its
-  reason now appear exactly once.
-- API: Added `SwitchOutcome::getPreviousMode()` and `ConfigSwitcher::getProjectRoot()`.
-- API: `OutcomeRenderer::formatOperation()` now takes an explicit preview flag; `render()` is
-  deprecated in favor of the runner's explicit real/preview rendering calls.
-- API: `ConfigSwitcher::MESSAGE_COMPOSER_COMMAND` is no longer emitted (kept for back-compat).
-- Tests: Added regression coverage for pre-existing gaps (path-repository alias rendering,
-  code-0 Detail messages, `composerSwitchProd()`/`composerSwitchUpdate()` false-return path,
-  moved-package double-override characterization) and a Tier 2 real-switch transcript check.
-
-## v3.1.0 - Readable switching output (Minor)
+## v3.1.0 - Readable switching output
 
 **Switch commands now print clear, framed console output and block unsafe version pins.**
-A switch is stopped before anything is written when a leftover `version` override, such as an
-old 2.x pin, cannot satisfy the package's root constraint. Failed switches now exit non-zero with
-the reason printed, plus a hint on how to recover.
+A switch is stopped before anything is written when a leftover version override, such as an
+old 2.x pin, cannot satisfy the package's root constraint. Failed switches exit non-zero with
+the reason and a recovery hint. Real switches no longer show preview wording, and a package
+moved between `require` and `require-dev` is now reported once, as a move.
 
-- Switching: Switch commands now print readable, framed console output.
+- Switching: Switch commands now print readable, framed output, always closed by a footer.
+- Switching: Real switches no longer show preview wording; the header names the transition.
 - Switching: Added a check that blocks a switch on an unsatisfiable version override (182230).
-- Switching: Added a recovery hint after a failed switch (182231).
-- Switching: Failures now exit non-zero and print the reason.
+- Switching: Failures now exit non-zero and print the reason plus a recovery hint (182231).
+- Switching: A package moved between `require` and `require-dev` is now reported once.
+- Switching: Blocked switches now render in a dedicated layout.
+- Switching: Removed the duplicate "Running `composer …`" line.
 - Switching: `-v` now shows file-operation details.
 - Switching: Fixed duplicate messages in the output.
 - Switching: Fixed a first DEV switch wrongly marking a pruned VCS repository as `[permanent]`.
-- Switching: Fixed a package moved between `require` and `require-dev` being duplicated on `switch-prod`.
-- API: Added message severity levels, readable on every switch message.
-- API: Dev transform results now report version conflicts.
-- API: Composer commands can now be rendered as display strings.
-- API: Switch entry points now return a success flag.
-- Composer: Added `composer/semver` as a dev dependency.
+- API: Added message severity levels, move reporting and the previous mode on switch outcomes.
+- API: Switch entry points now return a success flag; dev transform results report conflicts.
+- API: Deprecated the old overridden-entries getter and the renderer's `render()` method.
 
 ## v3.0.0 - A single source of truth (Breaking-M)
 
