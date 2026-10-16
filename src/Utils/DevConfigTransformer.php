@@ -12,6 +12,7 @@ use Mistralys\ComposerSwitcher\ConfigSwitcher;
 use Mistralys\ComposerSwitcher\State\ConfigChangeOrigin;
 use Mistralys\ComposerSwitcher\State\DevTransformResult;
 use Mistralys\ComposerSwitcher\State\LocalRepository;
+use Mistralys\ComposerSwitcher\State\ManagedEntryOverride;
 use Mistralys\ComposerSwitcher\State\RevertResult;
 use Mistralys\ComposerSwitcher\State\ConstraintCheck;
 
@@ -196,7 +197,6 @@ final class DevConfigTransformer
         );
 
         $effectiveConfig = array();
-        $overridden = array();
 
         foreach(self::unionKeys($devConfig, $base, $snapshotConfig) as $key) {
             if(in_array($key, array('require', 'require-dev', ConfigSwitcher::KEY_REPOSITORIES), true)) {
@@ -229,8 +229,7 @@ final class DevConfigTransformer
         ));
 
         foreach(array('require', 'require-dev') as $section) {
-            [$sectionResult, $sectionOverrides] = self::revertSection(
-                $section,
+            $sectionResult = self::revertSection(
                 self::sectionOf($devConfig, $section),
                 self::sectionOf($base, $section),
                 self::sectionOf($snapshotConfig, $section),
@@ -240,9 +239,9 @@ final class DevConfigTransformer
             if(count($sectionResult) > 0 || array_key_exists($section, $snapshotConfig)) {
                 $effectiveConfig[$section] = $sectionResult;
             }
-
-            $overridden = array_merge($overridden, $sectionOverrides);
         }
+
+        $overrides = self::detectManagedOverrides($devConfig, $base, $snapshotConfig, $managedInBase);
 
         $repositoriesResult = self::revertRepositories(
             self::sectionOf($devConfig, ConfigSwitcher::KEY_REPOSITORIES),
@@ -255,7 +254,7 @@ final class DevConfigTransformer
             $effectiveConfig[ConfigSwitcher::KEY_REPOSITORIES] = $repositoriesResult;
         }
 
-        return new RevertResult($effectiveConfig, $overridden);
+        return new RevertResult($effectiveConfig, $overrides);
     }
 
     /**
@@ -290,8 +289,10 @@ final class DevConfigTransformer
         $overriddenKeys = array();
 
         if($revertResult !== null) {
-            foreach($revertResult->getOverriddenManagedEntries() as $entry) {
-                $overriddenKeys[$entry['section'] . '|' . $entry['packageName']] = true;
+            foreach($revertResult->getOverrides() as $override) {
+                foreach($override->getAffectedSections() as $section) {
+                    $overriddenKeys[$section . '|' . $override->getPackageName()] = true;
+                }
             }
         }
 
@@ -480,39 +481,25 @@ final class DevConfigTransformer
     /**
      * Merges one `require`/`require-dev` section per package: a
      * managed package always takes the snapshot value (or is dropped
-     * when the snapshot has none), recording an override when the
-     * user edited it anyway; every other package takes the current
-     * value.
+     * when the snapshot has none); every other package takes the
+     * current value. A pure merge — override detection runs separately,
+     * once per package across both sections, in
+     * {@see self::detectManagedOverrides()}.
      *
      * @param array<string,mixed> $current
      * @param array<string,mixed> $base
      * @param array<string,mixed> $snapshot
      * @param string[] $managedPackageNames Managed packages present in the base of either section (see {@see self::revert()}), so a package moved between sections is never duplicated.
-     * @return array{0:array<string,mixed>,1:array<int,array{section:string,packageName:string,snapshotValue:mixed,currentValue:mixed}>}
+     * @return array<string,mixed>
      */
-    private static function revertSection(string $section, array $current, array $base, array $snapshot, array $managedPackageNames) : array
+    private static function revertSection(array $current, array $base, array $snapshot, array $managedPackageNames) : array
     {
         $result = array();
-        $overridden = array();
 
         foreach(self::unionKeys($current, $base, $snapshot) as $packageName) {
-            $isManagedHere = in_array($packageName, $managedPackageNames, true);
-
-            if($isManagedHere) {
+            if(in_array($packageName, $managedPackageNames, true)) {
                 if(array_key_exists($packageName, $snapshot)) {
                     $result[$packageName] = $snapshot[$packageName];
-                }
-
-                $currentValue = $current[$packageName] ?? null;
-                $baseValue = $base[$packageName] ?? null;
-
-                if(!self::valuesEqual($currentValue, $baseValue)) {
-                    $overridden[] = array(
-                        'section' => $section,
-                        'packageName' => $packageName,
-                        'snapshotValue' => $snapshot[$packageName] ?? null,
-                        'currentValue' => $current[$packageName] ?? null
-                    );
                 }
 
                 continue;
@@ -523,7 +510,84 @@ final class DevConfigTransformer
             }
         }
 
-        return array($result, $overridden);
+        return $result;
+    }
+
+    /**
+     * Detects every managed package the user edited anyway, once per
+     * package across both `require` and `require-dev` — the fix for
+     * the double-report a per-section pass caused for a package moved
+     * between sections during DEV.
+     *
+     * For each managed package, the section it is reported against is
+     * the one it occupies in `$base` — resolved by checking `require`
+     * first, then `require-dev`, matching {@see self::sectionOf()}'s own
+     * lookup order; this also covers the malformed-but-possible case of
+     * a base (or snapshot) declaring the same package in both sections.
+     * The package's current section is resolved the same way against
+     * `$current`, or `null` when it is absent from both — a removal.
+     *
+     * An override is reported when the current section differs from
+     * the base section (a move, {@see ManagedEntryOverride::isMove()}
+     * `true`, reported regardless of whether the value also changed),
+     * when the current section is `null` (a removal), or when the
+     * value changed in place (current section equals base section, but
+     * the value differs from base).
+     *
+     * @param array<string,mixed> $current The current, live DEV `composer.json` data.
+     * @param array<string,mixed> $base `apply($snapshot, …)`'s result — what the DEV config looked like with no further edits.
+     * @param array<string,mixed> $snapshot The original PROD snapshot.
+     * @param string[] $managedInBase Managed packages present in the base of either section (see {@see self::revert()}).
+     * @return array<int,ManagedEntryOverride>
+     */
+    private static function detectManagedOverrides(array $current, array $base, array $snapshot, array $managedInBase) : array
+    {
+        $overrides = array();
+
+        foreach($managedInBase as $packageName) {
+            $baseSection = self::locateSection($base, $packageName) ?? 'require';
+            $baseValue = self::sectionOf($base, $baseSection)[$packageName] ?? null;
+            $snapshotValue = self::sectionOf($snapshot, $baseSection)[$packageName] ?? null;
+
+            $currentSection = self::locateSection($current, $packageName);
+            $currentValue = $currentSection !== null ? self::sectionOf($current, $currentSection)[$packageName] : null;
+
+            $isMove = $currentSection !== null && $currentSection !== $baseSection;
+            $isRemoved = $currentSection === null;
+            $isEditedInPlace = !$isMove && !$isRemoved && !self::valuesEqual($currentValue, $baseValue);
+
+            if($isMove || $isRemoved || $isEditedInPlace) {
+                $overrides[] = new ManagedEntryOverride(
+                    $packageName,
+                    $baseSection,
+                    $snapshotValue,
+                    $currentValue,
+                    $currentSection
+                );
+            }
+        }
+
+        return $overrides;
+    }
+
+    /**
+     * Finds which of `require`/`require-dev` `$config` declares
+     * `$packageName` under, checking `require` first. `null` when
+     * neither section has it.
+     *
+     * @param array<string,mixed> $config
+     */
+    private static function locateSection(array $config, string $packageName) : ?string
+    {
+        if(array_key_exists($packageName, self::sectionOf($config, 'require'))) {
+            return 'require';
+        }
+
+        if(array_key_exists($packageName, self::sectionOf($config, 'require-dev'))) {
+            return 'require-dev';
+        }
+
+        return null;
     }
 
     /**

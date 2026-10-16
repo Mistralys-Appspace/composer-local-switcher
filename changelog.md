@@ -1,5 +1,19 @@
 # Changelog
 
+## v3.3.0 - Moved packages reported once (Minor)
+
+**A managed package moved between `require` and `require-dev` during a DEV session is now reported once, as a move.**
+Previously the same package could be reported as an override in both sections when reverting. A
+new value object makes this move explicit, and project-root handling has been consolidated.
+
+- Switching: A moved managed package is now reported once, as a move.
+- API: Added `State\ManagedEntryOverride` and `RevertResult::getOverrides()`; deprecated
+  `getOverriddenManagedEntries()`.
+- API: `RevertResult`'s constructor now takes `ManagedEntryOverride[]`. It is only produced by
+  `DevConfigTransformer::revert()`; code that reads a `RevertResult` is unaffected.
+- Internal: Consolidated project-root derivation.
+- Tests: Added Tier 1 and Tier 2 coverage.
+
 ## v3.2.0 - Switch output matches the plan (Minor)
 
 **A real switch's console output now matches the layout the v3.1.0 release promised.**

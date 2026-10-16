@@ -866,6 +866,103 @@ final class TestSwitching extends ComposerSwitcherTestCase
         $this->assertTrue($found, 'Expected the non-switched VCS entry for some-unrelated-library to survive the DEV switch.');
     }
 
+    /**
+     * A managed package moved from `require` to `require-dev` during DEV
+     * (no value edit, just a section move) is restored to `require` on
+     * `switch-prod`, and the restore is reported as a single
+     * {@see ConfigSwitcher::MESSAGE_MANAGED_ENTRY_OVERRIDDEN} message
+     * worded as a move, naming both the section it moved away from and
+     * the one it is being restored to — not the legacy single-section
+     * "manual edit" wording, and not two separate messages.
+     */
+    public function test_movedManagedPackageEmitsSingleMoveMessage() : void
+    {
+        $packageName = 'mistralys/application_framework';
+
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $config = $switcher->getMainFile()->getData();
+        $config['require-dev'][$packageName] = $config['require'][$packageName];
+        unset($config['require'][$packageName]);
+        $switcher->getMainFile()->putData($config);
+
+        $outcome = $switcher->switchToProduction();
+
+        $this->assertFalse($outcome->isBlocked());
+
+        $messages = $this->getMessagesForCode($switcher, ConfigSwitcher::MESSAGE_MANAGED_ENTRY_OVERRIDDEN);
+        $this->assertCount(1, $messages, 'Expected exactly one override message for the moved package.');
+
+        $text = $messages[0]->getText();
+        $this->assertStringContainsString($packageName, $text);
+        $this->assertStringContainsString('require-dev', $text);
+        $this->assertStringContainsString('moved', $text);
+
+        $restored = $switcher->getMainFile()->getData();
+        $this->assertArrayHasKey($packageName, $restored['require']);
+        $this->assertArrayNotHasKey($packageName, $restored['require-dev']);
+    }
+
+    /**
+     * The same moved-package scenario, but via a DEV→DEV refresh
+     * ({@see ConfigSwitcher::switchUpdate()} while already in DEV, i.e.
+     * {@see ConfigSwitcher::switch_planDevRefresh()}) rather than a
+     * DEV→PROD switch: the move is still reported exactly once.
+     */
+    public function test_refreshWithMovedManagedPackageEmitsSingleMoveMessage() : void
+    {
+        $packageName = 'mistralys/application_framework';
+
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $config = $switcher->getMainFile()->getData();
+        $config['require-dev'][$packageName] = $config['require'][$packageName];
+        unset($config['require'][$packageName]);
+        $switcher->getMainFile()->putData($config);
+
+        $outcome = $switcher->switchUpdate();
+
+        $this->assertFalse($outcome->isBlocked());
+
+        $messages = $this->getMessagesForCode($switcher, ConfigSwitcher::MESSAGE_MANAGED_ENTRY_OVERRIDDEN);
+        $this->assertCount(1, $messages, 'Expected exactly one override message for the moved package on refresh.');
+        $this->assertStringContainsString('moved', $messages[0]->getText());
+    }
+
+    /**
+     * An in-place edit of a managed package's value (same section, value
+     * changed) keeps the existing, pre-move-aware wording verbatim —
+     * {@see ConfigSwitcher::switch_recordOverriddenEntries()} must not
+     * apply move wording to a non-move override.
+     */
+    public function test_editedManagedPackageKeepsLegacyWording() : void
+    {
+        $packageName = 'mistralys/application_framework';
+
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $config = $switcher->getMainFile()->getData();
+        $config['require'][$packageName] = '^9.9';
+        $switcher->getMainFile()->putData($config);
+
+        $outcome = $switcher->switchToProduction();
+
+        $this->assertFalse($outcome->isBlocked());
+
+        $messages = $this->getMessagesForCode($switcher, ConfigSwitcher::MESSAGE_MANAGED_ENTRY_OVERRIDDEN);
+        $this->assertCount(1, $messages, 'Expected exactly one override message for the edited package.');
+        $this->assertSame(
+            sprintf(
+                'A manual edit to the managed [require] entry for [%s] was discarded (restored to the production-aliased value).',
+                $packageName
+            ),
+            $messages[0]->getText()
+        );
+    }
+
     // endregion
 
     // region: Support methods
@@ -899,6 +996,21 @@ final class TestSwitching extends ComposerSwitcherTestCase
             static fn(SwitchMessage $message) : int => $message->getCode(),
             $switcher->getMessages()
         );
+    }
+
+    /**
+     * Sibling of {@see self::getMessageCodes()}: returns the full
+     * {@see SwitchMessage} objects matching `$code`, for tests that need
+     * to assert on message text rather than just presence of a code.
+     *
+     * @return SwitchMessage[]
+     */
+    private function getMessagesForCode(ConfigSwitcher $switcher, int $code) : array
+    {
+        return array_values(array_filter(
+            $switcher->getMessages(),
+            static fn(SwitchMessage $message) : bool => $message->getCode() === $code
+        ));
     }
 
     /**

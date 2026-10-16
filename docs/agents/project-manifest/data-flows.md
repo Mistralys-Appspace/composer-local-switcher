@@ -141,8 +141,9 @@ switch_planDevToProd(): array{blocked, command, changes, snapshotHash, appliedRe
       require`/`remove`/config edits back. revert() identifies a managed package across both
       `require` and `require-dev` before applying this snapshot-value override, so a package the
       user moved between the two sections during DEV is restored once, in its snapshot section —
-      never duplicated into both, and never double-overridden by also carrying back the stale
-      current-side entry as if it were a separate, non-managed edit
+      never duplicated into both — and reported once, as a move (a single ManagedEntryOverride
+      with isMove() === true, naming both the section it moved from and the one it moved to),
+      never as two separate overrides
     → Writes revertResult->getEffectiveConfig() → composer.json
     → If a composer-prod.lock backup exists: restores it → composer.lock; otherwise
       force-deletes composer.lock (a DEV-session lock cannot be trusted as a PROD lock) and

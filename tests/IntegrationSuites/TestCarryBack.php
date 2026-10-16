@@ -21,6 +21,7 @@ final class TestCarryBack extends IntegrationTestCase
 {
     private const NEW_PACKAGE_NAME = 'psr/log';
     private const NEW_PACKAGE_CONSTRAINT = '^3.0';
+    private const MANAGED_PACKAGE_NAME = 'mistralys/simple_html_dom';
 
     // region: _Tests
 
@@ -136,6 +137,57 @@ final class TestCarryBack extends IntegrationTestCase
             $this->assertArrayHasKey($name, $restoredLockedVersions, sprintf('Expected package [%s] to still be locked after carry-back.', $name));
             $this->assertSame($version, $restoredLockedVersions[$name], sprintf('Expected package [%s]\'s locked version to be unchanged after carry-back.', $name));
         }
+    }
+
+    /**
+     * The managed package (`mistralys/simple_html_dom`) moved from
+     * `require` to `require-dev` directly in the DEV working copy is
+     * restored to `require` on a real `switch-prod -- --yes` run,
+     * reported as a single move-worded
+     * {@see \Mistralys\ComposerSwitcher\ConfigSwitcher::MESSAGE_MANAGED_ENTRY_OVERRIDDEN}
+     * message rather than two separate "manual edit" messages, and the
+     * resulting `composer.json` change set marks the affected lines
+     * `[discarded]` — this plan's WP-004/WP-005 moved-package fix,
+     * proven end to end against a real Composer binary.
+     */
+    public function test_movedManagedPackageIsRestoredWithSingleNotice() : void
+    {
+        $this->switchToDev();
+
+        $mainFilePath = $this->testTarget . '/composer.json';
+        $config = $this->decodeJsonFile($mainFilePath);
+
+        $config['require-dev'][self::MANAGED_PACKAGE_NAME] = $config['require'][self::MANAGED_PACKAGE_NAME];
+        unset($config['require'][self::MANAGED_PACKAGE_NAME]);
+
+        $this->writeJsonFile($mainFilePath, $config);
+
+        $result = $this->runSwitch('switch-prod');
+
+        $this->assertTrue($result->isSuccess(), sprintf(
+            "switch-prod failed unexpectedly.\nOutput:\n%s\nError output:\n%s",
+            $result->getOutput(),
+            $result->getErrorOutput()
+        ));
+
+        $restored = $this->decodeJsonFile($mainFilePath);
+        $this->assertArrayHasKey(self::MANAGED_PACKAGE_NAME, $restored['require'] ?? array());
+        $this->assertArrayNotHasKey(self::MANAGED_PACKAGE_NAME, $restored['require-dev'] ?? array());
+
+        $output = $result->getOutput();
+
+        $occurrences = substr_count($output, 'was moved from [require] to [require-dev]');
+        $this->assertSame(
+            1,
+            $occurrences,
+            "Expected the move wording to occur exactly once.\nOutput:\n" . $output
+        );
+
+        $this->assertStringContainsString(
+            '[discarded]',
+            $output,
+            "Expected the change set to mark the moved package's lines as discarded.\nOutput:\n" . $output
+        );
     }
 
     // endregion

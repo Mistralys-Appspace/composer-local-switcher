@@ -11,7 +11,9 @@ use Mistralys\ComposerSwitcher\State\ConfigChangeSet;
 use Mistralys\ComposerSwitcher\State\FileOperation;
 use Mistralys\ComposerSwitcher\State\InstalledState;
 use Mistralys\ComposerSwitcher\State\LockStatus;
+use Mistralys\ComposerSwitcher\State\ManagedEntryOverride;
 use Mistralys\ComposerSwitcher\State\MessageLevel;
+use Mistralys\ComposerSwitcher\State\RevertResult;
 use Mistralys\ComposerSwitcher\State\SwitchDescription;
 use Mistralys\ComposerSwitcher\State\SwitchMessage;
 use Mistralys\ComposerSwitcher\State\SwitchOutcome;
@@ -556,6 +558,129 @@ final class TestStateValueObjects extends TestCase
         $command = new ComposerCommand(array(), 'Nothing to run.');
 
         $this->assertSame('', $command->toDisplayString());
+    }
+
+    // endregion
+
+    // region: _Tests - ManagedEntryOverride
+
+    public function test_managedEntryOverride_gettersAndArray() : void
+    {
+        $override = new ManagedEntryOverride(
+            'acme/local-one',
+            'require',
+            '^1.0',
+            '^2.0',
+            'require'
+        );
+
+        $this->assertSame('acme/local-one', $override->getPackageName());
+        $this->assertSame('require', $override->getSection());
+        $this->assertSame('^1.0', $override->getSnapshotValue());
+        $this->assertSame('^2.0', $override->getCurrentValue());
+        $this->assertSame('require', $override->getCurrentSection());
+
+        $this->assertSame(
+            array(
+                'packageName' => 'acme/local-one',
+                'section' => 'require',
+                'snapshotValue' => '^1.0',
+                'currentValue' => '^2.0',
+                'currentSection' => 'require'
+            ),
+            $override->toArray()
+        );
+    }
+
+    /**
+     * {@see ManagedEntryOverride::isMove()} is true only when
+     * `currentSection` differs from `section` — an in-place edit
+     * (same section) and a removal (`currentSection === null`) are
+     * both reported as `false`. {@see ManagedEntryOverride::getAffectedSections()}
+     * mirrors this: both sections for a move, only the snapshot
+     * section otherwise.
+     */
+    public function test_managedEntryOverride_moveAffectsBothSections() : void
+    {
+        $move = new ManagedEntryOverride('acme/local-one', 'require', '^1.0', '^1.0', 'require-dev');
+        $inPlaceEdit = new ManagedEntryOverride('acme/local-one', 'require', '^1.0', '^2.0', 'require');
+        $removal = new ManagedEntryOverride('acme/local-one', 'require', '^1.0', null, null);
+
+        $this->assertTrue($move->isMove());
+        $this->assertSame(array('require', 'require-dev'), $move->getAffectedSections());
+
+        $this->assertFalse($inPlaceEdit->isMove());
+        $this->assertSame(array('require'), $inPlaceEdit->getAffectedSections());
+
+        $this->assertFalse($removal->isMove());
+        $this->assertSame(array('require'), $removal->getAffectedSections());
+    }
+
+    /**
+     * `fromArray(toArray())` round-trips to an equal object for all
+     * three override shapes: an in-place edit, a removal
+     * (`currentSection` `null`), and a move.
+     */
+    public function test_managedEntryOverride_fromArrayRoundTrips() : void
+    {
+        $inPlaceEdit = new ManagedEntryOverride('acme/local-one', 'require', '^1.0', '^2.0', 'require');
+        $removal = new ManagedEntryOverride('acme/local-one', 'require', '^1.0', null, null);
+        $move = new ManagedEntryOverride('acme/local-one', 'require', '^1.0', '^1.0', 'require-dev');
+
+        foreach(array($inPlaceEdit, $removal, $move) as $original) {
+            $restored = ManagedEntryOverride::fromArray($original->toArray());
+
+            $this->assertEquals($original, $restored);
+        }
+    }
+
+    // endregion
+
+    // region: _Tests - RevertResult
+
+    /**
+     * {@see RevertResult::getOverrides()} returns the exact
+     * {@see ManagedEntryOverride} instances passed to the constructor,
+     * and the deprecated {@see RevertResult::getOverriddenManagedEntries()}
+     * derives the legacy four-key shape from them, one entry per
+     * override — including for a move, which is a single override on
+     * both sides of this adapter.
+     */
+    public function test_revertResult_exposesValueObjectsAndLegacyShape() : void
+    {
+        $inPlaceEdit = new ManagedEntryOverride('acme/local-one', 'require', '^1.0', '^2.0', 'require');
+        $move = new ManagedEntryOverride('acme/local-two', 'require', '^1.0', '^1.0', 'require-dev');
+
+        $effectiveConfig = array('name' => 'acme/app');
+        $result = new RevertResult($effectiveConfig, array($inPlaceEdit, $move));
+
+        $this->assertSame($effectiveConfig, $result->getEffectiveConfig());
+        $this->assertSame(array($inPlaceEdit, $move), $result->getOverrides());
+        $this->assertTrue($result->hasOverriddenManagedEntries());
+
+        $legacy = $result->getOverriddenManagedEntries();
+        $this->assertSame(
+            array(
+                array(
+                    'section' => 'require',
+                    'packageName' => 'acme/local-one',
+                    'snapshotValue' => '^1.0',
+                    'currentValue' => '^2.0'
+                ),
+                array(
+                    'section' => 'require',
+                    'packageName' => 'acme/local-two',
+                    'snapshotValue' => '^1.0',
+                    'currentValue' => '^1.0'
+                )
+            ),
+            $legacy
+        );
+
+        $empty = new RevertResult($effectiveConfig, array());
+        $this->assertSame(array(), $empty->getOverrides());
+        $this->assertSame(array(), $empty->getOverriddenManagedEntries());
+        $this->assertFalse($empty->hasOverriddenManagedEntries());
     }
 
     // endregion

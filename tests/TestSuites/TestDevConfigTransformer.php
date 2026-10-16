@@ -448,11 +448,20 @@ final class TestDevConfigTransformer extends TestCase
         $this->assertSame('^2.0', $result->getEffectiveConfig()['require']['acme/local-one'] ?? null);
         $this->assertTrue($result->hasOverriddenManagedEntries());
 
-        $overrides = $result->getOverriddenManagedEntries();
-        $this->assertSame('require', $overrides[0]['section']);
-        $this->assertSame('acme/local-one', $overrides[0]['packageName']);
-        $this->assertSame('^2.0', $overrides[0]['snapshotValue']);
-        $this->assertSame('^3.0', $overrides[0]['currentValue']);
+        $overrides = $result->getOverrides();
+        $this->assertCount(1, $overrides);
+        $this->assertSame('require', $overrides[0]->getSection());
+        $this->assertSame('acme/local-one', $overrides[0]->getPackageName());
+        $this->assertSame('^2.0', $overrides[0]->getSnapshotValue());
+        $this->assertSame('^3.0', $overrides[0]->getCurrentValue());
+        $this->assertFalse($overrides[0]->isMove());
+
+        // The legacy adapter still reports the same facts.
+        $legacy = $result->getOverriddenManagedEntries();
+        $this->assertSame('require', $legacy[0]['section']);
+        $this->assertSame('acme/local-one', $legacy[0]['packageName']);
+        $this->assertSame('^2.0', $legacy[0]['snapshotValue']);
+        $this->assertSame('^3.0', $legacy[0]['currentValue']);
     }
 
     public function test_revertResultCarriesEffectiveConfigAndOverridesOnly() : void
@@ -461,14 +470,14 @@ final class TestDevConfigTransformer extends TestCase
         $base = DevConfigTransformer::apply($snapshotConfig, $repos, $lock)->getConfig();
 
         $unedited = DevConfigTransformer::revert($base, $snapshotConfig, $repos, $lock);
-        $this->assertSame(array(), $unedited->getOverriddenManagedEntries());
+        $this->assertSame(array(), $unedited->getOverrides());
         $this->assertFalse($unedited->hasOverriddenManagedEntries());
 
         $edited = $base;
         $edited['require']['acme/local-one'] = '^9.0';
         $withOverride = DevConfigTransformer::revert($edited, $snapshotConfig, $repos, $lock);
 
-        $this->assertCount(1, $withOverride->getOverriddenManagedEntries());
+        $this->assertCount(1, $withOverride->getOverrides());
         $this->assertTrue($withOverride->hasOverriddenManagedEntries());
         $this->assertArrayHasKey('require', $withOverride->getEffectiveConfig());
     }
@@ -524,21 +533,13 @@ final class TestDevConfigTransformer extends TestCase
     }
 
     /**
-     * Characterization test (not a fix): a managed package moved
-     * between `require`/`require-dev` during DEV, with no actual value
-     * edit, is still reported as overridden in *both* sections by
-     * {@see DevConfigTransformer::revertSection()} — one entry with the
-     * section the snapshot restores it to (`currentValue: null`, since
-     * the package is absent from DEV's `current` there) and one with
-     * the section it moved away from (`snapshotValue: null`, since the
-     * snapshot never had it there). This is a known limitation
-     * ({@see self::test_movedPackageNotDuplicatedOnRevert()}'s
-     * `effectiveConfig` is still correct — only the *reported* override
-     * list double-counts the single move) deferred to a dedicated
-     * future plan; this test pins the current behavior rather than
-     * fixing `revertSection()`'s shared `$managedPackageNames` list.
+     * A managed package moved between `require`/`require-dev` during
+     * DEV, with no actual value edit, is reported exactly once, as a
+     * move: {@see ManagedEntryOverride::isMove()} is `true`, the
+     * override's section is the snapshot section, and its current
+     * section is the one the package moved to.
      */
-    public function test_movedPackageOnRevertIsReportedInBothSections() : void
+    public function test_movedPackageOnRevertIsReportedOnceAsMove() : void
     {
         [$snapshotConfig, $repos, $lock] = $this->buildBaselineOne();
         $base = DevConfigTransformer::apply($snapshotConfig, $repos, $lock)->getConfig();
@@ -550,16 +551,130 @@ final class TestDevConfigTransformer extends TestCase
         unset($current['require']['acme/local-one']);
 
         $result = DevConfigTransformer::revert($current, $snapshotConfig, $repos, $lock);
-        $overrides = $result->getOverriddenManagedEntries();
+        $overrides = $result->getOverrides();
 
-        $this->assertCount(2, $overrides, 'Known limitation: a pure section move is reported as an override in both sections.');
+        $this->assertCount(1, $overrides);
+        $this->assertTrue($overrides[0]->isMove());
+        $this->assertSame('require', $overrides[0]->getSection());
+        $this->assertSame('require-dev', $overrides[0]->getCurrentSection());
+        $this->assertSame('acme/local-one', $overrides[0]->getPackageName());
 
-        $sections = array_column($overrides, 'section');
-        $this->assertContains('require', $sections);
-        $this->assertContains('require-dev', $sections);
+        // effectiveConfig still restores the package once, in its snapshot section.
+        $effective = $result->getEffectiveConfig();
+        $this->assertSame('^2.0', $effective['require']['acme/local-one'] ?? null);
+        $this->assertArrayNotHasKey('acme/local-one', $effective['require-dev']);
     }
 
-    // endregion
+    /**
+     * A move combined with a value edit is still a single override —
+     * the moved-to section and the edited value both come through on
+     * the same {@see ManagedEntryOverride}.
+     */
+    public function test_movedAndEditedPackageIsReportedOnce() : void
+    {
+        [$snapshotConfig, $repos, $lock] = $this->buildBaselineOne();
+        $base = DevConfigTransformer::apply($snapshotConfig, $repos, $lock)->getConfig();
+
+        $current = $base;
+        $current['require-dev']['acme/local-one'] = '^9.0';
+        unset($current['require']['acme/local-one']);
+
+        $result = DevConfigTransformer::revert($current, $snapshotConfig, $repos, $lock);
+        $overrides = $result->getOverrides();
+
+        $this->assertCount(1, $overrides);
+        $this->assertTrue($overrides[0]->isMove());
+        $this->assertSame('require', $overrides[0]->getSection());
+        $this->assertSame('require-dev', $overrides[0]->getCurrentSection());
+        $this->assertSame('^2.0', $overrides[0]->getSnapshotValue());
+        $this->assertSame('^9.0', $overrides[0]->getCurrentValue());
+    }
+
+    /**
+     * An in-place edit and a DEV-time removal of a managed package
+     * each report exactly one override with `isMove() === false`; an
+     * unedited DEV config reports none.
+     */
+    public function test_removedManagedPackageIsReportedOnce() : void
+    {
+        [$snapshotConfig, $repos, $lock] = $this->buildBaselineOne();
+        $base = DevConfigTransformer::apply($snapshotConfig, $repos, $lock)->getConfig();
+
+        $current = $base;
+        unset($current['require']['acme/local-one']);
+
+        $result = DevConfigTransformer::revert($current, $snapshotConfig, $repos, $lock);
+        $overrides = $result->getOverrides();
+
+        $this->assertCount(1, $overrides);
+        $this->assertFalse($overrides[0]->isMove());
+        $this->assertSame('require', $overrides[0]->getSection());
+        $this->assertNull($overrides[0]->getCurrentSection());
+        $this->assertNull($overrides[0]->getCurrentValue());
+        $this->assertSame('^2.0', $overrides[0]->getSnapshotValue());
+
+        // The managed package is still restored to its snapshot value.
+        $this->assertSame('^2.0', $result->getEffectiveConfig()['require']['acme/local-one'] ?? null);
+    }
+
+    /**
+     * {@see DevConfigTransformer::makeOriginClassifier()} classifies
+     * both diff paths of a moved managed package —
+     * `require` › package (the section it moved away from) and
+     * `require-dev` › package (the section it moved to) — as
+     * {@see ConfigChangeOrigin::Discarded}.
+     */
+    public function test_movedPackageBothPathsClassifiedDiscarded() : void
+    {
+        [$snapshotConfig, $repos, $lock] = $this->buildBaselineOne();
+        $base = DevConfigTransformer::apply($snapshotConfig, $repos, $lock)->getConfig();
+
+        $current = $base;
+        $current['require-dev']['acme/local-one'] = $current['require']['acme/local-one'];
+        unset($current['require']['acme/local-one']);
+
+        $result = DevConfigTransformer::revert($current, $snapshotConfig, $repos, $lock);
+        $classifier = DevConfigTransformer::makeOriginClassifier($repos, $result);
+
+        $this->assertSame(
+            ConfigChangeOrigin::Discarded,
+            $classifier(array('require', 'acme/local-one'), '^2.0', null)
+        );
+        $this->assertSame(
+            ConfigChangeOrigin::Discarded,
+            $classifier(array('require-dev', 'acme/local-one'), null, '^2.0')
+        );
+    }
+
+    /**
+     * {@see RevertResult::getOverriddenManagedEntries()} is
+     * `@deprecated` but still returns the legacy four-key array shape,
+     * reading it off {@see RevertResult::getOverrides()} — one legacy
+     * entry per override, even for a move.
+     */
+    public function test_legacyOverriddenManagedEntriesAdapter() : void
+    {
+        [$snapshotConfig, $repos, $lock] = $this->buildBaselineOne();
+        $base = DevConfigTransformer::apply($snapshotConfig, $repos, $lock)->getConfig();
+
+        $current = $base;
+        $current['require-dev']['acme/local-one'] = $current['require']['acme/local-one'];
+        unset($current['require']['acme/local-one']);
+
+        $result = DevConfigTransformer::revert($current, $snapshotConfig, $repos, $lock);
+
+        $legacy = $result->getOverriddenManagedEntries();
+        $this->assertCount(1, $legacy);
+        $this->assertSame(
+            array(
+                'section' => 'require',
+                'packageName' => 'acme/local-one',
+                'snapshotValue' => '^2.0',
+                'currentValue' => '^2.0'
+            ),
+            $legacy[0]
+        );
+    }
 
     // region: Support methods
 

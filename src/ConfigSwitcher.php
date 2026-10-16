@@ -14,6 +14,7 @@ use Mistralys\ComposerSwitcher\State\FileOperation;
 use Mistralys\ComposerSwitcher\State\InstalledState;
 use Mistralys\ComposerSwitcher\State\LocalRepository;
 use Mistralys\ComposerSwitcher\State\LockStatus;
+use Mistralys\ComposerSwitcher\State\ManagedEntryOverride;
 use Mistralys\ComposerSwitcher\State\MessageLevel;
 use Mistralys\ComposerSwitcher\State\SwitchDescription;
 use Mistralys\ComposerSwitcher\State\SwitchMessage;
@@ -147,9 +148,14 @@ class ConfigSwitcher
 
     /**
      * {@see self::switch_planDevRefresh()} / {@see self::switch_planDevToProd()} —
-     * a managed (local package) entry was edited directly in DEV and is
-     * being reset to its snapshot value instead of kept, per
-     * {@see \Mistralys\ComposerSwitcher\State\RevertResult::getOverriddenManagedEntries()}.
+     * a managed (local package) entry was edited, moved between
+     * `require`/`require-dev`, or removed directly in DEV and is being
+     * reset to its snapshot value/section instead of kept, per
+     * {@see \Mistralys\ComposerSwitcher\State\RevertResult::getOverrides()}.
+     * A plain in-place edit keeps the legacy single-section wording; a
+     * move (per {@see \Mistralys\ComposerSwitcher\State\ManagedEntryOverride::isMove()})
+     * names both the section the entry moved from and the section it is
+     * being restored to, as a single message rather than two.
      */
     public const MESSAGE_MANAGED_ENTRY_OVERRIDDEN = 182221;
 
@@ -1276,7 +1282,7 @@ class ConfigSwitcher
 
         $revertResult = DevConfigTransformer::revert($current, $snapshotConfig, $appliedRepos, $prodLock);
 
-        $this->switch_recordOverriddenEntries($revertResult->getOverriddenManagedEntries());
+        $this->switch_recordOverriddenEntries($revertResult->getOverrides());
 
         $currentRepos = $this->switch_requireCurrentLocalRepositories();
 
@@ -1423,7 +1429,7 @@ class ConfigSwitcher
         $revertResult = DevConfigTransformer::revert($current, $snapshotConfig, $appliedRepos, $prodLock);
         $effectiveConfig = $revertResult->getEffectiveConfig();
 
-        $this->switch_recordOverriddenEntries($revertResult->getOverriddenManagedEntries());
+        $this->switch_recordOverriddenEntries($revertResult->getOverrides());
 
         $classifier = DevConfigTransformer::makeOriginClassifier($appliedRepos, $revertResult);
         $prodConfigChanges = ConfigDiff::between($snapshotConfig, $effectiveConfig, $classifier);
@@ -1733,24 +1739,37 @@ class ConfigSwitcher
     }
 
     /**
-     * @param array<int,array{section:string,packageName:string,snapshotValue:mixed,currentValue:mixed}> $overrides
+     * @param ManagedEntryOverride[] $overrides
      */
     private function switch_recordOverriddenEntries(array $overrides) : void
     {
         foreach($overrides as $override) {
+            if($override->isMove()) {
+                $this->addMessage(
+                    MessageLevel::Info,
+                    self::MESSAGE_MANAGED_ENTRY_OVERRIDDEN,
+                    'The managed entry for [%s] was moved from [%s] to [%s] during DEV; the move was discarded (restored to [%s] with the production-aliased value).',
+                    $override->getPackageName(),
+                    $override->getSection(),
+                    $override->getCurrentSection(),
+                    $override->getSection()
+                );
+                continue;
+            }
+
             $this->addMessage(
                 MessageLevel::Info,
                 self::MESSAGE_MANAGED_ENTRY_OVERRIDDEN,
                 'A manual edit to the managed [%s] entry for [%s] was discarded (restored to the production-aliased value).',
-                $override['section'],
-                $override['packageName']
+                $override->getSection(),
+                $override->getPackageName()
             );
         }
     }
 
     private function switch_installedPackages() : InstalledPackages
     {
-        $projectRoot = dirname($this->mainFile->getPath());
+        $projectRoot = $this->getProjectRoot();
         $configData = $this->mainFile->exists() ? $this->mainFile->getData() : array();
 
         return (new InstalledPackages($projectRoot, $configData))->setFileSystem($this->fileSystem);
