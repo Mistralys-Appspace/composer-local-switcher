@@ -1,5 +1,28 @@
 # Changelog
 
+## v3.2.0 - Switch output matches the plan (Minor)
+
+**A real switch's console output now matches the layout the v3.1.0 release promised.**
+Real `switch-dev`/`switch-prod`/`switch-update` runs no longer show preview wording, name the
+transition in the header (`PROD → DEV`, `refresh DEV`), and always close with a framed footer,
+even when no Composer command needs to run. The legacy duplicate command line is gone.
+
+- Switching: Real switches no longer print preview/"would" wording; the header names the
+  transition being made (`PROD → DEV`, `refresh DEV`).
+- Switching: A blocked real switch now renders through the dedicated blocked layout instead of
+  the preview-flavored one.
+- Switching: Every real switch now closes with a framed "done" footer, including switches that
+  need no Composer command or run with `--no-install`.
+- Switching: Removed the legacy duplicate "Running `composer …`" line; the command and its
+  reason now appear exactly once.
+- API: Added `SwitchOutcome::getPreviousMode()` and `ConfigSwitcher::getProjectRoot()`.
+- API: `OutcomeRenderer::formatOperation()` now takes an explicit preview flag; `render()` is
+  deprecated in favor of the runner's explicit real/preview rendering calls.
+- API: `ConfigSwitcher::MESSAGE_COMPOSER_COMMAND` is no longer emitted (kept for back-compat).
+- Tests: Added regression coverage for pre-existing gaps (path-repository alias rendering,
+  code-0 Detail messages, `composerSwitchProd()`/`composerSwitchUpdate()` false-return path,
+  moved-package double-override characterization) and a Tier 2 real-switch transcript check.
+
 ## v3.1.0 - Readable switching output (Minor)
 
 **Switch commands now print clear, framed console output and block unsafe version pins.**

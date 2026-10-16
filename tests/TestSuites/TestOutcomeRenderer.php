@@ -57,6 +57,66 @@ final class TestOutcomeRenderer extends TestCase
         $this->assertTrue($context->hasWrittenLineContaining('nothing will be changed'));
     }
 
+    /**
+     * A known previous mode names the transition in the header: `PROD →
+     * DEV` for a genuine mode change, with {@see ConfigSwitcher::MODE_INITIAL}
+     * displaying as `PROD` (see {@see OutcomeRenderer}'s `describeTransition()`
+     * docblock for why that mapping holds).
+     */
+    public function test_renderPlanNamesTheTransitionWhenPreviousModeIsKnown() : void
+    {
+        $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, array(), array(), null, false, null, ConfigSwitcher::MODE_PROD);
+
+        $context = new ScriptedEventContext();
+        $this->createRenderer($context)->renderPlan($outcome, false);
+
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — switch PROD → DEV'));
+    }
+
+    /**
+     * {@see ConfigSwitcher::MODE_INITIAL} displays as `PROD` — the very
+     * first switch a project ever makes always starts from the
+     * PROD-equivalent initial state.
+     */
+    public function test_renderPlanDisplaysInitialPreviousModeAsProd() : void
+    {
+        $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, array(), array(), null, false, null, ConfigSwitcher::MODE_INITIAL);
+
+        $context = new ScriptedEventContext();
+        $this->createRenderer($context)->renderPlan($outcome, false);
+
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — switch PROD → DEV'));
+    }
+
+    /**
+     * A previous mode equal to the target names the header a `refresh`
+     * rather than repeating the mode on both sides of an arrow.
+     */
+    public function test_renderPlanNamesARefreshWhenPreviousModeEqualsTarget() : void
+    {
+        $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, array(), array(), null, false, null, ConfigSwitcher::MODE_DEV);
+
+        $context = new ScriptedEventContext();
+        $this->createRenderer($context)->renderPlan($outcome, false);
+
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — switch refresh DEV'));
+    }
+
+    /**
+     * A blocked outcome's header also names the transition, exactly
+     * like {@see self::test_renderPlanNamesTheTransitionWhenPreviousModeIsKnown()}'s
+     * non-blocked counterpart.
+     */
+    public function test_renderBlockedNamesTheTransitionWhenPreviousModeIsKnown() : void
+    {
+        $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, array(), array(), null, true, null, ConfigSwitcher::MODE_PROD);
+
+        $context = new ScriptedEventContext();
+        $this->createRenderer($context)->renderBlocked($outcome);
+
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — switch PROD → DEV blocked, nothing was changed'));
+    }
+
     public function test_renderBlockedCommandStartDoneFailureShareTheHeaderPrefix() : void
     {
         $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, array(), array(), null, true);
@@ -135,8 +195,55 @@ final class TestOutcomeRenderer extends TestCase
         $this->createRenderer($context)->renderPlan($outcome, false);
 
         $this->assertTrue($context->hasWrittenLineContaining('[182201] Using Composer DEV configuration.'));
-        $this->assertTrue($context->hasWrittenLineContaining('would write'));
+        $this->assertTrue($context->hasWrittenLineContaining('will write'));
         $this->assertTrue($context->hasWrittenLineContaining('./composer.json'), 'The file operation path should be project-relative.');
+    }
+
+    /**
+     * {@see OutcomeRenderer::formatOperation()}'s preview/real distinction,
+     * exercised through `renderPlan()`'s own `$isPreview` flag rather
+     * than calling `formatOperation()` directly: a real plan's file
+     * operation lines read `will <type>: …`, a preview's read `would
+     * <type>: …`.
+     */
+    public function test_verboseOperationLinesUseWillForRealSwitch() : void
+    {
+        $operation = new FileOperation(FileOperation::TYPE_WRITE, self::PROJECT_ROOT . '/composer.json', null, 'Rewriting DEV config.', true);
+        $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, array(), array($operation));
+
+        $realContext = new ScriptedEventContext(array(), true, array(), true);
+        $this->createRenderer($realContext)->renderPlan($outcome, false);
+
+        $this->assertTrue($realContext->hasWrittenLineContaining('will write'));
+        $this->assertFalse($realContext->hasWrittenLineContaining('would write'));
+
+        $previewContext = new ScriptedEventContext(array(), true, array(), true);
+        $this->createRenderer($previewContext)->renderPlan($outcome, true);
+
+        $this->assertTrue($previewContext->hasWrittenLineContaining('would write'));
+        $this->assertFalse($previewContext->hasWrittenLineContaining('will write'));
+    }
+
+    /**
+     * A `Detail`-level message with code `0` ({@see \Mistralys\ComposerSwitcher\State\SwitchMessage::hasCode()}
+     * treats `0` as "no code", matching the constructor's own default)
+     * renders without a `[0]` prefix at `-v` — distinct from a coded
+     * `Detail` message, which does carry one (see
+     * {@see self::test_renderPlanShowsFileOperationsAndCodedDetailMessagesWhenVerbose()}).
+     */
+    public function test_detailMessageWithCodeZeroAtVerbose() : void
+    {
+        $messages = array(
+            new SwitchMessage(0, 'Uncoded detail message.', MessageLevel::Detail),
+        );
+
+        $outcome = new SwitchOutcome(ConfigSwitcher::MODE_DEV, false, $messages, array());
+
+        $context = new ScriptedEventContext(array(), true, array(), true);
+        $this->createRenderer($context)->renderPlan($outcome, false);
+
+        $this->assertTrue($context->hasWrittenLineContaining('Uncoded detail message.'));
+        $this->assertFalse($context->hasWrittenLineContaining('[0]'));
     }
 
     public function test_rendersPlannedCommandLabels() : void

@@ -205,11 +205,17 @@ final class TestConfirmation extends ComposerSwitcherTestCase
         $this->assertFalse($context->wasConfirmCalled());
         $this->assertTrue($context->hasWrittenLineContaining('composer.json changes ('));
         // The first (pre-confirmation) render is of the dry-run preview
-        // outcome, so OutcomeRenderer labels its command line "Would
-        // run:"; the real execution is announced separately via
-        // MESSAGE_COMPOSER_COMMAND's "Running `composer ...`" line.
-        $this->assertTrue($context->hasWrittenLineContaining('Would run: composer'));
-        $this->assertTrue($context->hasWrittenLineContaining('Running `composer'));
+        // outcome, but SwitchCommandRunner::renderPlanned() renders it
+        // as a real plan (not a preview), so OutcomeRenderer labels its
+        // command line "Next:". The real execution is then framed by
+        // exactly one "running `composer ...`" header — the legacy
+        // duplicate "Running `composer ...`" announcement is gone, so
+        // there is no "Would run" (preview-only wording) and no second,
+        // unframed command line.
+        $this->assertTrue($context->hasWrittenLineContaining('Next: composer'));
+        $this->assertTrue($context->hasWrittenLineContaining('running `composer'));
+        $this->assertFalse($context->hasWrittenLineContaining('Would run'));
+        $this->assertFalse($context->hasWrittenMessageCode(ConfigSwitcher::MESSAGE_COMPOSER_COMMAND));
     }
 
     /**
@@ -395,6 +401,92 @@ final class TestConfirmation extends ComposerSwitcherTestCase
 
         $this->assertTrue($context->wasConfirmCalled());
         $this->assertFileDoesNotExist($this->recordFile);
+    }
+
+    /**
+     * `--no-install` skips the real Composer invocation (and therefore
+     * {@see \Mistralys\ComposerSwitcher\Utils\OutcomeRenderer::renderCommandStart()}/
+     * `renderFailure()`), but {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner::runCommand()}
+     * still ends the switch with a framed `done` footer — the
+     * pre-confirmation plan's `Next:` line (not affected by
+     * `--no-install`) and the footer both appear.
+     */
+    public function test_noInstallStillRendersNextLine() : void
+    {
+        [$runner, $context] = $this->createRunnerWithContext(array('--yes', '--no-install'), true, array());
+
+        $runner->runSwitch(ConfigSwitcher::MODE_DEV);
+
+        $this->assertTrue($context->hasWrittenLineContaining('Next: composer'));
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — switch to DEV done'));
+    }
+
+    /**
+     * A PROD/INITIAL->PROD switch with `vendor/composer/installed.json`
+     * already present plans no Composer command at all (see
+     * {@see \Mistralys\ComposerSwitcher\TestSuites\TestSwitching::test_prodToProdPlansInstallOnlyWhenNothingInstalled()}) —
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner::runCommand()}'s
+     * `$command === null` branch must still end the switch with a
+     * framed `done` footer rather than returning silently.
+     */
+    public function test_switchWithNoComposerCommandEndsWithDoneFooter() : void
+    {
+        $installedJsonPath = $this->testTarget . '/vendor/composer/installed.json';
+        mkdir(dirname($installedJsonPath), 0777, true);
+        file_put_contents($installedJsonPath, json_encode(array('packages' => array()), JSON_THROW_ON_ERROR));
+
+        [$runner, $context] = $this->createRunnerWithContext(array(), true, array());
+
+        $runner->runSwitch(ConfigSwitcher::MODE_PROD);
+
+        $this->assertTrue($context->hasWrittenLineContaining('already installed'));
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — switch to PROD done'));
+    }
+
+    /**
+     * The command and its reason are written exactly once: inside the
+     * `running `composer ...`` frame ({@see \Mistralys\ComposerSwitcher\Utils\OutcomeRenderer::renderCommandStart()}).
+     * The legacy {@see ConfigSwitcher::MESSAGE_COMPOSER_COMMAND}
+     * announcement is never written any more, so there is no second
+     * line repeating the same command/reason pair.
+     */
+    public function test_commandAndReasonAppearOnce() : void
+    {
+        [$runner, $context] = $this->createRunnerWithContext(array('--yes'), true, array());
+
+        $runner->runSwitch(ConfigSwitcher::MODE_DEV);
+
+        $this->assertFalse($context->hasWrittenMessageCode(ConfigSwitcher::MESSAGE_COMPOSER_COMMAND));
+
+        $occurrences = 0;
+
+        foreach($context->getWrittenLines() as $line)
+        {
+            if(str_contains($line, 'running `composer')) {
+                $occurrences++;
+            }
+        }
+
+        $this->assertSame(1, $occurrences, 'The command header must be written exactly once.');
+    }
+
+    /**
+     * A real `switch-dev`/`switch-prod`/`switch-update` renders its
+     * pre-confirmation plan as a real plan, not a preview: no "preview"
+     * or "nothing will be changed" wording, and the planned command is
+     * labelled `Next:` — the whole point of {@see SwitchCommandRunner::renderPlanned()}
+     * passing an explicit `isPreview: false` rather than the outcome's
+     * own {@see \Mistralys\ComposerSwitcher\State\SwitchOutcome::isDryRun()}.
+     */
+    public function test_realSwitchRendersPlanWithoutPreviewWording() : void
+    {
+        [$runner, $context] = $this->createRunnerWithContext(array('--yes'), true, array());
+
+        $runner->runSwitch(ConfigSwitcher::MODE_DEV);
+
+        $this->assertFalse($context->hasWrittenLineContaining('preview'));
+        $this->assertFalse($context->hasWrittenLineContaining('nothing will be changed'));
+        $this->assertTrue($context->hasWrittenLineContaining('Next: composer'));
     }
 
     /**

@@ -12,7 +12,7 @@ Everything the Composer commands do is available as PHP methods on `Mistralys\Co
 
 Every one of these value objects is immutable and exposes a `toArray()` (`SwitchDescription` also exposes `toJSON()`).
 
-Create a switcher for the standard file layout with `ConfigSwitcher::fromProjectRoot($projectRoot)`, or with the three-argument constructor for a custom layout (see [Setup](setup.md#custom-file-layout)).
+Create a switcher for the standard file layout with `ConfigSwitcher::fromProjectRoot($projectRoot)`, or with the three-argument constructor for a custom layout (see [Setup](setup.md#custom-file-layout)). `getProjectRoot()` returns that root back (derived from the main `composer.json` file's location) - the same working directory the built-in commands use to shell out to Composer and to resolve relative paths.
 
 ## Switch outcomes
 
@@ -22,6 +22,7 @@ Create a switcher for the standard file layout with `ConfigSwitcher::fromProject
 $outcome = $switcher->switchToProduction();
 
 $outcome->getMode();              // string - the mode that was switched to
+$outcome->getPreviousMode();      // ?string - the mode the switcher was in immediately before this switch, or null when unknown
 $outcome->getMessages();          // SwitchMessage[]
 $outcome->getMessageTexts();      // string[]
 $outcome->getOperations();        // FileOperation[] - files copied or removed, in order
@@ -175,6 +176,27 @@ foreach($switcher->getMessages() as $message) {
 
 `ConfigSwitcher::isDisplayMessagesEnabled()` returns whether the automatic post-switch summary (see
 [Console logging](#console-logging)) is currently on, the getter counterpart to `setDisplayMessages()`.
+
+`ConfigSwitcher::MESSAGE_COMPOSER_COMMAND` (182222) is no longer emitted: `Utils\SwitchCommandRunner`
+used to write this announcement ("Running `composer ...`: reason") right after
+`Utils\OutcomeRenderer::renderCommandStart()`, duplicating the command and reason that frame already
+prints. The constant is kept only for backward compatibility with any consumer that still references it.
+
+### Rendering (`Utils\OutcomeRenderer`)
+
+`renderPlan(SwitchOutcome $outcome, bool $isPreview)` and `renderBlocked(SwitchOutcome $outcome)` are
+what the built-in `composer switch-*` commands use to print a plan/blocked outcome; a library consumer
+building its own console output can call the same methods. `render(SwitchOutcome $outcome)` is a
+**deprecated** thin wrapper over `renderPlan()` that treats the outcome's own `isDryRun()` as the
+preview flag - but a real switch's pre-confirmation plan is also computed via a dry run internally
+(see `previewSwitch()`), so this wrapper wrongly labels that real plan a preview too. It is no longer
+used by `SwitchCommandRunner`, which calls `renderPlan()` (with an explicit preview flag) or
+`renderBlocked()` directly instead; it is kept only for backward compatibility with external callers.
+
+`formatOperation(FileOperation $operation, bool $isPreview = true): string` formats a single file
+operation as `would <type>: <source> -> <target> (<reason>)` when `$isPreview` is `true` (the default),
+or `will <type>: …` when `false` - the wording the console uses to tell a preview's planned operations
+apart from a real switch's own plan (both shown only at `-v`, see [Verbose output](usage.md#verbose-output)).
 
 ### Version override conflicts
 

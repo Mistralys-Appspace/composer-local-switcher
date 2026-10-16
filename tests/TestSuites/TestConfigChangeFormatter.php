@@ -66,6 +66,34 @@ final class TestConfigChangeFormatter extends TestCase
         $this->assertStringNotContainsString('as version', $text);
     }
 
+    /**
+     * `options.versions` present but an empty array — distinct from
+     * {@see self::test_pathRepositoryEntryWithoutAliasOmitsVersionClause()}'s
+     * entirely absent key — still renders without error, with no
+     * package name or alias clause (both derived from
+     * `array_key_first($versions)`, which is `null` for an empty array).
+     */
+    public function test_pathRepositoryWithMissingOptionsVersions() : void
+    {
+        $entry = array(
+            'type' => 'path',
+            'url' => '/project/packages/acme-one',
+            'options' => array(
+                'symlink' => true,
+                'versions' => array(),
+            ),
+        );
+
+        $change = new ConfigChange(array('repositories', '0'), null, $entry, ConfigChange::KIND_ADDED, ConfigChangeOrigin::LocalSwitch);
+
+        $text = $this->createFormatter()->describe($change);
+
+        $this->assertStringContainsString('./packages/acme-one', $text);
+        $this->assertStringContainsString('symlink', $text);
+        $this->assertStringNotContainsString('as version', $text);
+        $this->assertStringNotContainsString(' for `', $text, 'No package name clause should be rendered without a versions entry.');
+    }
+
     public function test_vcsRepositoryEntryNamesTypeAndUrl() : void
     {
         $entry = array('type' => 'vcs', 'url' => 'https://example.test/acme/one.git');

@@ -17,6 +17,8 @@ namespace Mistralys\ComposerSwitcher\State;
  *
  * @package Composer Switcher
  * @subpackage State
+ *
+ * @phpstan-type SwitchMessageShape array{code:int,text:string,level:string}
  */
 final class SwitchMessage
 {
@@ -58,7 +60,7 @@ final class SwitchMessage
     }
 
     /**
-     * @return array{code:int,text:string,level:string}
+     * @return SwitchMessageShape
      */
     public function toArray() : array
     {

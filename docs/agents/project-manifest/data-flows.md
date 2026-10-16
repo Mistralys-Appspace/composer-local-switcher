@@ -72,8 +72,9 @@ User calls ConfigSwitcher::switchToDevelopment(): SwitchOutcome
     → Displays collected messages (ConfigSwitcher's legacy echo channel, via
       autoDisplayMessages(); SwitchCommandRunner turns it off around its own real switchTo(), see §7a)
     → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations, the planned
-      ComposerCommand (if any), isBlocked(), the ConfigChangeSet) — a blocked outcome carries
-      no file effects
+      ComposerCommand (if any), isBlocked(), the ConfigChangeSet, previousMode — the mode read
+      from StatusFile::getMode() ?? MODE_INITIAL before this switch overwrote it) — a blocked
+      outcome carries no file effects
 ```
 
 ## 2. Switch to Production Mode
@@ -99,7 +100,7 @@ User calls ConfigSwitcher::switchToProduction(): SwitchOutcome
     → Writes flag files: creates composer.json.PROD, deletes composer.json.DEV
     → Displays collected messages
     → Returns a SwitchOutcome (mode, dry-run flag, messages, file operations, planned
-      ComposerCommand, isBlocked(), ConfigChangeSet)
+      ComposerCommand, isBlocked(), ConfigChangeSet, previousMode)
 ```
 
 ## 3. Update Current Configuration
@@ -137,7 +138,11 @@ switch_planDevToProd(): array{blocked, command, changes, snapshotHash, appliedRe
       DEV composer.json, target = $snapshotConfig; a managed (local) package entry always takes
       the snapshot value (recording MESSAGE_MANAGED_ENTRY_OVERRIDDEN if the user edited it
       anyway); every other key/package takes the current value, carrying `composer
-      require`/`remove`/config edits back
+      require`/`remove`/config edits back. revert() identifies a managed package across both
+      `require` and `require-dev` before applying this snapshot-value override, so a package the
+      user moved between the two sections during DEV is restored once, in its snapshot section —
+      never duplicated into both, and never double-overridden by also carrying back the stale
+      current-side entry as if it were a separate, non-managed edit
     → Writes revertResult->getEffectiveConfig() → composer.json
     → If a composer-prod.lock backup exists: restores it → composer.lock; otherwise
       force-deletes composer.lock (a DEV-session lock cannot be trusted as a PROD lock) and
@@ -243,8 +248,14 @@ Available entry points: `composerSwitchDev`, `composerSwitchProd`, `composerSwit
 Every switch/update entry point above delegates to `SwitchCommandRunner::runSwitch($mode)` (or
 `runUpdate()`, which resolves the current mode and calls `runSwitch()`), the only place in the
 library that executes Composer or prompts the user. A preview entry point
-(`composerSwitchPreviewDev`/`Prod`) calls `runPreview($mode)` instead, which only previews and
-renders — no nested-run guard, no confirmation, no command execution.
+(`composerSwitchPreviewDev`/`Prod`) calls `runPreview($mode)` instead, which previews and renders
+via `renderPlanned($outcome, true)` — no nested-run guard, no confirmation, no command execution.
+`renderPlanned(SwitchOutcome $outcome, bool $isPreview)` is `SwitchCommandRunner`'s single
+dispatch point for both planning moments (`runSwitch()`'s pre-confirmation plan and the whole of
+`runPreview()`): `renderer->renderBlocked($outcome)` when blocked, else
+`renderer->renderPlan($outcome, $isPreview)` — so a true preview still reads "preview of switch …
+(nothing will be changed)" and "Would run:", while a real switch's own plan (`$isPreview = false`)
+reads "switch …" and "Next:".
 
 ```
 SwitchCommandRunner::runSwitch(string $mode): void
@@ -252,14 +263,24 @@ SwitchCommandRunner::runSwitch(string $mode): void
     e.g. a leftover post-update-cmd hook firing during the switcher's own `composer update`):
     writes MESSAGE_NESTED_RUN_SKIPPED and returns — no preview, no file effects
   → first = $switcher->previewSwitch($mode)
-  → OutcomeRenderer::render($first) → renderPlan($first, $first->isDryRun()) — always, with or
-    without --yes. $first is a dry-run preview outcome, so this block's header reads
-    "Composer Local Switcher — preview of switch to DEV (nothing will be changed)" and the
-    command line is labelled "Would run:". It shows: the ConfigChangeSet (one readable line per
-    change via ConfigChangeFormatter, [permanent]/[discarded] markers), Info/Warning messages
-    (Warning prefixed "!"), the planned command via ComposerCommand::toDisplayString(), and — at
-    -v only — the file operations and Detail messages (the latter with their [code] prefix)
-  → If $first->isBlocked(): throws ERROR_SWITCH_BLOCKED — stops here, nothing written (e.g. a
+  → renderPlanned($first, false) — SwitchCommandRunner's own private dispatch: calls
+    OutcomeRenderer::renderBlocked($first) if blocked, otherwise renderPlan($first, false) —
+    always, with or without --yes. The `false` here is runSwitch()'s own moment (a real switch's
+    pre-confirmation plan), deliberately not $first->isDryRun() (which is always true for a
+    pre-rendered outcome and which the deprecated OutcomeRenderer::render() wrongly conflates with
+    "preview" — see §"OutcomeRenderer" in api-surface.md). So this block's header reads
+    "Composer Local Switcher — switch PROD → DEV" (the transition named by the private
+    describeTransition(), reading $first->getPreviousMode() — "refresh DEV" for a same-mode
+    refresh, the legacy "to DEV" wording only for an outcome built with no previous mode) with no
+    "preview"/"nothing will be changed" wording, and the command line is labelled "Next:". It
+    shows: the ConfigChangeSet (one readable line per change via ConfigChangeFormatter,
+    [permanent]/[discarded] markers), Info/Warning messages (Warning prefixed "!"), the planned
+    command via ComposerCommand::toDisplayString(), and — at -v only — the file operations
+    (formatOperation($operation, false) → "will <type>: …") and Detail messages (the latter with
+    their [code] prefix)
+  → If $first->isBlocked(): renderBlocked() has already written
+    "Composer Local Switcher — switch PROD → DEV blocked, nothing was changed" plus the messages
+    explaining why; then throws ERROR_SWITCH_BLOCKED — stops here, nothing written (e.g. a
     182230 version-override conflict, 182217 stale lock, 182218/182219 snapshot problems)
   → If $first->requiresConfirmation() (composer.json itself would change):
     → confirmSwitch($first):
@@ -280,17 +301,22 @@ SwitchCommandRunner::runSwitch(string $mode): void
   → outcome = $switcher->switchTo($mode) — the real switch, now writes to disk; `finally`
     restores setDisplayMessages(previous), also when switchTo() throws
   → runCommand($outcome):
-    → No planned command: return
+    → No planned command: OutcomeRenderer::renderDone() ("… switch to DEV done") and return —
+      one of the two footer-only exits (see below) now that every path through this method ends
+      framed
     → --no-install flag: writes MESSAGE_COMPOSER_SKIPPED (prints the command instead of
-      running it) and returns
+      running it), then OutcomeRenderer::renderDone(), and returns
     → --with-dependencies flag, and the command is a partial `update <packages>` (not a full
       `update` or `install`): appends --with-dependencies
     → Parent context is non-interactive: appends --no-interaction, so the child process never
       blocks on a prompt the parent couldn't have answered either
     → OutcomeRenderer::renderCommandStart() ("Composer Local Switcher — running `composer …`"),
-      MESSAGE_COMPOSER_COMMAND, then ComposerProcess::run() spawns the real `composer` child
-      process (COMPOSER_SWITCHER_NESTED=1 in its environment — see §6/§7)
-    → Exit code 0: OutcomeRenderer::renderDone() ("… switch to DEV done")
+      then ComposerProcess::run() spawns the real `composer` child process
+      (COMPOSER_SWITCHER_NESTED=1 in its environment — see §6/§7); the legacy
+      MESSAGE_COMPOSER_COMMAND announcement is no longer written here, since
+      renderCommandStart() already names the command and its reason
+    → Exit code 0: OutcomeRenderer::renderDone() ("… switch to DEV done") — the third and last
+      path to this same footer
     → Non-zero exit code (failure/recovery flow): OutcomeRenderer::renderFailure() ("… composer
       command failed (exit code N)" plus a command/reason recap), then MESSAGE_COMPOSER_RECOVERY
       (182231, Warning) naming the mode now active and the two ways forward — fix the cause and
@@ -304,8 +330,9 @@ At the entry point, `guardEntryPoint()` catches ERROR_SWITCH_BLOCKED, ERROR_CONF
 ERROR_INPUTS_CHANGED and ERROR_COMPOSER_COMMAND_FAILED — the runner has already printed the
 reason — writes the exception message as one styled line and returns `false`, so Composer exits
 non-zero without a PHP stack box. The OutcomeRenderer output moments, in order of a successful
-real switch, are therefore: plan block (preview header) → confirmation prompt → command start
-→ Composer's own output → done footer.
+real switch, are therefore: plan block (real-switch header naming the transition, "Next:" command
+line, no preview wording) → confirmation prompt → command start → Composer's own output → done
+footer.
 
 `EventContext::fromEvent(?object $event)` is the sole duck-typing site for Composer's
 event/IO (`getArguments()`/`getIO()`/`isInteractive()`/`isVerbose()`/`askConfirmation()`/`write()`, each

@@ -14,10 +14,13 @@ namespace Mistralys\ComposerSwitcher\State;
  * the target mode, whether it was a dry run, the messages and file
  * operations produced along the way, the single {@see ComposerCommand}
  * (if any) the caller should run next, whether the switch was
- * blocked, and the {@see ConfigChangeSet} describing what changed.
+ * blocked, the {@see ConfigChangeSet} describing what changed, and the
+ * previous mode the switch transitioned from (see {@see self::getPreviousMode()}).
  *
  * @package Composer Switcher
  * @subpackage State
+ *
+ * @phpstan-import-type SwitchMessageShape from SwitchMessage
  */
 final class SwitchOutcome
 {
@@ -29,6 +32,7 @@ final class SwitchOutcome
      * @param ComposerCommand|null $composerCommand The single Composer command planned for this outcome, or `null` when none is needed.
      * @param bool $blocked Whether this switch was blocked by a precondition — a blocked outcome carries no file effects.
      * @param ConfigChangeSet|null $configChanges The config changes this switch produces, or `null` to default to an empty set (e.g. a legacy/blocked outcome with nothing to diff).
+     * @param string|null $previousMode The mode the switcher was in immediately before this switch (e.g. {@see \Mistralys\ComposerSwitcher\ConfigSwitcher::MODE_INITIAL}/`MODE_PROD`/`MODE_DEV`), or `null` when unknown — only {@see \Mistralys\ComposerSwitcher\ConfigSwitcher::switchTo()} supplies this; a legacy or hand-built outcome has no transition to name.
      */
     public function __construct(
         private readonly string $mode,
@@ -37,7 +41,8 @@ final class SwitchOutcome
         private readonly array $operations,
         private readonly ?ComposerCommand $composerCommand = null,
         private readonly bool $blocked = false,
-        private readonly ?ConfigChangeSet $configChanges = null
+        private readonly ?ConfigChangeSet $configChanges = null,
+        private readonly ?string $previousMode = null
     )
     {
     }
@@ -45,6 +50,16 @@ final class SwitchOutcome
     public function getMode() : string
     {
         return $this->mode;
+    }
+
+    /**
+     * The mode the switcher was in immediately before this switch, or
+     * `null` when unknown (e.g. a legacy or hand-built outcome that
+     * never recorded one).
+     */
+    public function getPreviousMode() : ?string
+    {
+        return $this->previousMode;
     }
 
     /**
@@ -186,11 +201,12 @@ final class SwitchOutcome
      * @return array{
      *     mode: string,
      *     dryRun: bool,
-     *     messages: array<int,array{code:int,text:string,level:string}>,
+     *     messages: array<int,SwitchMessageShape>,
      *     operations: array<int,array{type:string,target:string,source:string|null,reason:string,applied:bool}>,
      *     composerCommand: array{arguments:string[],reason:string}|null,
      *     blocked: bool,
-     *     configChanges: array{composerJson:array<int,array<string,mixed>>,prodConfig:array<int,array<string,mixed>>}
+     *     configChanges: array{composerJson:array<int,array<string,mixed>>,prodConfig:array<int,array<string,mixed>>},
+     *     previousMode: string|null
      * }
      */
     public function toArray() : array
@@ -208,7 +224,8 @@ final class SwitchOutcome
             ),
             'composerCommand' => $this->composerCommand?->toArray(),
             'blocked' => $this->blocked,
-            'configChanges' => $this->getConfigChanges()->toArray()
+            'configChanges' => $this->getConfigChanges()->toArray(),
+            'previousMode' => $this->previousMode
         ];
     }
 }

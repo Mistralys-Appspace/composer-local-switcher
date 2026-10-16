@@ -178,8 +178,12 @@ class ConfigSwitcher
     public const MESSAGE_ALREADY_INSTALLED = 182227;
 
     /**
-     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner} —
-     * printed immediately before a planned command is actually executed.
+     * No longer emitted: {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner::runCommand()}
+     * used to write this announcement ("Running `composer ...`: reason")
+     * immediately after {@see \Mistralys\ComposerSwitcher\Utils\OutcomeRenderer::renderCommandStart()},
+     * duplicating the command and reason that frame already prints.
+     * The constant is kept for backward compatibility with any
+     * consumer that still references it.
      */
     public const MESSAGE_COMPOSER_COMMAND = 182222;
 
@@ -442,7 +446,7 @@ class ConfigSwitcher
             $context,
             $switcher,
             new ComposerProcess(),
-            new OutcomeRenderer($context, new ConfigChangeFormatter(dirname($switcher->getMainFile()->getPath())))
+            new OutcomeRenderer($context, new ConfigChangeFormatter($switcher->getProjectRoot()))
         );
     }
 
@@ -480,7 +484,7 @@ class ConfigSwitcher
     {
         $context = EventContext::fromEvent($event);
         $switcher = self::fromProjectRoot(getcwd());
-        $renderer = new OutcomeRenderer($context, new ConfigChangeFormatter(dirname($switcher->getMainFile()->getPath())));
+        $renderer = new OutcomeRenderer($context, new ConfigChangeFormatter($switcher->getProjectRoot()));
 
         $renderer->renderDescription($switcher->describe());
     }
@@ -570,6 +574,16 @@ class ConfigSwitcher
     public function getMainFile(): ConfigFile
     {
         return $this->mainFile;
+    }
+
+    /**
+     * The project root directory, derived from the main `composer.json`
+     * file's location. Used wherever a working directory is needed for
+     * shelling out to Composer or resolving relative paths.
+     */
+    public function getProjectRoot() : string
+    {
+        return dirname($this->getMainFile()->getPath());
     }
 
     public function getDevFile(): ConfigFile
@@ -945,6 +959,8 @@ class ConfigSwitcher
                 $this->addMessage(MessageLevel::Detail, self::MESSAGE_DRY_RUN_ACTIVE, 'Dry run: no files will actually be changed.');
             }
 
+            $previousMode = $this->statusFile->getMode() ?? self::MODE_INITIAL;
+
             $plan = $this->switch_plan($mode);
 
             if($plan['blocked'])
@@ -958,7 +974,8 @@ class ConfigSwitcher
                     $this->fileSystem->getOperations(),
                     null,
                     true,
-                    $plan['changes']
+                    $plan['changes'],
+                    $previousMode
                 );
             }
 
@@ -975,7 +992,8 @@ class ConfigSwitcher
                 $this->fileSystem->getOperations(),
                 $plan['command'],
                 false,
-                $plan['changes']
+                $plan['changes'],
+                $previousMode
             );
         } finally {
             $this->fileSystem->setDryRun($previousDryRun);

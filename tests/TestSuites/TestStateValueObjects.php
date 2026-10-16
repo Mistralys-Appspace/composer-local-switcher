@@ -178,9 +178,23 @@ final class TestStateValueObjects extends TestCase
         $this->assertFalse($outcome->isBlocked());
         $this->assertTrue($outcome->getConfigChanges()->isEmpty());
         $this->assertFalse($outcome->requiresConfirmation());
+        $this->assertNull($outcome->getPreviousMode());
         $this->assertNull($array['composerCommand']);
         $this->assertFalse($array['blocked']);
         $this->assertSame(array('composerJson' => array(), 'prodConfig' => array()), $array['configChanges']);
+        $this->assertNull($array['previousMode']);
+    }
+
+    /**
+     * `getPreviousMode()` round-trips through `toArray()` when supplied
+     * at construction time.
+     */
+    public function test_switchOutcome_previousModeRoundTripsThroughArray() : void
+    {
+        $outcome = new SwitchOutcome('dev', false, array(), array(), null, false, null, 'prod');
+
+        $this->assertSame('prod', $outcome->getPreviousMode());
+        $this->assertSame('prod', $outcome->toArray()['previousMode']);
     }
 
     public function test_switchOutcome_extendedFieldsGettersAndArray() : void

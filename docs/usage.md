@@ -39,16 +39,18 @@ If `composer.json`'s lock file is missing (for example right after cloning the p
 
 Every switch entry point above starts by showing what it plans to do. Every block the switcher
 prints begins with a header line starting with `Composer Local Switcher —`, so its output is easy to
-tell apart from Composer's own. The first block is the plan: a dry-run preview of the switch, which
-is why its header says nothing will be changed yet. It lists the full set of `composer.json`
-changes, any warnings, and the Composer command the switch plans to run next. Only then does it
-ask:
+tell apart from Composer's own. The first block is the plan: it names the transition the switch is
+making (`PROD → DEV`, or `refresh DEV` when the mode stays the same), and lists the full set of
+`composer.json` changes, any warnings, and the Composer command the switch plans to run next.
+Unlike `composer switch-preview-dev`/`-prod` (see [below](#previewing-a-switch)), this is a real
+switch's own plan, so the header carries no "preview"/"nothing will be changed" wording — it is
+only shown ahead of the write for confirmation. Only then does it ask:
 
 ```text
-Composer Local Switcher — preview of switch to DEV (nothing will be changed)
+Composer Local Switcher — switch PROD → DEV
 composer.json changes (1):
   local path `../package-name` for `vendor/package-name` (symlinked, as version `1.4.2` from `options.versions`)
-Would run: composer update vendor/package-name (Installing the switched local packages at their aliased versions.)
+Next: composer update vendor/package-name (Installing the switched local packages at their aliased versions.)
 Apply these changes and run `composer update vendor/package-name`? [yes]
 ```
 
@@ -76,12 +78,17 @@ Composer Local Switcher — running `composer update vendor/package-name`
 Composer Local Switcher — switch to DEV done
 ```
 
+The `done` footer always closes a successful switch, even when there was no Composer command to
+run at all, or `--no-install` (below) left it for you to run yourself - only a failed command, or a
+blocked switch, ends without it.
+
 ### Verbose output
 
 By default, only the headers, the change set, warnings, and the planned command are shown. Run
-Composer with `-v` to also see each file operation (`would <type>: <source> -> <target> (<reason>)`)
-and the switcher's bookkeeping messages. At `-v`, a bookkeeping message carries its numeric `[code]`
-prefix; at default verbosity it is hidden entirely, and no machine code is printed anywhere.
+Composer with `-v` to also see each file operation (`will <type>: <source> -> <target> (<reason>)`
+for a real switch's plan, `would <type>: …` for a preview) and the switcher's bookkeeping messages.
+At `-v`, a bookkeeping message carries its numeric `[code]` prefix; at default verbosity it is
+hidden entirely, and no machine code is printed anywhere.
 
 ```bash
 composer -v switch-dev
@@ -106,7 +113,8 @@ passing `--yes`.
 Other flags accepted the same way:
 
 - `-- --no-install` prints the planned command instead of running it, leaving you to run it
-  yourself (or skip it) once you've reviewed the written `composer.json`.
+  yourself (or skip it) once you've reviewed the written `composer.json`; the switch still ends
+  with its `done` footer, since the `composer.json` change itself already succeeded.
 - `-- --with-dependencies` is forwarded to a partial `update <packages>` command (not a full
   `update` or a plain `install`), matching Composer's own `--with-dependencies` flag.
 
@@ -123,7 +131,7 @@ switch writes nothing, and the command exits non-zero with the reason printed. F
 pin:
 
 ```text
-Composer Local Switcher — preview of switch to DEV (nothing will be changed)
+Composer Local Switcher — switch PROD → DEV blocked, nothing was changed
   ! WARNING: The version override [1.0.4] for [vendor/package-name] does not satisfy its root require constraint [^3.0.0] (PROD-locked version: 3.0.0). Fix: edit the override in `local-repositories.json`, or adjust the root constraint, so the override satisfies it.
 ERROR: The switch is blocked by a precondition (see the messages above).
 ```
@@ -158,7 +166,7 @@ composer switch-preview-prod
 
 A preview runs the same code path as a real switch, but never touches disk: every file stays byte-identical and every modification time stays unchanged. The planned operations match what a real switch from the same starting state would perform, even from the `INITIAL` state where `composer-prod.json` does not exist yet.
 
-A preview prints the same header, change set, and planned-command line a real switch's plan does (the command line is labelled `Would run:` in a preview), under the same `-v` gating described [above](#verbose-output): at default verbosity, each planned file operation (`would <type>: <source> -> <target> (<reason>)`) and the switcher's bookkeeping messages are hidden, visible only with `-v`.
+A preview prints the same transition-naming header and change set a real switch's plan does, but keeps the explicit "preview of switch … (nothing will be changed)" wording and labels the planned-command line `Would run:` (a real switch's own plan instead reads `switch …` with no such wording, and labels it `Next:` — see [above](#what-you-will-be-asked-to-confirm)), under the same `-v` gating described [above](#verbose-output): at default verbosity, each planned file operation (`would <type>: <source> -> <target> (<reason>)`) and the switcher's bookkeeping messages are hidden, visible only with `-v`.
 
 ## Inspecting switcher state
 

@@ -46,10 +46,10 @@ echo '{"local-repositories": []}' > composer/local-repositories.json
 composer switch-preview-dev
 ```
 
-The preview prints a header naming it as a preview, followed by any `composer.json` changes it would make - with nothing yet to change for an empty `local-repositories.json`, that header is the whole output:
+The preview prints a header naming it as a preview and the transition it's previewing (a first-ever switch always starts from the production-equivalent initial state, so it reads `PROD → DEV`), followed by any `composer.json` changes it would make - with nothing yet to change for an empty `local-repositories.json`, that header is the whole output:
 
 ```text
-Composer Local Switcher — preview of switch to DEV (nothing will be changed)
+Composer Local Switcher — preview of switch PROD → DEV (nothing will be changed)
 ```
 
 Run with `-v` to also see each planned file operation (`would <type>: <source> -> <target> (<reason>)`) and the switcher's internal bookkeeping messages, both hidden at default verbosity.
@@ -61,14 +61,13 @@ From here:
 3. When you are done, run `composer switch-prod` the same way.
 
 A real switch shows you what it's about to do before it does it, then frames the Composer run it
-executes for you. The first block is the dry-run preview of the plan, which is why its header says
-nothing will be changed yet:
+executes for you. The first block is the plan, naming the transition it's making:
 
 ```text
-Composer Local Switcher — preview of switch to DEV (nothing will be changed)
+Composer Local Switcher — switch PROD → DEV
 composer.json changes (1):
   local path `../package-name` for `vendor/package-name` (symlinked, as version `1.4.2` from `options.versions`)
-Would run: composer update vendor/package-name (Installing the switched local packages at their aliased versions.)
+Next: composer update vendor/package-name (Installing the switched local packages at their aliased versions.)
 Apply these changes and run `composer update vendor/package-name`? [yes]
 Composer Local Switcher — running `composer update vendor/package-name`
   Installing the switched local packages at their aliased versions.
@@ -85,7 +84,7 @@ writes anything, names the package, the pinned version, the constraint and the P
 and exits non-zero:
 
 ```text
-Composer Local Switcher — preview of switch to DEV (nothing will be changed)
+Composer Local Switcher — switch PROD → DEV blocked, nothing was changed
   ! WARNING: The version override [1.0.4] for [vendor/package-name] does not satisfy its root require constraint [^3.0.0] (PROD-locked version: 3.0.0). Fix: edit the override in `local-repositories.json`, or adjust the root constraint, so the override satisfies it.
 ERROR: The switch is blocked by a precondition (see the messages above).
 ```

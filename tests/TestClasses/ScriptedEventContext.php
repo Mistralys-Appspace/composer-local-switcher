@@ -16,11 +16,14 @@ use Mistralys\ComposerSwitcher\Utils\EventContext;
  * in-prompt callback (fired from inside `confirm()`, letting a test
  * edit a file "while the user is being asked" — the
  * applied-equals-confirmed property this plan's second preview
- * guards against), every `write()`/`writeMessage()` line captured in
- * order instead of echoed, and every `writeMessage()` call's
- * `(code, text, level)` captured separately as structured data — no
- * recording hook was added to production {@see EventContext} for this;
- * this double simply overrides the public, non-`final` `writeMessage()`.
+ * guards against), every `write()`/`writeMessage()`/`writeStyled()`
+ * line captured in order instead of echoed (a styled line is captured
+ * with its style tags stripped, reusing {@see EventContext::stripStyleTags()}
+ * so the stripping logic is not duplicated), and every `writeMessage()`
+ * call's `(code, text, level)` captured separately as structured data —
+ * no recording hook was added to production {@see EventContext} for
+ * this; this double simply overrides the public, non-`final`
+ * `writeMessage()`/`writeStyled()`.
  *
  * Extends {@see EventContext} (not final, exactly for this purpose)
  * rather than implementing a separate interface, so it can be passed
@@ -106,6 +109,18 @@ final class ScriptedEventContext extends EventContext
     public function write(string $line) : void
     {
         $this->writtenLines[] = $line;
+    }
+
+    /**
+     * Captures a styled line the same way {@see self::write()} captures
+     * a plain one, with its style tags stripped via the inherited
+     * {@see EventContext::stripStyleTags()} — matching the real
+     * `echo` fallback's stripping behavior instead of falling through
+     * to an uncaptured `echo`.
+     */
+    public function writeStyled(string $line) : void
+    {
+        $this->writtenLines[] = $this->stripStyleTags($line);
     }
 
     /**

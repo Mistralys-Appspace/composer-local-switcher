@@ -8,6 +8,7 @@ declare(strict_types=1);
 
 namespace Mistralys\ComposerSwitcher\Utils;
 
+use Mistralys\ComposerSwitcher\ConfigSwitcher;
 use Mistralys\ComposerSwitcher\State\ComposerCommand;
 use Mistralys\ComposerSwitcher\State\ConfigChange;
 use Mistralys\ComposerSwitcher\State\ConfigChangeOrigin;
@@ -68,6 +69,16 @@ final class OutcomeRenderer
      * Thin compatibility wrapper over {@see self::renderPlan()},
      * treating the outcome's own {@see SwitchOutcome::isDryRun()} as
      * the preview flag.
+     *
+     * @deprecated Equates a {@see SwitchOutcome}'s own {@see SwitchOutcome::isDryRun()}
+     * with "preview" — but a real switch's pre-confirmation plan is
+     * also computed via a dry run internally (see
+     * {@see \Mistralys\ComposerSwitcher\ConfigSwitcher::previewSwitch()}),
+     * so this wrapper wrongly labels that real plan a preview. No
+     * longer used by {@see SwitchCommandRunner}, which calls
+     * {@see self::renderPlan()} (with an explicit preview flag) or
+     * {@see self::renderBlocked()} directly instead. Kept only for
+     * backward compatibility with external callers.
      */
     public function render(SwitchOutcome $outcome) : void
     {
@@ -82,15 +93,15 @@ final class OutcomeRenderer
      */
     public function renderPlan(SwitchOutcome $outcome, bool $isPreview) : void
     {
-        $modeLabel = strtoupper($outcome->getMode());
+        $transition = $this->describeTransition($outcome);
 
         if($isPreview)
         {
-            $this->writeHeader(sprintf('preview of switch to %s (nothing will be changed)', $modeLabel));
+            $this->writeHeader(sprintf('preview of switch %s (nothing will be changed)', $transition));
         }
         else
         {
-            $this->writeHeader(sprintf('switch to %s', $modeLabel));
+            $this->writeHeader(sprintf('switch %s', $transition));
         }
 
         $this->renderChangeSet($outcome->getConfigChanges());
@@ -114,7 +125,7 @@ final class OutcomeRenderer
         {
             foreach($outcome->getOperations() as $operation)
             {
-                $this->context->write($this->formatOperation($operation));
+                $this->context->write($this->formatOperation($operation, $isPreview));
             }
         }
     }
@@ -126,9 +137,44 @@ final class OutcomeRenderer
      */
     public function renderBlocked(SwitchOutcome $outcome) : void
     {
-        $this->writeHeader(sprintf('switch to %s blocked, nothing was changed', strtoupper($outcome->getMode())));
+        $this->writeHeader(sprintf('switch %s blocked, nothing was changed', $this->describeTransition($outcome)));
 
         $this->renderMessages($outcome->getMessages());
+    }
+
+    /**
+     * Describes the transition an outcome represents, for the
+     * `renderPlan()`/`renderBlocked()` headers: `PROD → DEV` when a
+     * previous mode is known and differs from the target, `refresh DEV`
+     * when the previous mode equals the target (a DEV→DEV or PROD→PROD
+     * refresh), or the legacy `to DEV` wording when no previous mode was
+     * recorded (e.g. an outcome built without one).
+     *
+     * {@see ConfigSwitcher::MODE_INITIAL} displays as {@see ConfigSwitcher::MODE_PROD}
+     * ("PROD") — this mapping holds only because the very first switch a
+     * project ever makes always starts from the PROD-equivalent initial
+     * state; it is not a general INITIAL-means-PROD rule.
+     */
+    private function describeTransition(SwitchOutcome $outcome) : string
+    {
+        $target = strtoupper($outcome->getMode());
+        $previous = $outcome->getPreviousMode();
+
+        if($previous === null)
+        {
+            return 'to ' . $target;
+        }
+
+        $previousLabel = $previous === ConfigSwitcher::MODE_INITIAL
+            ? strtoupper(ConfigSwitcher::MODE_PROD)
+            : strtoupper($previous);
+
+        if($previousLabel === $target)
+        {
+            return 'refresh ' . $target;
+        }
+
+        return sprintf('%s → %s', $previousLabel, $target);
     }
 
     /**
@@ -285,17 +331,19 @@ final class OutcomeRenderer
 
     /**
      * Formats a single {@see FileOperation} as `would <type>: <source>
-     * -> <target> (<reason>)`, both paths rendered through
+     * -> <target> (<reason>)` for a preview, or `will <type>: …` for a
+     * real plan — both paths rendered through
      * {@see ConfigChangeFormatter::displayPath()}. Operations with no
      * source (e.g. a plain write) render `-` in its place, keeping the
      * format uniform.
      */
-    public function formatOperation(FileOperation $operation) : string
+    public function formatOperation(FileOperation $operation, bool $isPreview = true) : string
     {
         $source = $operation->getSourcePath();
 
         return sprintf(
-            'would %s: %s -> %s (%s)',
+            '%s %s: %s -> %s (%s)',
+            $isPreview ? 'would' : 'will',
             $operation->getType(),
             $source !== null ? $this->formatter->displayPath($source) : '-',
             $this->formatter->displayPath($operation->getTargetPath()),

@@ -6,6 +6,7 @@ namespace Mistralys\ComposerSwitcher\TestSuites;
 
 use PHPUnit\Framework\TestCase;
 use Mistralys\ComposerSwitcher\State\MessageLevel;
+use Mistralys\ComposerSwitcher\Tests\TestClasses\ScriptedEventContext;
 use Mistralys\ComposerSwitcher\Utils\EventContext;
 
 /**
@@ -526,6 +527,22 @@ final class TestEventContext extends TestCase
         $output = ob_get_clean();
 
         $this->assertSame('Info Comment Warning plain' . PHP_EOL, $output);
+    }
+
+    /**
+     * {@see ScriptedEventContext::writeStyled()} must capture the line
+     * (tags stripped, like the base class's `echo` fallback) into the
+     * same captured-lines list `write()` uses, instead of falling
+     * through to {@see EventContext::writeStyled()}'s uncaptured `echo`.
+     */
+    public function test_scriptedContextCapturesStyledLines() : void
+    {
+        $context = new ScriptedEventContext();
+
+        $context->writeStyled('<warning>Careful now.</warning>');
+
+        $this->assertTrue($context->hasWrittenLineContaining('Careful now.'));
+        $this->assertSame(array('Careful now.'), $context->getWrittenLines());
     }
 
     // endregion

@@ -523,6 +523,42 @@ final class TestDevConfigTransformer extends TestCase
         $this->assertArrayNotHasKey('acme/local-one', $effective['require-dev']);
     }
 
+    /**
+     * Characterization test (not a fix): a managed package moved
+     * between `require`/`require-dev` during DEV, with no actual value
+     * edit, is still reported as overridden in *both* sections by
+     * {@see DevConfigTransformer::revertSection()} — one entry with the
+     * section the snapshot restores it to (`currentValue: null`, since
+     * the package is absent from DEV's `current` there) and one with
+     * the section it moved away from (`snapshotValue: null`, since the
+     * snapshot never had it there). This is a known limitation
+     * ({@see self::test_movedPackageNotDuplicatedOnRevert()}'s
+     * `effectiveConfig` is still correct — only the *reported* override
+     * list double-counts the single move) deferred to a dedicated
+     * future plan; this test pins the current behavior rather than
+     * fixing `revertSection()`'s shared `$managedPackageNames` list.
+     */
+    public function test_movedPackageOnRevertIsReportedInBothSections() : void
+    {
+        [$snapshotConfig, $repos, $lock] = $this->buildBaselineOne();
+        $base = DevConfigTransformer::apply($snapshotConfig, $repos, $lock)->getConfig();
+
+        // Move the managed package from require to require-dev during
+        // DEV, keeping its value identical — a pure move, no edit.
+        $current = $base;
+        $current['require-dev']['acme/local-one'] = $current['require']['acme/local-one'];
+        unset($current['require']['acme/local-one']);
+
+        $result = DevConfigTransformer::revert($current, $snapshotConfig, $repos, $lock);
+        $overrides = $result->getOverriddenManagedEntries();
+
+        $this->assertCount(2, $overrides, 'Known limitation: a pure section move is reported as an override in both sections.');
+
+        $sections = array_column($overrides, 'section');
+        $this->assertContains('require', $sections);
+        $this->assertContains('require-dev', $sections);
+    }
+
     // endregion
 
     // region: Support methods

@@ -62,6 +62,27 @@ final class TestSwitching extends ComposerSwitcherTestCase
     }
 
     /**
+     * `switchTo()` always records the mode the switcher was in
+     * immediately before the switch on its returned {@see \Mistralys\ComposerSwitcher\State\SwitchOutcome} —
+     * `initial` on the very first switch a project ever makes (no
+     * status file exists yet), and the actual previous mode on every
+     * switch after that.
+     */
+    public function test_switchToRecordsPreviousMode() : void
+    {
+        $switcher = $this->createSwitcher();
+
+        $first = $switcher->switchTo(ConfigSwitcher::MODE_DEV);
+        $this->assertSame(ConfigSwitcher::MODE_INITIAL, $first->getPreviousMode());
+
+        $second = $switcher->switchTo(ConfigSwitcher::MODE_PROD);
+        $this->assertSame(ConfigSwitcher::MODE_DEV, $second->getPreviousMode());
+
+        $third = $switcher->switchTo(ConfigSwitcher::MODE_PROD);
+        $this->assertSame(ConfigSwitcher::MODE_PROD, $third->getPreviousMode());
+    }
+
+    /**
      * No switch has been made yet, so switching to DEV
      * has the following tasks:
      *
@@ -773,6 +794,23 @@ final class TestSwitching extends ComposerSwitcherTestCase
             $this->testTarget . '/composer/local-repositories.json',
             $switcher->getDevFile()->getPath()
         );
+    }
+
+    /**
+     * {@see ConfigSwitcher::getProjectRoot()} must return the directory
+     * containing the main `composer.json` file, matching the previously
+     * duplicated `dirname($switcher->getMainFile()->getPath())` derivations.
+     */
+    public function test_getProjectRootMatchesMainFileDirectory() : void
+    {
+        $switcher = ConfigSwitcher::fromProjectRoot($this->testTarget);
+
+        $this->assertSame(
+            dirname($switcher->getMainFile()->getPath()),
+            $switcher->getProjectRoot()
+        );
+
+        $this->assertSame($this->testTarget, $switcher->getProjectRoot());
     }
 
     public function test_devSwitchRespectsRequireDevPlacement() : void

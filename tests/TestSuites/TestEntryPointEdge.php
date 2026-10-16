@@ -142,8 +142,8 @@ final class TestEntryPointEdge extends ComposerSwitcherTestCase
     }
 
     /**
-     * The "Running `composer ...`" announcement renders the command via
-     * {@see \Mistralys\ComposerSwitcher\State\ComposerCommand::toDisplayString()} —
+     * The framed `running `composer ...`` header renders the command
+     * via {@see \Mistralys\ComposerSwitcher\State\ComposerCommand::toDisplayString()} —
      * plain package names like `mistralys/application_framework` need
      * no quoting, unlike {@see \Mistralys\ComposerSwitcher\State\ComposerCommand::toShellString()}'s
      * `escapeshellarg()`-wrapped form.
@@ -154,9 +154,9 @@ final class TestEntryPointEdge extends ComposerSwitcherTestCase
 
         $runner->runSwitch(ConfigSwitcher::MODE_DEV);
 
-        $line = $this->findLineContaining($context, 'Running `composer');
+        $line = $this->findLineContaining($context, 'running `composer');
 
-        $this->assertNotNull($line, 'Expected a "Running `composer ...`" line to have been written.');
+        $this->assertNotNull($line, 'Expected a "running `composer ...`" header line to have been written.');
         $this->assertStringNotContainsString("'", $line);
         $this->assertStringContainsString('composer update', $line);
     }
@@ -195,6 +195,32 @@ final class TestEntryPointEdge extends ComposerSwitcherTestCase
         $runner->runSwitch(ConfigSwitcher::MODE_DEV);
     }
 
+    /**
+     * A blocked real switch (a stale main lock) still renders through
+     * {@see SwitchCommandRunner::renderPlanned()}, which dispatches a
+     * blocked outcome to {@see \Mistralys\ComposerSwitcher\Utils\OutcomeRenderer::renderBlocked()} —
+     * whose header also names the transition, exactly like a
+     * non-blocked real switch's header does.
+     */
+    public function test_blockedRealSwitchRendersBlockedHeader() : void
+    {
+        $lockPath = $this->testTarget . '/composer.lock';
+        $lockData = json_decode((string)file_get_contents($lockPath), true);
+        $lockData['content-hash'] = 'not-a-real-hash';
+        file_put_contents($lockPath, json_encode($lockData));
+
+        [$runner, $context] = $this->createRunnerWithContext(array('--yes'));
+
+        try {
+            $runner->runSwitch(ConfigSwitcher::MODE_DEV);
+            $this->fail('Expected a ComposerSwitcherException to be thrown.');
+        } catch (ComposerSwitcherException $e) {
+            $this->assertSame(ComposerSwitcherException::ERROR_SWITCH_BLOCKED, $e->getCode());
+        }
+
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — switch PROD → DEV blocked, nothing was changed'));
+    }
+
     public function test_nestedEnvSkipsSwitch() : void
     {
         putenv('COMPOSER_SWITCHER_NESTED=1');
@@ -206,6 +232,24 @@ final class TestEntryPointEdge extends ComposerSwitcherTestCase
         $this->assertFileDoesNotExist($this->recordFile);
         $this->assertTrue($context->hasWrittenMessageCode(ConfigSwitcher::MESSAGE_NESTED_RUN_SKIPPED));
         $this->assertFalse($this->createSwitcher()->getStatus()->exists());
+    }
+
+    /**
+     * {@see \Mistralys\ComposerSwitcher\Utils\SwitchCommandRunner::emitNestedRunSkipped()}
+     * is a no-op path that returns before any planning or command
+     * execution happens, so it never reaches {@see \Mistralys\ComposerSwitcher\Utils\OutcomeRenderer::renderDone()} —
+     * unlike every other `runSwitch()` path, which now always ends with
+     * a framed `done` footer.
+     */
+    public function test_nestedRunSkipPrintsNoFooter() : void
+    {
+        putenv('COMPOSER_SWITCHER_NESTED=1');
+
+        [$runner, $context] = $this->createRunnerWithContext(array('--yes'));
+
+        $runner->runSwitch(ConfigSwitcher::MODE_DEV);
+
+        $this->assertFalse($context->hasWrittenLineContaining('done'));
     }
 
     public function test_childProcessReceivesNestedEnv() : void
@@ -307,6 +351,60 @@ final class TestEntryPointEdge extends ComposerSwitcherTestCase
     }
 
     /**
+     * `ConfigSwitcher::composerSwitchUpdate()` and `composerSwitchProd()`
+     * — the two static entry points {@see self::test_entryPointReturnsFalseOnExplainedFailure()}
+     * does not already cover — also return `false` for an explained
+     * failure ({@see ComposerSwitcherException::ERROR_SWITCH_BLOCKED}),
+     * instead of letting it escape: `composerSwitchUpdate()` is blocked
+     * by a tampered production snapshot (a DEV→DEV refresh, per
+     * {@see \Mistralys\ComposerSwitcher\TestSuites\TestSwitching::test_devRefreshBlockedOnModifiedSnapshot()}),
+     * and `composerSwitchProd()` is then blocked by a missing one (a
+     * DEV→PROD switch, per {@see \Mistralys\ComposerSwitcher\TestSuites\TestSwitching::test_devToProdBlockedOnMissingSnapshot()}) —
+     * both block before any file is written, so reusing the same DEV
+     * fixture for both phases is safe.
+     */
+    public function test_composerSwitchProdAndUpdateReturnFalseOnExplainedFailure() : void
+    {
+        $switcher = $this->createSwitcher();
+        $switcher->switchToDevelopment();
+
+        $prodConfig = $switcher->getProdFile()->getData();
+        $prodConfig['extra']['tampered'] = true;
+        $switcher->getProdFile()->putData($prodConfig);
+
+        $previousCwd = getcwd();
+        $this->assertNotFalse($previousCwd);
+        chdir($this->testTarget);
+
+        try {
+            ob_start();
+            $updateResult = ConfigSwitcher::composerSwitchUpdate();
+            $updateOutput = (string)ob_get_clean();
+        } finally {
+            chdir($previousCwd);
+        }
+
+        $this->assertFalse($updateResult, 'composerSwitchUpdate() must return false for a blocked refresh.');
+        $this->assertStringContainsString('ERROR', $updateOutput);
+
+        $switcher->getProdFile()->delete();
+        $switcher->getProdFile()->getLockFile()->delete();
+
+        chdir($this->testTarget);
+
+        try {
+            ob_start();
+            $prodResult = ConfigSwitcher::composerSwitchProd();
+            $prodOutput = (string)ob_get_clean();
+        } finally {
+            chdir($previousCwd);
+        }
+
+        $this->assertFalse($prodResult, 'composerSwitchProd() must return false for a blocked switch.');
+        $this->assertStringContainsString('ERROR', $prodOutput);
+    }
+
+    /**
      * An exception whose code is not one of the four explained entry
      * point failures ({@see ComposerSwitcherException::ERROR_DEV_FILE_MISSING},
      * raised by `switch_requireCurrentLocalRepositories()` when the DEV
@@ -342,6 +440,23 @@ final class TestEntryPointEdge extends ComposerSwitcherTestCase
 
         $this->assertFileDoesNotExist($this->recordFile);
         $this->assertFalse($this->createSwitcher()->getStatus()->exists());
+    }
+
+    /**
+     * `switch-preview-dev`/`-prod` (via {@see SwitchCommandRunner::runPreview()})
+     * keep the preview header and `Would run:` wording — unaffected by
+     * {@see SwitchCommandRunner::runSwitch()}'s pre-confirmation render
+     * now passing `isPreview: false`.
+     */
+    public function test_previewEntryPointsKeepPreviewWording() : void
+    {
+        [$runner, $context] = $this->createRunnerWithContext(array());
+
+        $runner->runPreview(ConfigSwitcher::MODE_DEV);
+
+        $this->assertTrue($context->hasWrittenLineContaining('Composer Local Switcher — preview of switch'));
+        $this->assertTrue($context->hasWrittenLineContaining('nothing will be changed'));
+        $this->assertTrue($context->hasWrittenLineContaining('Would run: composer'));
     }
 
     /**

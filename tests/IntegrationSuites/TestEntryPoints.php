@@ -228,8 +228,8 @@ final class TestEntryPoints extends IntegrationTestCase
         ));
 
         $this->assertTrue(
-            $result->containsOutput('Composer Local Switcher — switch to DEV'),
-            "Expected the framed header to be present.\nOutput:\n" . $result->getOutput()
+            $result->containsOutput('Composer Local Switcher — switch PROD → DEV'),
+            "Expected the framed header naming the transition to be present.\nOutput:\n" . $result->getOutput()
         );
 
         $this->assertTrue(
@@ -242,7 +242,7 @@ final class TestEntryPoints extends IntegrationTestCase
             "Expected bookkeeping text to be hidden at default verbosity.\nOutput:\n" . $result->getOutput()
         );
 
-        $occurrences = substr_count($result->getOutput() . $result->getErrorOutput(), 'Composer Local Switcher — switch to DEV');
+        $occurrences = substr_count($result->getOutput() . $result->getErrorOutput(), 'Composer Local Switcher — switch PROD → DEV');
         $this->assertSame(1, $occurrences, 'Expected the switch header to appear exactly once, not duplicated.');
     }
 
@@ -271,8 +271,92 @@ final class TestEntryPoints extends IntegrationTestCase
         );
 
         $this->assertTrue(
-            $result->containsOutput('would '),
+            $result->containsOutput('will '),
             "Expected at least one file operation line to be shown at -v.\nOutput:\n" . $result->getOutput()
+        );
+    }
+
+    /**
+     * A real `switch-dev` transcript structurally matches this plan's
+     * target layout: the transition header, the change set
+     * (`composer.json changes (…):`), the `Next:` planned-command line,
+     * the running frame (`running \`composer …\``) and the done footer
+     * each appear, in that order — the end-to-end counterpart to the
+     * plan's target layout no stage in the prior project checked
+     * against a real Composer run (see WP-006's notes and insight
+     * `33a6df5a-e93d-41a3-b64d-766d33e0fe2e`).
+     */
+    public function test_realSwitchTranscriptMatchesPlannedLayout() : void
+    {
+        $this->bootstrapProd();
+
+        $result = $this->runSwitch('switch-dev');
+
+        $this->assertTrue($result->isSuccess(), sprintf(
+            "switch-dev failed unexpectedly.\nOutput:\n%s\nError output:\n%s",
+            $result->getOutput(),
+            $result->getErrorOutput()
+        ));
+
+        $output = $result->getOutput();
+
+        $headerPos = strpos($output, 'Composer Local Switcher — switch PROD → DEV');
+        $changeSetPos = strpos($output, 'composer.json changes');
+        $nextPos = strpos($output, 'Next:');
+        $runningFramePos = strpos($output, 'Composer Local Switcher — running `composer');
+        $footerPos = strpos($output, 'Composer Local Switcher — switch to DEV done');
+
+        $this->assertNotFalse($headerPos, "Expected the transition header.\nOutput:\n" . $output);
+        $this->assertNotFalse($changeSetPos, "Expected the composer.json change set.\nOutput:\n" . $output);
+        $this->assertNotFalse($nextPos, "Expected the 'Next:' planned-command line.\nOutput:\n" . $output);
+        $this->assertNotFalse($runningFramePos, "Expected the running-command frame.\nOutput:\n" . $output);
+        $this->assertNotFalse($footerPos, "Expected the done footer.\nOutput:\n" . $output);
+
+        $this->assertTrue(
+            $headerPos < $changeSetPos && $changeSetPos < $nextPos && $nextPos < $runningFramePos && $runningFramePos < $footerPos,
+            "Expected header, change set, 'Next:', running frame and footer to appear in that order.\nOutput:\n" . $output
+        );
+    }
+
+    /**
+     * A switch blocked by a stale `version` override (one that no
+     * longer satisfies its root `require`/`require-dev` constraint —
+     * {@see \Mistralys\ComposerSwitcher\ConfigSwitcher::MESSAGE_VERSION_OVERRIDE_CONFLICT})
+     * exits non-zero, prints the blocked header, and shows no preview
+     * wording — nothing was written, so the output must not read like a
+     * dry run.
+     */
+    public function test_blockedStalePinTranscript() : void
+    {
+        $this->bootstrapProd();
+
+        $this->setLocalRepositoryVersionOverride('1.0.0');
+
+        $result = $this->runSwitch('switch-dev');
+
+        $this->assertFalse($result->isSuccess(), sprintf(
+            "Expected the stale-pin switch to be blocked (non-zero exit).\nOutput:\n%s\nError output:\n%s",
+            $result->getOutput(),
+            $result->getErrorOutput()
+        ));
+
+        $this->assertTrue(
+            $result->containsOutput('Composer Local Switcher — switch PROD → DEV blocked, nothing was changed'),
+            "Expected the blocked header naming the transition.\nOutput:\n" . $result->getOutput()
+        );
+
+        $combinedOutput = $result->getOutput() . $result->getErrorOutput();
+
+        $this->assertStringNotContainsStringIgnoringCase(
+            'preview',
+            $combinedOutput,
+            "Expected no preview wording in a blocked-switch transcript.\nOutput:\n" . $combinedOutput
+        );
+
+        $this->assertStringNotContainsString(
+            'Would run',
+            $combinedOutput,
+            "Expected no 'Would run' wording in a blocked-switch transcript.\nOutput:\n" . $combinedOutput
         );
     }
 

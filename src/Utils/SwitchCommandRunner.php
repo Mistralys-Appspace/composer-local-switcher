@@ -98,7 +98,7 @@ final class SwitchCommandRunner
 
         $first = $this->switcher->previewSwitch($mode);
 
-        $this->renderer->render($first);
+        $this->renderPlanned($first, false);
 
         if($first->isBlocked())
         {
@@ -162,7 +162,30 @@ final class SwitchCommandRunner
     {
         $outcome = $this->switcher->previewSwitch($mode);
 
-        $this->renderer->render($outcome);
+        $this->renderPlanned($outcome, true);
+    }
+
+    /**
+     * Renders a {@see SwitchOutcome} for one of this class's two
+     * planning moments — step 2 of {@see self::runSwitch()}'s sequence,
+     * or the whole of {@see self::runPreview()} — delegating to
+     * {@see OutcomeRenderer::renderBlocked()} when the outcome is
+     * blocked, or {@see OutcomeRenderer::renderPlan()} with the given
+     * `$isPreview` flag otherwise. `$isPreview` is the caller's own
+     * moment (a true preview vs. a real switch's pre-confirmation plan)
+     * — deliberately not {@see SwitchOutcome::isDryRun()}, which
+     * {@see OutcomeRenderer::render()} conflates with it and which this
+     * method exists to avoid (see that method's `@deprecated` note).
+     */
+    private function renderPlanned(SwitchOutcome $outcome, bool $isPreview) : void
+    {
+        if($outcome->isBlocked())
+        {
+            $this->renderer->renderBlocked($outcome);
+            return;
+        }
+
+        $this->renderer->renderPlan($outcome, $isPreview);
     }
 
     /**
@@ -224,23 +247,25 @@ final class SwitchCommandRunner
      * the parent could not have answered either.
      *
      * Every human-facing command line (the `--no-install` notice, the
-     * "Running" announcement, the exception message) renders the
-     * command via {@see ComposerCommand::toDisplayString()} — unquoted
-     * unless an argument actually needs it — while the exception's
+     * exception message) renders the command via
+     * {@see ComposerCommand::toDisplayString()} — unquoted unless an
+     * argument actually needs it — while the exception's
      * {@see ComposerSwitcherException::KEY_COMMAND} context value keeps
      * {@see ComposerCommand::toShellString()}'s shell-escaped form, for
      * a programmatic consumer that might copy-paste or re-run it.
      *
-     * The real invocation is framed by {@see OutcomeRenderer::renderCommandStart()}
-     * and either {@see OutcomeRenderer::renderDone()} (exit code `0`)
-     * or {@see OutcomeRenderer::renderFailure()}. The pre-existing
-     * {@see ConfigSwitcher::MESSAGE_COMPOSER_COMMAND} announcement
-     * ("Running `composer ...`: reason") is still written immediately
-     * after `renderCommandStart()`, even though the two lines now carry
-     * near-identical information — it is kept, not dead code, because
-     * {@see \Mistralys\ComposerSwitcher\TestSuites\TestConfirmation::test_yesStillPrintsChanges}
-     * (out of this method's scope) asserts on its literal "Running
-     * `composer" substring. On a non-zero exit,
+     * One footer rule covers every path through this method: a switch
+     * ends with {@see OutcomeRenderer::renderDone()} whether there was
+     * no command to run at all, `--no-install` skipped it, or it ran
+     * and exited `0`. The real invocation (when one happens) is framed
+     * by {@see OutcomeRenderer::renderCommandStart()} and either
+     * `renderDone()` or {@see OutcomeRenderer::renderFailure()}. The
+     * legacy {@see ConfigSwitcher::MESSAGE_COMPOSER_COMMAND} announcement
+     * ("Running `composer ...`: reason") is no longer written here —
+     * `renderCommandStart()` already names the command and its reason,
+     * and writing both duplicated the same information on two adjacent
+     * lines; the constant itself is kept for backward compatibility
+     * (see its own docblock). On a non-zero exit,
      * {@see ConfigSwitcher::MESSAGE_COMPOSER_RECOVERY} is printed next,
      * naming the current mode and the two recovery commands (`composer
      * switch-update`, `composer switch-prod`) — guidance only: the
@@ -257,6 +282,7 @@ final class SwitchCommandRunner
 
         if($command === null)
         {
+            $this->renderer->renderDone(strtoupper($outcome->getMode()));
             return;
         }
 
@@ -267,6 +293,8 @@ final class SwitchCommandRunner
                 $command->toDisplayString(),
                 $command->getReason()
             ));
+
+            $this->renderer->renderDone(strtoupper($outcome->getMode()));
 
             return;
         }
@@ -286,12 +314,6 @@ final class SwitchCommandRunner
         $finalCommand = new ComposerCommand($arguments, $command->getReason());
 
         $this->renderer->renderCommandStart($finalCommand);
-
-        $this->context->writeMessage(ConfigSwitcher::MESSAGE_COMPOSER_COMMAND, sprintf(
-            'Running `composer %s`: %s',
-            $finalCommand->toDisplayString(),
-            $finalCommand->getReason()
-        ));
 
         $exitCode = $this->process->run($finalCommand, $this->getWorkingDir());
 
@@ -337,8 +359,10 @@ final class SwitchCommandRunner
     /**
      * Whether `$changes` has a `prodConfig` entry (a permanent change)
      * or a `composerJson` entry whose origin is {@see ConfigChangeOrigin::CarriedBack}
-     * (also rendered `[permanent]` by {@see OutcomeRenderer::formatChange()})
-     * or {@see ConfigChangeOrigin::Discarded} — the condition the
+     * (also rendered with a trailing `[permanent]` marker by
+     * {@see OutcomeRenderer}'s private `describeChange()`) or
+     * {@see ConfigChangeOrigin::Discarded} (rendered `[discarded]` the
+     * same way) — the condition the
      * interactive confirmation prompt defaults to "no" for. Matching
      * the renderer's own origin check here, rather than only
      * {@see ConfigChangeSet::hasPermanentChanges()}'s `prodConfig`
@@ -380,6 +404,6 @@ final class SwitchCommandRunner
 
     private function getWorkingDir() : string
     {
-        return dirname($this->switcher->getMainFile()->getPath());
+        return $this->switcher->getProjectRoot();
     }
 }

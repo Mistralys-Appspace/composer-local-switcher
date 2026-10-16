@@ -238,8 +238,14 @@ class EventContext
      * Strips `<info>`, `<comment>` and `<warning>` tags (opening and
      * closing) from `$line` — the exact tag set {@see self::writeStyled()}
      * supports, used only by its `echo` fallback.
+     *
+     * `protected` (not `private`) so a test double (e.g.
+     * {@see \Mistralys\ComposerSwitcher\Tests\TestClasses\ScriptedEventContext})
+     * can reuse the same stripping logic when overriding
+     * {@see self::writeStyled()} to capture styled lines, instead of
+     * duplicating the regex.
      */
-    private function stripStyleTags(string $line) : string
+    protected function stripStyleTags(string $line) : string
     {
         $pattern = '#</?(?:info|comment|warning)>#';
 
